@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -17,7 +16,6 @@ pub struct AdminAccount {
 #[derive(Debug, Deserialize)]
 pub struct Account {
     pub display_name: String,
-    pub created_at: DateTime<Utc>,
     pub note: String,
     pub avatar: String,
     pub url: String,

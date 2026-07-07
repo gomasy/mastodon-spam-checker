@@ -6,16 +6,28 @@ mod slack;
 
 use anyhow::Result;
 use tracing::{error, info, warn};
+use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // reqwest を rustls-no-provider で使うため、TLS 初回利用前にプロバイダの登録が必須
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("rustls 暗号プロバイダの登録に失敗");
+
     dotenvy::dotenv().ok();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("mastodon_spam_checker=info".parse()?),
-        )
+    // EnvFilter は regex を引き込みバイナリが肥大化するため、軽量な Targets で代替。
+    // RUST_LOG が設定されていればそれを優先、なければ本クレートのみ info。
+    let filter: Targets = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            Targets::new().with_target("mastodon_spam_checker", tracing::Level::INFO)
+        });
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(filter)
         .init();
     let config = config::Config::from_env()?;
     info!("設定読み込み完了");

@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -66,7 +65,6 @@ Evaluation criteria:
 - Profile that mimics legitimate accounts but with subtle differences
 - If no avatar is set (i.e. the account uses the default avatar), examine the account with extra care
 - If the username looks like a machine-generated, meaningless sequence of letters, treat the account with heightened suspicion
-- Account age is given as elapsed time since the account was created. Very new accounts (a few days old or less) that also show other spam indicators should be treated with heightened suspicion. A young account age alone is NOT evidence of spam.
 
 Respond ONLY with a JSON object in this exact format (no markdown, no extra text):
 {"spam": true/false, "reason": "Brief explanation in Japanese", "confidence": 0.0-1.0}
@@ -184,7 +182,6 @@ fn build_user_prompt(account: &AdminAccount, statuses: &[Status]) -> String {
          - Bio: {}\n\
          - URL: {}\n\
          - Avatar: {}\n\
-         - Account Age: {}\n\
          - Followers: {} / Following: {} / Posts: {}\n",
         account.username,
         domain,
@@ -192,7 +189,6 @@ fn build_user_prompt(account: &AdminAccount, statuses: &[Status]) -> String {
         note_plain,
         account.account.url,
         avatar_state,
-        format_account_age(account.account.created_at),
         account.account.followers_count,
         account.account.following_count,
         account.account.statuses_count,
@@ -209,17 +205,6 @@ fn build_user_prompt(account: &AdminAccount, statuses: &[Status]) -> String {
     }
 
     prompt
-}
-
-// 絶対日時だと LLM が現在日時を知らず経過時間を判断できないため、相対表現に変換する
-fn format_account_age(created_at: chrono::DateTime<Utc>) -> String {
-    let days = Utc::now().signed_duration_since(created_at).num_days();
-    match days {
-        i64::MIN..=0 => "less than 1 day".to_string(),
-        1..=59 => format!("{days} days"),
-        60..=729 => format!("about {} months", days / 30),
-        _ => format!("about {} years", days / 365),
-    }
 }
 
 fn html_to_plain(html: &str) -> String {
@@ -251,23 +236,6 @@ fn html_to_plain(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
-
-    fn age_of(days: i64) -> String {
-        format_account_age(Utc::now() - Duration::days(days))
-    }
-
-    #[test]
-    fn account_age_boundaries() {
-        assert_eq!(age_of(-3), "less than 1 day"); // 未来日時(クロックずれ)
-        assert_eq!(age_of(0), "less than 1 day");
-        assert_eq!(age_of(1), "1 days");
-        assert_eq!(age_of(59), "59 days");
-        assert_eq!(age_of(60), "about 2 months");
-        assert_eq!(age_of(729), "about 24 months");
-        assert_eq!(age_of(730), "about 2 years");
-        assert_eq!(age_of(1500), "about 4 years");
-    }
 
     #[test]
     fn html_to_plain_strips_tags() {
