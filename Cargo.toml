@@ -2,6 +2,8 @@
 name = "mastodon-spam-checker"
 version = "0.1.0"
 edition = "2024"
+description = "LLM-powered spam detector for Mastodon instances"
+license = "MIT"
 
 [dependencies]
 anyhow = "1"
