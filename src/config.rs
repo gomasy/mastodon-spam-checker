@@ -23,7 +23,9 @@ impl Config {
             openai_model: std::env::var("OPENAI_MODEL")
                 .unwrap_or_else(|_| "gpt-4o".to_string()),
             slack_webhook_url: required_env("SLACK_WEBHOOK_URL")?,
-            slack_channel: std::env::var("SLACK_CHANNEL").ok(),
+            slack_channel: std::env::var("SLACK_CHANNEL")
+                .ok()
+                .filter(|s| !s.is_empty()),
         })
     }
 }

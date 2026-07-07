@@ -11,6 +11,7 @@ const APP_NAME: &str = "Mastodon Spam Checker";
 struct SlackMessage {
     text: String,
     username: &'static str,
+    icon_emoji: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     channel: Option<String>,
 }
@@ -62,6 +63,7 @@ impl SlackNotifier {
             .json(&SlackMessage {
                 text,
                 username: APP_NAME,
+                icon_emoji: ":scales:",
                 channel: self.channel.clone(),
             })
             .send()
