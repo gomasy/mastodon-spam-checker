@@ -1,7 +1,10 @@
+use std::time::Duration;
+
 use anyhow::{bail, Context, Result};
-use reqwest::Client;
+use chrono::{DateTime, Utc};
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Deserialize)]
 pub struct AdminAccount {
@@ -14,6 +17,7 @@ pub struct AdminAccount {
 #[derive(Debug, Deserialize)]
 pub struct Account {
     pub display_name: String,
+    pub created_at: DateTime<Utc>,
     pub note: String,
     pub avatar: String,
     pub url: String,
@@ -41,6 +45,7 @@ impl MastodonClient {
                 "/",
                 env!("CARGO_PKG_VERSION"),
             ))
+            .timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client");
 
@@ -108,6 +113,12 @@ impl MastodonClient {
             .context("Statuses API リクエスト失敗")?;
 
         let status = resp.status();
+        // アカウント削除済み等の恒久的エラーは「投稿なし」として扱い、
+        // プロフィールのみで判定を続行する(呼び出し側で中断させない)
+        if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+            warn!(account_id = %account_id, %status, "投稿を取得できないため投稿なしとして扱う");
+            return Ok(Vec::new());
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             bail!("Statuses API エラー (HTTP {status}): {body}");

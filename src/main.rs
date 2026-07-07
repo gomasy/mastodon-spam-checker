@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
         &config.openai_api_base,
         &config.openai_api_key,
         &config.openai_model,
+        config.openai_json_mode,
     );
     let slack = slack::SlackNotifier::new(&config.slack_webhook_url, config.slack_channel);
 
@@ -69,16 +70,16 @@ async fn main() -> Result<()> {
             "チェック中"
         );
 
+        // リトライ可能なエラーではカーソルを進めず中断し、次回実行でこのアカウントから再開する
         let statuses = match mastodon.fetch_statuses(&account.id).await {
             Ok(s) => s,
             Err(e) => {
-                warn!(
+                error!(
                     username = %account.username,
                     error = %e,
-                    "投稿取得失敗、スキップ"
+                    "投稿取得失敗、中断して次回このアカウントから再開"
                 );
-                last_id = Some(account.id.clone());
-                continue;
+                break;
             }
         };
 
@@ -108,8 +109,9 @@ async fn main() -> Result<()> {
                 error!(
                     username = %account.username,
                     error = %e,
-                    "LLM 判定失敗、スキップ"
+                    "LLM 判定失敗、中断して次回このアカウントから再開"
                 );
+                break;
             }
         }
 
@@ -134,4 +136,19 @@ const SYSTEM_USERNAMES: &[&str] = &["mastodon.internal", "internal.fetch", "syst
 
 fn is_system_account(username: &str, domain: &str) -> bool {
     SYSTEM_USERNAMES.contains(&username) || username == domain
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_accounts_are_detected() {
+        assert!(is_system_account("mastodon.internal", "example.com"));
+        assert!(is_system_account("internal.fetch", "example.com"));
+        assert!(is_system_account("system.actor", "example.com"));
+        // インスタンスアクター(ユーザー名 == ドメイン)
+        assert!(is_system_account("example.com", "example.com"));
+        assert!(!is_system_account("alice", "example.com"));
+    }
 }
