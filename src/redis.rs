@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use redis::aio::MultiplexedConnection;
 use redis::AsyncCommands;
+use redis::aio::MultiplexedConnection;
 
 const CURSOR_KEY: &str = "mastodon_spam_checker:last_account_id";
 
@@ -10,8 +10,7 @@ pub struct CursorStore {
 
 impl CursorStore {
     pub async fn new(redis_url: &str) -> Result<Self> {
-        let client =
-            redis::Client::open(redis_url).context("Redis クライアントの作成に失敗")?;
+        let client = redis::Client::open(redis_url).context("Redis クライアントの作成に失敗")?;
         let conn = client
             .get_multiplexed_async_connection()
             .await

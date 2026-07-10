@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -54,10 +54,7 @@ impl MastodonClient {
         }
     }
 
-    pub async fn fetch_remote_accounts(
-        &self,
-        min_id: Option<&str>,
-    ) -> Result<Vec<AdminAccount>> {
+    pub async fn fetch_remote_accounts(&self, min_id: Option<&str>) -> Result<Vec<AdminAccount>> {
         let mut url = format!(
             "{}/api/v2/admin/accounts?origin=remote&limit=100",
             self.base_url

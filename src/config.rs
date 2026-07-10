@@ -21,8 +21,7 @@ impl Config {
                 .unwrap_or_else(|_| "redis://localhost:6379".to_string()),
             openai_api_base: required_env("OPENAI_API_BASE")?,
             openai_api_key: required_env("OPENAI_API_KEY")?,
-            openai_model: std::env::var("OPENAI_MODEL")
-                .unwrap_or_else(|_| "gpt-4o".to_string()),
+            openai_model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()),
             // response_format 非対応の OpenAI 互換 API では false にする
             openai_json_mode: std::env::var("OPENAI_JSON_MODE")
                 .map(|v| v != "false" && v != "0")

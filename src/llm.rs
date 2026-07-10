@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -82,7 +82,11 @@ pub struct LlmClient {
 impl LlmClient {
     pub fn new(api_base: &str, api_key: &str, model: &str, json_mode: bool) -> Self {
         let client = Client::builder()
-            .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
             .timeout(Duration::from_secs(120))
             .build()
             .expect("failed to build HTTP client");
@@ -138,10 +142,7 @@ impl LlmClient {
             bail!("LLM API エラー (HTTP {status}): {body}");
         }
 
-        let resp: ChatResponse = resp
-            .json()
-            .await
-            .context("LLM レスポンスのパース失敗")?;
+        let resp: ChatResponse = resp.json().await.context("LLM レスポンスのパース失敗")?;
 
         let content = &resp
             .choices
@@ -168,13 +169,12 @@ fn build_user_prompt(account: &AdminAccount, statuses: &[Status]) -> String {
     let domain = account.domain.as_deref().unwrap_or("(local)");
     let note_plain = html_to_plain(&account.account.note);
     // Mastodon serves /avatars/original/missing.png when no avatar is set
-    let avatar_state = if account.account.avatar.is_empty()
-        || account.account.avatar.contains("missing.png")
-    {
-        "not set (default avatar)"
-    } else {
-        "set"
-    };
+    let avatar_state =
+        if account.account.avatar.is_empty() || account.account.avatar.contains("missing.png") {
+            "not set (default avatar)"
+        } else {
+            "set"
+        };
 
     let mut prompt = format!(
         "## Account Profile\n\
@@ -210,7 +210,10 @@ fn build_user_prompt(account: &AdminAccount, statuses: &[Status]) -> String {
 
 fn html_to_plain(html: &str) -> String {
     let mut result = html.to_string();
-    result = result.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n");
+    result = result
+        .replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n");
     result = result.replace("</p><p>", "\n\n");
 
     let mut plain = String::with_capacity(result.len());
@@ -254,7 +257,10 @@ mod tests {
 
     #[test]
     fn html_to_plain_unescapes_entities_once() {
-        assert_eq!(html_to_plain("&lt;b&gt; &quot;x&quot; &#39;y&#39;"), "<b> \"x\" 'y'");
+        assert_eq!(
+            html_to_plain("&lt;b&gt; &quot;x&quot; &#39;y&#39;"),
+            "<b> \"x\" 'y'"
+        );
         // 二重エスケープは一段だけ復元される(&amp; を最後に置換しているため)
         assert_eq!(html_to_plain("&amp;lt;script&amp;gt;"), "&lt;script&gt;");
         assert_eq!(html_to_plain("A &amp; B"), "A & B");

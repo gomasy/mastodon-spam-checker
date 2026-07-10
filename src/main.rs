@@ -33,10 +33,8 @@ async fn main() -> Result<()> {
     info!("設定読み込み完了");
 
     let mut cursor_store = redis::CursorStore::new(&config.redis_url).await?;
-    let mastodon = mastodon::MastodonClient::new(
-        &config.mastodon_base_url,
-        &config.mastodon_access_token,
-    );
+    let mastodon =
+        mastodon::MastodonClient::new(&config.mastodon_base_url, &config.mastodon_access_token);
     let llm = llm::LlmClient::new(
         &config.openai_api_base,
         &config.openai_api_key,
@@ -46,11 +44,12 @@ async fn main() -> Result<()> {
     let slack = slack::SlackNotifier::new(&config.slack_webhook_url, config.slack_channel);
 
     let cursor = cursor_store.get_cursor().await?;
-    info!(cursor = cursor.as_deref().unwrap_or("(none)"), "前回カーソル");
+    info!(
+        cursor = cursor.as_deref().unwrap_or("(none)"),
+        "前回カーソル"
+    );
 
-    let accounts = mastodon
-        .fetch_remote_accounts(cursor.as_deref())
-        .await?;
+    let accounts = mastodon.fetch_remote_accounts(cursor.as_deref()).await?;
 
     if accounts.is_empty() {
         info!("新しいリモートアカウントはありません");
@@ -135,11 +134,7 @@ async fn main() -> Result<()> {
         info!(cursor = %id, "カーソル保存完了");
     }
 
-    info!(
-        total = accounts.len(),
-        spam = spam_count,
-        "チェック完了"
-    );
+    info!(total = accounts.len(), spam = spam_count, "チェック完了");
 
     Ok(())
 }

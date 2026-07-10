@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::Serialize;
 
@@ -27,7 +27,11 @@ pub struct SlackNotifier {
 impl SlackNotifier {
     pub fn new(webhook_url: &str, channel: Option<String>) -> Self {
         let client = Client::builder()
-            .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
             .timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client");
@@ -39,11 +43,7 @@ impl SlackNotifier {
         }
     }
 
-    pub async fn notify_spam(
-        &self,
-        account: &AdminAccount,
-        verdict: &SpamVerdict,
-    ) -> Result<()> {
+    pub async fn notify_spam(&self, account: &AdminAccount, verdict: &SpamVerdict) -> Result<()> {
         let domain = account.domain.as_deref().unwrap_or("(local)");
         let text = format!(
             ":warning: *スパムアカウント検出*\n\
