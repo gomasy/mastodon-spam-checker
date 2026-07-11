@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: cargo build --release --locked
+      - name: Rename binary
+        run: cp target/release/mastodon-spam-checker "mastodon-spam-checker-${{ matrix.target }}"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binaries-${{ matrix.target }}
+          path: mastodon-spam-checker-*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    needs:
+      - build
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/binaries
+          pattern: binaries-*
+          merge-multiple: true
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ runner.temp }}/binaries/mastodon-spam-checker-*
+          generate_release_notes: true
