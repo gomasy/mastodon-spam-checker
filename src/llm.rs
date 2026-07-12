@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::http;
 use crate::mastodon::{AdminAccount, Status};
 
 #[derive(Debug, Deserialize)]
@@ -81,18 +82,8 @@ pub struct LlmClient {
 
 impl LlmClient {
     pub fn new(api_base: &str, api_key: &str, model: &str, json_mode: bool) -> Self {
-        let client = Client::builder()
-            .user_agent(concat!(
-                env!("CARGO_PKG_NAME"),
-                "/",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .timeout(Duration::from_secs(120))
-            .build()
-            .expect("failed to build HTTP client");
-
         Self {
-            client,
+            client: http::client(Duration::from_secs(120)),
             api_base: api_base.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
@@ -134,20 +125,20 @@ impl LlmClient {
             .json(&request)
             .send()
             .await
-            .context("LLM API リクエスト失敗")?;
+            .context("LLM API request failed")?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            bail!("LLM API エラー (HTTP {status}): {body}");
+            bail!("LLM API error (HTTP {status}): {body}");
         }
 
-        let resp: ChatResponse = resp.json().await.context("LLM レスポンスのパース失敗")?;
+        let resp: ChatResponse = resp.json().await.context("failed to parse LLM response")?;
 
         let content = &resp
             .choices
             .first()
-            .context("LLM レスポンスに choices がありません")?
+            .context("LLM response has no choices")?
             .message
             .content;
 
@@ -159,7 +150,7 @@ impl LlmClient {
             .trim();
 
         let verdict: SpamVerdict =
-            serde_json::from_str(content).context("LLM 判定結果の JSON パース失敗")?;
+            serde_json::from_str(content).context("failed to parse LLM verdict JSON")?;
 
         Ok(verdict)
     }

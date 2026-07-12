@@ -10,11 +10,11 @@ pub struct CursorStore {
 
 impl CursorStore {
     pub async fn new(redis_url: &str) -> Result<Self> {
-        let client = redis::Client::open(redis_url).context("Redis クライアントの作成に失敗")?;
+        let client = redis::Client::open(redis_url).context("failed to create Redis client")?;
         let conn = client
             .get_multiplexed_async_connection()
             .await
-            .context("Redis 接続失敗")?;
+            .context("failed to connect to Redis")?;
         Ok(Self { conn })
     }
 
@@ -23,7 +23,7 @@ impl CursorStore {
             .conn
             .get(CURSOR_KEY)
             .await
-            .context("Redis カーソル読み込み失敗")?;
+            .context("failed to read cursor from Redis")?;
 
         Ok(value)
     }
@@ -32,7 +32,7 @@ impl CursorStore {
         self.conn
             .set::<_, _, ()>(CURSOR_KEY, account_id)
             .await
-            .context("Redis カーソル保存失敗")?;
+            .context("failed to save cursor to Redis")?;
 
         Ok(())
     }

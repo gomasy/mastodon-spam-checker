@@ -14,9 +14,10 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        let (mastodon_base_url, mastodon_access_token) = mastodon_env()?;
         Ok(Self {
-            mastodon_base_url: required_env("MASTODON_BASE_URL")?,
-            mastodon_access_token: required_env("MASTODON_ACCESS_TOKEN")?,
+            mastodon_base_url,
+            mastodon_access_token,
             redis_url: std::env::var("REDIS_URL")
                 .unwrap_or_else(|_| "redis://localhost:6379".to_string()),
             openai_api_base: required_env("OPENAI_API_BASE")?,
@@ -34,6 +35,34 @@ impl Config {
     }
 }
 
+/// serve モード(Slack インタラクションサーバー)用の設定
+pub struct ServeConfig {
+    pub mastodon_base_url: String,
+    pub mastodon_access_token: String,
+    pub slack_signing_secret: String,
+    pub listen_addr: String,
+}
+
+impl ServeConfig {
+    pub fn from_env() -> Result<Self> {
+        let (mastodon_base_url, mastodon_access_token) = mastodon_env()?;
+        Ok(Self {
+            mastodon_base_url,
+            mastodon_access_token,
+            slack_signing_secret: required_env("SLACK_SIGNING_SECRET")?,
+            listen_addr: std::env::var("LISTEN_ADDR")
+                .unwrap_or_else(|_| "127.0.0.1:8990".to_string()),
+        })
+    }
+}
+
+fn mastodon_env() -> Result<(String, String)> {
+    Ok((
+        required_env("MASTODON_BASE_URL")?,
+        required_env("MASTODON_ACCESS_TOKEN")?,
+    ))
+}
+
 fn required_env(key: &str) -> Result<String> {
-    std::env::var(key).with_context(|| format!("環境変数 {key} が設定されていません"))
+    std::env::var(key).with_context(|| format!("environment variable {key} is not set"))
 }

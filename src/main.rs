@@ -1,10 +1,12 @@
 mod config;
+mod http;
 mod llm;
 mod mastodon;
 mod redis;
+mod server;
 mod slack;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use tracing::{error, info, warn};
 use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -13,7 +15,7 @@ async fn main() -> Result<()> {
     // reqwest を rustls-no-provider で使うため、TLS 初回利用前にプロバイダの登録が必須
     rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("rustls 暗号プロバイダの登録に失敗");
+        .expect("failed to install rustls crypto provider");
 
     dotenvy::dotenv().ok();
 
@@ -29,8 +31,18 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .with(filter)
         .init();
+
+    match std::env::args().nth(1).as_deref() {
+        None => check().await,
+        Some("serve") => server::run(config::ServeConfig::from_env()?).await,
+        Some(cmd) => bail!("unknown subcommand: {cmd} (usage: mastodon-spam-checker [serve])"),
+    }
+}
+
+/// 新規リモートアカウントを取得してスパム判定する(デフォルトの一発実行モード)
+async fn check() -> Result<()> {
     let config = config::Config::from_env()?;
-    info!("設定読み込み完了");
+    info!("configuration loaded");
 
     let mut cursor_store = redis::CursorStore::new(&config.redis_url).await?;
     let mastodon =
@@ -46,17 +58,17 @@ async fn main() -> Result<()> {
     let cursor = cursor_store.get_cursor().await?;
     info!(
         cursor = cursor.as_deref().unwrap_or("(none)"),
-        "前回カーソル"
+        "previous cursor"
     );
 
     let accounts = mastodon.fetch_remote_accounts(cursor.as_deref()).await?;
 
     if accounts.is_empty() {
-        info!("新しいリモートアカウントはありません");
+        info!("no new remote accounts");
         return Ok(());
     }
 
-    info!(count = accounts.len(), "新規リモートアカウント取得");
+    info!(count = accounts.len(), "fetched new remote accounts");
 
     let mut last_id: Option<String> = None;
     let mut spam_count = 0u32;
@@ -68,7 +80,7 @@ async fn main() -> Result<()> {
             info!(
                 username = %account.username,
                 domain = %domain,
-                "システムアカウント、スキップ"
+                "system account, skipping"
             );
             last_id = Some(account.id.clone());
             continue;
@@ -78,7 +90,7 @@ async fn main() -> Result<()> {
             username = %account.username,
             domain = %domain,
             id = %account.id,
-            "チェック中"
+            "checking"
         );
 
         // リトライ可能なエラーではカーソルを進めず中断し、次回実行でこのアカウントから再開する
@@ -88,7 +100,7 @@ async fn main() -> Result<()> {
                 error!(
                     username = %account.username,
                     error = %e,
-                    "投稿取得失敗、中断して次回このアカウントから再開"
+                    "failed to fetch statuses; aborting, next run resumes from this account"
                 );
                 break;
             }
@@ -103,16 +115,16 @@ async fn main() -> Result<()> {
                         domain = %domain,
                         confidence = verdict.confidence,
                         reason = %verdict.reason,
-                        "スパム検出"
+                        "spam detected"
                     );
                     if let Err(e) = slack.notify_spam(account, &verdict).await {
-                        error!(error = %e, "Slack 通知失敗");
+                        error!(error = %e, "failed to send Slack notification");
                     }
                 } else {
                     info!(
                         username = %account.username,
                         domain = %domain,
-                        "正常"
+                        "not spam"
                     );
                 }
             }
@@ -120,7 +132,7 @@ async fn main() -> Result<()> {
                 error!(
                     username = %account.username,
                     error = %e,
-                    "LLM 判定失敗、中断して次回このアカウントから再開"
+                    "LLM check failed; aborting, next run resumes from this account"
                 );
                 break;
             }
@@ -131,10 +143,10 @@ async fn main() -> Result<()> {
 
     if let Some(ref id) = last_id {
         cursor_store.set_cursor(id).await?;
-        info!(cursor = %id, "カーソル保存完了");
+        info!(cursor = %id, "cursor saved");
     }
 
-    info!(total = accounts.len(), spam = spam_count, "チェック完了");
+    info!(total = accounts.len(), spam = spam_count, "check finished");
 
     Ok(())
 }
