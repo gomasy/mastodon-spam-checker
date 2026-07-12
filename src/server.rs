@@ -16,7 +16,10 @@ use tracing::{error, info, warn};
 
 use crate::config::ServeConfig;
 use crate::mastodon::MastodonClient;
-use crate::slack::{ButtonValue, SUSPEND_ACTION_ID};
+use crate::slack::{
+    ButtonValue, DELETE_ACTION_ID, SUSPEND_ACTION_ID, TEXT_MAX_CHARS, delete_actions_block,
+    truncate_chars,
+};
 
 /// Slack の署名タイムスタンプの許容ずれ(リプレイ攻撃対策)
 const MAX_TIMESTAMP_SKEW_SECS: i64 = 300;
@@ -27,8 +30,24 @@ struct AppState {
     mastodon: MastodonClient,
     signing_secret: String,
     http: reqwest::Client,
-    /// 停止処理中のアカウント ID(多重クリック抑止と shutdown 時の完了待ちに使う)
+    /// 処理中のアカウント ID(多重クリック抑止と shutdown 時の完了待ちに使う)
     in_flight: Mutex<HashSet<String>>,
+}
+
+impl AppState {
+    /// in_flight のロックを取得する。poisoning(ロック保持中のパニック)が起きても
+    /// HashSet 自体は不整合にならないため、パニックを連鎖させず回復して続行する
+    fn lock_in_flight(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Slack メッセージ上のボタンに対応する操作
+enum ButtonAction {
+    Suspend,
+    Delete,
 }
 
 pub async fn run(config: ServeConfig) -> Result<()> {
@@ -56,7 +75,7 @@ pub async fn run(config: ServeConfig) -> Result<()> {
     // 「Mastodon では停止済みなのに Slack が未更新」で中断しないよう、
     // 進行中の停止処理の完了を待ってから終了する
     let deadline = Instant::now() + SHUTDOWN_GRACE;
-    while !state.in_flight.lock().unwrap().is_empty() {
+    while !state.lock_in_flight().is_empty() {
         if Instant::now() >= deadline {
             warn!("shutting down with suspend tasks still in flight");
             break;
@@ -67,11 +86,18 @@ pub async fn run(config: ServeConfig) -> Result<()> {
 }
 
 async fn shutdown_signal() {
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("failed to install SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = sigterm.recv() => {}
+    // SIGTERM ハンドラの登録に失敗してもパニックでサーバを道連れにせず、Ctrl-C のみで継続する
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to install SIGTERM handler, falling back to Ctrl-C only");
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
     info!("shutdown signal received");
 }
@@ -98,18 +124,25 @@ async fn handle_interaction(
         return StatusCode::OK;
     }
 
-    let Some(action) = payload["actions"]
-        .as_array()
-        .and_then(|a| a.iter().find(|a| a["action_id"] == SUSPEND_ACTION_ID))
-    else {
+    let Some((kind, action)) = payload["actions"].as_array().and_then(|arr| {
+        arr.iter().find_map(|a| {
+            let kind = match a["action_id"].as_str()? {
+                SUSPEND_ACTION_ID => ButtonAction::Suspend,
+                DELETE_ACTION_ID => ButtonAction::Delete,
+                _ => return None,
+            };
+            Some((kind, a))
+        })
+    }) else {
         return StatusCode::OK;
     };
 
-    let value: ButtonValue = match action["value"]
-        .as_str()
-        .ok_or_else(|| anyhow!("action has no value"))
-        .and_then(|v| serde_json::from_str(v).context("failed to parse button value"))
-    {
+    // 削除ボタンへの差し替え時に value をそのまま引き継ぐため、生の JSON 文字列も保持する
+    let Some(raw_value) = action["value"].as_str().map(String::from) else {
+        warn!("action has no value");
+        return StatusCode::BAD_REQUEST;
+    };
+    let value: ButtonValue = match serde_json::from_str(&raw_value) {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "invalid button value");
@@ -154,62 +187,141 @@ async fn handle_interaction(
         }));
     }
 
-    // 同一アカウントへの停止処理が既に走っていれば無視する(二重クリック対策)
-    if !state.in_flight.lock().unwrap().insert(value.id.clone()) {
-        info!(account_id = %value.id, "suspension already in progress, ignoring click");
+    // 同一アカウントへの処理が既に走っていれば無視する(二重クリック対策)
+    if !state.lock_in_flight().insert(value.id.clone()) {
+        info!(account_id = %value.id, "action already in progress, ignoring click");
         return StatusCode::OK;
     }
 
-    // Slack は 3 秒以内の応答を要求するため、停止処理は別タスクで行い即座に 200 を返す
+    // Slack は 3 秒以内の応答を要求するため、実処理は別タスクで行い即座に 200 を返す
     tokio::spawn(async move {
-        process_suspend(state, value, user_id, response_url, original_blocks).await;
+        process_action(
+            state,
+            kind,
+            value,
+            raw_value,
+            user_id,
+            response_url,
+            original_blocks,
+        )
+        .await;
     });
 
     StatusCode::OK
 }
 
-/// アカウントを停止し、response_url 経由で元の Slack メッセージを結果で更新する
-async fn process_suspend(
+/// ボタンに応じた Mastodon API を呼び、response_url 経由で元の Slack メッセージを結果で更新する
+async fn process_action(
     state: Arc<AppState>,
+    kind: ButtonAction,
     value: ButtonValue,
+    raw_value: String,
     user_id: String,
     response_url: String,
     mut blocks: Vec<Value>,
 ) {
-    let result = state.mastodon.suspend_account(&value.id).await;
+    // 過去の結果表示(context)はリトライで無制限に蓄積するため毎回除去する。
+    // 成功時は各分岐でボタンも除去・差し替えして再実行を防ぐ(失敗時は再試行できるよう残す)
+    blocks.retain(|b| b["type"] != "context");
 
-    let result_text = match &result {
-        Ok(()) => {
-            info!(account_id = %value.id, acct = %value.acct, "account suspended");
-            format!(
-                ":white_check_mark: <@{user_id}> が `{}` を停止しました",
-                value.acct
-            )
+    let result_text = match kind {
+        ButtonAction::Suspend => {
+            // 手動操作や別の通知メッセージのボタンで既に停止済みの場合は、
+            // 停止 API を呼ばずにその旨を表示して削除ボタンに差し替える。
+            // チェック自体の失敗は停止処理を妨げない(停止 API は冪等)
+            let already_suspended = match state.mastodon.is_account_suspended(&value.id).await {
+                Ok(suspended) => suspended,
+                Err(e) => {
+                    warn!(account_id = %value.id, error = %e, "failed to check suspension state, proceeding to suspend");
+                    false
+                }
+            };
+
+            if already_suspended {
+                info!(account_id = %value.id, acct = %value.acct, "account already suspended, skipping");
+                replace_buttons_with_delete(&mut blocks, &raw_value, &value.acct);
+                format!(":information_source: `{}` は既に停止済みです", value.acct)
+            } else {
+                match state.mastodon.suspend_account(&value.id).await {
+                    Ok(()) => {
+                        info!(account_id = %value.id, acct = %value.acct, "account suspended");
+                        replace_buttons_with_delete(&mut blocks, &raw_value, &value.acct);
+                        format!(
+                            ":white_check_mark: <@{user_id}> が `{}` を停止しました",
+                            value.acct
+                        )
+                    }
+                    Err(e) => {
+                        error!(account_id = %value.id, error = %e, "failed to suspend account");
+                        format!(":x: `{}` の停止に失敗しました: {e}", value.acct)
+                    }
+                }
+            }
         }
-        Err(e) => {
-            error!(account_id = %value.id, error = %e, "failed to suspend account");
-            format!(":x: `{}` の停止に失敗しました: {e}", value.acct)
-        }
+        // 削除は取り返しがつかないため、Slack メッセージ上のボタンの存在だけを信用せず、
+        // 停止済みであることをサーバ側でも確認してから実行する
+        // (停止後に手動で停止解除された古いボタンが押されるケースへの防御)
+        ButtonAction::Delete => match state.mastodon.is_account_suspended(&value.id).await {
+            Ok(true) => match state.mastodon.delete_account(&value.id).await {
+                Ok(()) => {
+                    info!(account_id = %value.id, acct = %value.acct, "account data deleted");
+                    // 削除は最後の操作なのでボタンを除去する
+                    blocks.retain(|b| b["type"] != "actions");
+                    format!(
+                        ":wastebasket: <@{user_id}> が `{}` のデータを削除しました",
+                        value.acct
+                    )
+                }
+                Err(e) => {
+                    error!(account_id = %value.id, error = %e, "failed to delete account");
+                    format!(":x: `{}` の削除に失敗しました: {e}", value.acct)
+                }
+            },
+            Ok(false) => {
+                warn!(account_id = %value.id, "account is not suspended, refusing to delete");
+                format!(
+                    ":x: `{}` は停止されていないため削除を中止しました(停止が解除された可能性があります)",
+                    value.acct
+                )
+            }
+            Err(e) => {
+                error!(account_id = %value.id, error = %e, "failed to check suspension state, aborting delete");
+                format!(
+                    ":x: `{}` の停止状態を確認できなかったため削除を中止しました: {e}",
+                    value.acct
+                )
+            }
+        },
     };
 
-    // 過去の結果表示(context)はリトライで無制限に蓄積するため毎回除去し、
-    // 成功時はボタンも除去して再実行を防ぐ(失敗時は再試行できるよう残す)
-    blocks.retain(|b| b["type"] != "context");
-    if result.is_ok() {
-        blocks.retain(|b| b["type"] != "actions");
-    }
-    blocks.push(json!({
-        "type": "context",
-        "elements": [{ "type": "mrkdwn", "text": result_text }]
-    }));
-
+    blocks.push(context_block(&result_text));
     let update = json!({
         "replace_original": true,
         "text": result_text,
         "blocks": blocks,
     });
+    post_to_slack(&state.http, &response_url, &update).await;
 
-    match state.http.post(&response_url).json(&update).send().await {
+    state.lock_in_flight().remove(&value.id);
+}
+
+/// 停止完了後: 停止ボタンを除去し、削除ボタンに差し替える
+fn replace_buttons_with_delete(blocks: &mut Vec<Value>, value_json: &str, acct: &str) {
+    blocks.retain(|b| b["type"] != "actions");
+    blocks.push(delete_actions_block(value_json, acct));
+}
+
+fn context_block(text: &str) -> Value {
+    json!({
+        "type": "context",
+        // Mastodon のエラーボディ等で上限を超えると invalid_blocks で
+        // 更新ごと失われるため、必ず切り詰める
+        "elements": [{ "type": "mrkdwn", "text": truncate_chars(text, TEXT_MAX_CHARS) }]
+    })
+}
+
+async fn post_to_slack(http: &reqwest::Client, url: &str, payload: &Value) {
+    match http.post(url).json(payload).send().await {
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -218,8 +330,6 @@ async fn process_suspend(
         Ok(_) => {}
         Err(e) => error!(error = %e, "Slack message update request failed"),
     }
-
-    state.in_flight.lock().unwrap().remove(&value.id);
 }
 
 /// `payload=<JSON>` 形式のフォームボディをパースする
@@ -247,7 +357,7 @@ fn verify_signature(secret: &str, headers: &HeaderMap, body: &[u8]) -> Result<()
     let ts: i64 = timestamp.parse().context("timestamp is not a number")?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock is before the UNIX epoch")
+        .context("system clock is before the UNIX epoch")?
         .as_secs() as i64;
     if (now - ts).abs() > MAX_TIMESTAMP_SKEW_SECS {
         bail!("timestamp outside allowed window (possible replay)");

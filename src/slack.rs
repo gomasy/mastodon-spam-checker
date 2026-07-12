@@ -13,9 +13,11 @@ const APP_NAME: &str = "Mastodon Spam Checker";
 
 /// 停止ボタンの action_id(serve モードのハンドラと共有)
 pub const SUSPEND_ACTION_ID: &str = "suspend_account";
+/// 削除ボタンの action_id(停止後のメッセージにのみ現れる)
+pub const DELETE_ACTION_ID: &str = "delete_account";
 
-/// Block Kit の section text(mrkdwn)の文字数上限
-const SECTION_TEXT_MAX_CHARS: usize = 3000;
+/// Block Kit の text オブジェクト(mrkdwn)の文字数上限(section / context 共通)
+pub(crate) const TEXT_MAX_CHARS: usize = 3000;
 /// Block Kit の confirm ダイアログ text の文字数上限
 const CONFIRM_TEXT_MAX_CHARS: usize = 300;
 
@@ -80,7 +82,7 @@ impl SlackNotifier {
                 "type": "section",
                 // LLM の reason やプロフィール由来の文字列は無制限のため、
                 // 上限超過で invalid_blocks になり通知ごと失われるのを防ぐ
-                "text": { "type": "mrkdwn", "text": truncate_chars(&text, SECTION_TEXT_MAX_CHARS) }
+                "text": { "type": "mrkdwn", "text": truncate_chars(&text, TEXT_MAX_CHARS) }
             },
             {
                 "type": "actions",
@@ -131,8 +133,37 @@ impl SlackNotifier {
     }
 }
 
+/// 停止後のメッセージに差し込む「アカウントを削除」ボタンの actions ブロック
+/// (DELETE /api/v1/admin/accounts/:id は停止済みアカウントにのみ有効)
+/// value_json には停止ボタンの value(ButtonValue の JSON)をそのまま渡す
+pub fn delete_actions_block(value_json: &str, acct: &str) -> Value {
+    json!({
+        "type": "actions",
+        "elements": [{
+            "type": "button",
+            "action_id": DELETE_ACTION_ID,
+            "style": "danger",
+            "text": { "type": "plain_text", "text": "アカウントを削除" },
+            "value": value_json,
+            "confirm": {
+                "style": "danger",
+                "title": { "type": "plain_text", "text": "アカウント削除" },
+                "text": {
+                    "type": "mrkdwn",
+                    "text": truncate_chars(
+                        &format!("`{acct}` のデータを完全に削除します。この操作は取り消せません。よろしいですか?"),
+                        CONFIRM_TEXT_MAX_CHARS,
+                    )
+                },
+                "confirm": { "type": "plain_text", "text": "削除する" },
+                "deny": { "type": "plain_text", "text": "キャンセル" }
+            }
+        }]
+    })
+}
+
 /// 文字数(chars)で切り詰め、超過時は末尾を … にする
-fn truncate_chars(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {

@@ -88,6 +88,37 @@ impl MastodonClient {
         Ok(accounts)
     }
 
+    /// アカウントが停止済みかどうかを返す(要 admin:read:accounts スコープ)
+    pub async fn is_account_suspended(&self, account_id: &str) -> Result<bool> {
+        let url = format!("{}/api/v1/admin/accounts/{}", self.base_url, account_id);
+
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+            .context("Admin account API request failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Admin account API error (HTTP {status}): {body}");
+        }
+
+        // suspended が欠落・null のバージョン差異でもエラーにせず「未停止」として扱う
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(default)]
+            suspended: Option<bool>,
+        }
+        let account: Resp = resp
+            .json()
+            .await
+            .context("failed to parse admin account response")?;
+        Ok(account.suspended.unwrap_or(false))
+    }
+
     /// アカウントを停止する(要 admin:write:accounts スコープ)
     pub async fn suspend_account(&self, account_id: &str) -> Result<()> {
         let url = format!(
@@ -110,6 +141,30 @@ impl MastodonClient {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             bail!("Admin action API error (HTTP {status}): {body}");
+        }
+
+        Ok(())
+    }
+
+    /// 停止済みアカウントのデータを完全に削除する(要 admin:write:accounts スコープ)
+    /// 停止していないアカウントに対しては Mastodon 側が拒否する
+    pub async fn delete_account(&self, account_id: &str) -> Result<()> {
+        let url = format!("{}/api/v1/admin/accounts/{}", self.base_url, account_id);
+
+        info!(account_id = %account_id, "deleting account data");
+
+        let resp = self
+            .client
+            .delete(&url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+            .context("Admin account delete API request failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Admin account delete API error (HTTP {status}): {body}");
         }
 
         Ok(())
