@@ -18,11 +18,10 @@ impl Config {
         Ok(Self {
             mastodon_base_url,
             mastodon_access_token,
-            redis_url: std::env::var("REDIS_URL")
-                .unwrap_or_else(|_| "redis://localhost:6379".to_string()),
+            redis_url: env_or("REDIS_URL", "redis://localhost:6379"),
             openai_api_base: required_env("OPENAI_API_BASE")?,
             openai_api_key: required_env("OPENAI_API_KEY")?,
-            openai_model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()),
+            openai_model: env_or("OPENAI_MODEL", "gpt-4o"),
             // response_format 非対応の OpenAI 互換 API では false にする
             openai_json_mode: std::env::var("OPENAI_JSON_MODE")
                 .map(|v| v != "false" && v != "0")
@@ -50,8 +49,7 @@ impl ServeConfig {
             mastodon_base_url,
             mastodon_access_token,
             slack_signing_secret: required_env("SLACK_SIGNING_SECRET")?,
-            listen_addr: std::env::var("LISTEN_ADDR")
-                .unwrap_or_else(|_| "127.0.0.1:8990".to_string()),
+            listen_addr: env_or("LISTEN_ADDR", "127.0.0.1:8990"),
         })
     }
 }
@@ -65,4 +63,8 @@ fn mastodon_env() -> Result<(String, String)> {
 
 fn required_env(key: &str) -> Result<String> {
     std::env::var(key).with_context(|| format!("environment variable {key} is not set"))
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
 }

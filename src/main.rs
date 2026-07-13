@@ -6,7 +6,7 @@ mod redis;
 mod server;
 mod slack;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use tracing::{error, info, warn};
 use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -93,46 +93,15 @@ async fn check() -> Result<()> {
             "checking"
         );
 
-        // リトライ可能なエラーではカーソルを進めず中断し、次回実行でこのアカウントから再開する
-        let statuses = match mastodon.fetch_statuses(&account.id).await {
-            Ok(s) => s,
+        match check_account(&mastodon, &llm, &slack, account).await {
+            Ok(true) => spam_count += 1,
+            Ok(false) => {}
+            // リトライ可能なエラーではカーソルを進めず中断し、次回実行でこのアカウントから再開する
             Err(e) => {
                 error!(
                     username = %account.username,
-                    error = %e,
-                    "failed to fetch statuses; aborting, next run resumes from this account"
-                );
-                break;
-            }
-        };
-
-        match llm.check_spam(account, &statuses).await {
-            Ok(verdict) => {
-                if verdict.spam {
-                    spam_count += 1;
-                    warn!(
-                        username = %account.username,
-                        domain = %domain,
-                        confidence = verdict.confidence,
-                        reason = %verdict.reason,
-                        "spam detected"
-                    );
-                    if let Err(e) = slack.notify_spam(account, &verdict).await {
-                        error!(error = %e, "failed to send Slack notification");
-                    }
-                } else {
-                    info!(
-                        username = %account.username,
-                        domain = %domain,
-                        "not spam"
-                    );
-                }
-            }
-            Err(e) => {
-                error!(
-                    username = %account.username,
-                    error = %e,
-                    "LLM check failed; aborting, next run resumes from this account"
+                    error = format!("{e:#}"),
+                    "check failed; aborting, next run resumes from this account"
                 );
                 break;
             }
@@ -149,6 +118,47 @@ async fn check() -> Result<()> {
     info!(total = accounts.len(), spam = spam_count, "check finished");
 
     Ok(())
+}
+
+/// 1 アカウントの投稿を取得してスパム判定し、スパムなら Slack に通知する。
+/// 戻り値はスパム判定の有無。Err はリトライ可能な失敗(呼び出し側はカーソルを進めず中断する)
+async fn check_account(
+    mastodon: &mastodon::MastodonClient,
+    llm: &llm::LlmClient,
+    slack: &slack::SlackNotifier,
+    account: &mastodon::AdminAccount,
+) -> Result<bool> {
+    let statuses = mastodon
+        .fetch_statuses(&account.id)
+        .await
+        .context("failed to fetch statuses")?;
+    let verdict = llm
+        .check_spam(account, &statuses)
+        .await
+        .context("LLM check failed")?;
+
+    let domain = account.domain.as_deref().unwrap_or("?");
+    if verdict.spam {
+        warn!(
+            username = %account.username,
+            domain = %domain,
+            confidence = verdict.confidence,
+            reason = %verdict.reason,
+            "spam detected"
+        );
+        // 通知失敗で全体を止めない(判定自体は完了しているためカーソルは進めてよい)
+        if let Err(e) = slack.notify_spam(account, &verdict).await {
+            error!(error = %e, "failed to send Slack notification");
+        }
+    } else {
+        info!(
+            username = %account.username,
+            domain = %domain,
+            "not spam"
+        );
+    }
+
+    Ok(verdict.spam)
 }
 
 const SYSTEM_USERNAMES: &[&str] = &["mastodon.internal", "internal.fetch", "system.actor"];

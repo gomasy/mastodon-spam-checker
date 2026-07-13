@@ -50,6 +50,18 @@ enum ButtonAction {
     Delete,
 }
 
+/// ボタンクリックのペイロードから取り出した、処理に必要な情報一式
+struct Interaction {
+    kind: ButtonAction,
+    value: ButtonValue,
+    /// 削除ボタンへの差し替え時に value をそのまま引き継ぐための生 JSON 文字列
+    raw_value: String,
+    user_id: String,
+    response_url: String,
+    /// 元メッセージの blocks(結果表示を差し込んで replace_original に使う)
+    blocks: Vec<Value>,
+}
+
 pub async fn run(config: ServeConfig) -> Result<()> {
     let mastodon = MastodonClient::new(&config.mastodon_base_url, &config.mastodon_access_token);
     let state = Arc::new(AppState {
@@ -112,16 +124,33 @@ async fn handle_interaction(
         return StatusCode::UNAUTHORIZED;
     }
 
-    let mut payload = match parse_payload(&body) {
-        Ok(p) => p,
+    let interaction = match parse_payload(&body).and_then(extract_interaction) {
+        Ok(Some(i)) => i,
+        // 関知しないイベント・ボタンは正常応答して無視する
+        Ok(None) => return StatusCode::OK,
         Err(e) => {
-            warn!(error = %e, "failed to parse payload");
+            warn!(error = %e, "invalid interaction payload");
             return StatusCode::BAD_REQUEST;
         }
     };
 
-    if payload["type"] != "block_actions" {
+    // 同一アカウントへの処理が既に走っていれば無視する(二重クリック対策)
+    if !state.lock_in_flight().insert(interaction.value.id.clone()) {
+        info!(account_id = %interaction.value.id, "action already in progress, ignoring click");
         return StatusCode::OK;
+    }
+
+    // Slack は 3 秒以内の応答を要求するため、実処理は別タスクで行い即座に 200 を返す
+    tokio::spawn(process_action(state, interaction));
+
+    StatusCode::OK
+}
+
+/// block_actions ペイロードから処理対象のボタン操作を取り出す。
+/// 関知しないイベント・ボタンは Ok(None)、必須情報の欠落・不正は Err
+fn extract_interaction(mut payload: Value) -> Result<Option<Interaction>> {
+    if payload["type"] != "block_actions" {
+        return Ok(None);
     }
 
     let Some((kind, action)) = payload["actions"].as_array().and_then(|arr| {
@@ -134,38 +163,31 @@ async fn handle_interaction(
             Some((kind, a))
         })
     }) else {
-        return StatusCode::OK;
+        return Ok(None);
     };
 
-    // 削除ボタンへの差し替え時に value をそのまま引き継ぐため、生の JSON 文字列も保持する
-    let Some(raw_value) = action["value"].as_str().map(String::from) else {
-        warn!("action has no value");
-        return StatusCode::BAD_REQUEST;
-    };
-    let value: ButtonValue = match serde_json::from_str(&raw_value) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "invalid button value");
-            return StatusCode::BAD_REQUEST;
-        }
-    };
+    let raw_value = action["value"]
+        .as_str()
+        .map(String::from)
+        .context("action has no value")?;
+    let value: ButtonValue = serde_json::from_str(&raw_value).context("invalid button value")?;
 
     // Mastodon のアカウント ID は数値のみ。URL パスに埋め込むため、
     // 万一改変された値が届いても別エンドポイントに向かわないよう検証する
     if value.id.is_empty() || !value.id.bytes().all(|b| b.is_ascii_digit()) {
-        warn!(id = %value.id, "account id is not numeric, rejecting");
-        return StatusCode::BAD_REQUEST;
+        bail!("account id is not numeric: {}", value.id);
     }
 
-    let Some(response_url) = payload["response_url"].as_str().map(String::from) else {
-        warn!("payload has no response_url");
-        return StatusCode::BAD_REQUEST;
-    };
+    let response_url = payload["response_url"]
+        .as_str()
+        .map(String::from)
+        .context("payload has no response_url")?;
     let user_id = payload["user"]["id"]
         .as_str()
         .unwrap_or("unknown")
         .to_string();
-    let mut original_blocks: Vec<Value> = payload
+
+    let mut blocks: Vec<Value> = payload
         .get_mut("message")
         .and_then(|m| m.get_mut("blocks"))
         .map(Value::take)
@@ -176,50 +198,38 @@ async fn handle_interaction(
         .unwrap_or_default();
     // blocks が欠けていた場合、replace_original で元の通知内容が
     // 丸ごと消えないよう text から最低限復元する
-    if original_blocks.is_empty()
+    if blocks.is_empty()
         && let Some(text) = payload["message"]["text"]
             .as_str()
             .filter(|t| !t.is_empty())
     {
-        original_blocks.push(json!({
+        blocks.push(json!({
             "type": "section",
             "text": { "type": "mrkdwn", "text": text }
         }));
     }
 
-    // 同一アカウントへの処理が既に走っていれば無視する(二重クリック対策)
-    if !state.lock_in_flight().insert(value.id.clone()) {
-        info!(account_id = %value.id, "action already in progress, ignoring click");
-        return StatusCode::OK;
-    }
-
-    // Slack は 3 秒以内の応答を要求するため、実処理は別タスクで行い即座に 200 を返す
-    tokio::spawn(async move {
-        process_action(
-            state,
-            kind,
-            value,
-            raw_value,
-            user_id,
-            response_url,
-            original_blocks,
-        )
-        .await;
-    });
-
-    StatusCode::OK
+    Ok(Some(Interaction {
+        kind,
+        value,
+        raw_value,
+        user_id,
+        response_url,
+        blocks,
+    }))
 }
 
 /// ボタンに応じた Mastodon API を呼び、response_url 経由で元の Slack メッセージを結果で更新する
-async fn process_action(
-    state: Arc<AppState>,
-    kind: ButtonAction,
-    value: ButtonValue,
-    raw_value: String,
-    user_id: String,
-    response_url: String,
-    mut blocks: Vec<Value>,
-) {
+async fn process_action(state: Arc<AppState>, interaction: Interaction) {
+    let Interaction {
+        kind,
+        value,
+        raw_value,
+        user_id,
+        response_url,
+        mut blocks,
+    } = interaction;
+
     // 過去の結果表示(context)はリトライで無制限に蓄積するため毎回除去する。
     // 成功時は各分岐でボタンも除去・差し替えして再実行を防ぐ(失敗時は再試行できるよう残す)
     blocks.retain(|b| b["type"] != "context");
@@ -461,5 +471,76 @@ mod tests {
         let body = b"payload=%7B%22type%22%3A%22block_actions%22%7D";
         let v = parse_payload(body).unwrap();
         assert_eq!(v["type"], "block_actions");
+    }
+
+    #[test]
+    fn interaction_is_extracted_from_suspend_click() {
+        let payload = json!({
+            "type": "block_actions",
+            "response_url": "https://hooks.slack.com/actions/xxx",
+            "user": { "id": "U123" },
+            "message": {
+                "text": "notice",
+                "blocks": [{ "type": "section" }]
+            },
+            "actions": [{
+                "action_id": SUSPEND_ACTION_ID,
+                "value": r#"{"id":"42","acct":"alice@example.com"}"#
+            }]
+        });
+        let i = extract_interaction(payload).unwrap().unwrap();
+        assert!(matches!(i.kind, ButtonAction::Suspend));
+        assert_eq!(i.value.id, "42");
+        assert_eq!(i.value.acct, "alice@example.com");
+        assert_eq!(i.raw_value, r#"{"id":"42","acct":"alice@example.com"}"#);
+        assert_eq!(i.user_id, "U123");
+        assert_eq!(i.response_url, "https://hooks.slack.com/actions/xxx");
+        assert_eq!(i.blocks.len(), 1);
+    }
+
+    #[test]
+    fn unrelated_events_and_buttons_are_ignored() {
+        // block_actions 以外のイベント
+        let none = extract_interaction(json!({ "type": "view_submission" })).unwrap();
+        assert!(none.is_none());
+
+        // 関知しない action_id のボタン
+        let payload = json!({
+            "type": "block_actions",
+            "actions": [{ "action_id": "other_button", "value": "{}" }]
+        });
+        assert!(extract_interaction(payload).unwrap().is_none());
+    }
+
+    #[test]
+    fn non_numeric_account_id_is_rejected() {
+        // URL パスに埋め込まれるため、数値以外(パストラバーサル等)は拒否する
+        let payload = json!({
+            "type": "block_actions",
+            "response_url": "https://hooks.slack.com/actions/xxx",
+            "actions": [{
+                "action_id": SUSPEND_ACTION_ID,
+                "value": r#"{"id":"42/action","acct":"alice@example.com"}"#
+            }]
+        });
+        assert!(extract_interaction(payload).is_err());
+    }
+
+    #[test]
+    fn missing_blocks_are_restored_from_text() {
+        let payload = json!({
+            "type": "block_actions",
+            "response_url": "https://hooks.slack.com/actions/xxx",
+            "user": { "id": "U1" },
+            "message": { "text": "original notice" },
+            "actions": [{
+                "action_id": DELETE_ACTION_ID,
+                "value": r#"{"id":"7","acct":"bob@example.com"}"#
+            }]
+        });
+        let i = extract_interaction(payload).unwrap().unwrap();
+        assert!(matches!(i.kind, ButtonAction::Delete));
+        assert_eq!(i.blocks.len(), 1);
+        assert_eq!(i.blocks[0]["text"]["text"], "original notice");
     }
 }

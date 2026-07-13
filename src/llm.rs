@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +31,7 @@ struct ResponseFormat {
 
 #[derive(Serialize)]
 struct Message {
-    role: String,
+    role: &'static str,
     content: String,
 }
 
@@ -102,11 +102,11 @@ impl LlmClient {
             model: self.model.clone(),
             messages: vec![
                 Message {
-                    role: "system".to_string(),
+                    role: "system",
                     content: SYSTEM_PROMPT.to_string(),
                 },
                 Message {
-                    role: "user".to_string(),
+                    role: "user",
                     content: user_prompt,
                 },
             ],
@@ -126,12 +126,7 @@ impl LlmClient {
             .send()
             .await
             .context("LLM API request failed")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("LLM API error (HTTP {status}): {body}");
-        }
+        let resp = http::ensure_success(resp, "LLM API").await?;
 
         let resp: ChatResponse = resp.json().await.context("failed to parse LLM response")?;
 

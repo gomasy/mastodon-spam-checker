@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use reqwest::{Client, StatusCode};
+use anyhow::{Context, Result};
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -51,6 +51,16 @@ impl MastodonClient {
         self.client.clone()
     }
 
+    /// 認証を付けて送信し、非成功ステータスはボディ付きエラーにする
+    async fn send(&self, req: RequestBuilder, what: &str) -> Result<Response> {
+        let resp = req
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+            .with_context(|| format!("{what} request failed"))?;
+        http::ensure_success(resp, what).await
+    }
+
     pub async fn fetch_remote_accounts(&self, min_id: Option<&str>) -> Result<Vec<AdminAccount>> {
         let mut url = format!(
             "{}/api/v2/admin/accounts?origin=remote&limit=100",
@@ -63,19 +73,8 @@ impl MastodonClient {
         info!(url = %url, "fetching accounts");
 
         let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.access_token)
-            .send()
-            .await
-            .context("Mastodon Admin API request failed")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Admin API error (HTTP {status}): {body}");
-        }
-
+            .send(self.client.get(&url), "Admin accounts API")
+            .await?;
         let mut accounts: Vec<AdminAccount> = resp
             .json()
             .await
@@ -93,18 +92,8 @@ impl MastodonClient {
         let url = format!("{}/api/v1/admin/accounts/{}", self.base_url, account_id);
 
         let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.access_token)
-            .send()
-            .await
-            .context("Admin account API request failed")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Admin account API error (HTTP {status}): {body}");
-        }
+            .send(self.client.get(&url), "Admin account API")
+            .await?;
 
         // suspended が欠落・null のバージョン差異でもエラーにせず「未停止」として扱う
         #[derive(Deserialize)]
@@ -128,20 +117,11 @@ impl MastodonClient {
 
         info!(account_id = %account_id, "suspending account");
 
-        let resp = self
+        let req = self
             .client
             .post(&url)
-            .bearer_auth(&self.access_token)
-            .json(&serde_json::json!({ "type": "suspend" }))
-            .send()
-            .await
-            .context("Admin action API request failed")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Admin action API error (HTTP {status}): {body}");
-        }
+            .json(&serde_json::json!({ "type": "suspend" }));
+        self.send(req, "Admin action API").await?;
 
         Ok(())
     }
@@ -153,19 +133,8 @@ impl MastodonClient {
 
         info!(account_id = %account_id, "deleting account data");
 
-        let resp = self
-            .client
-            .delete(&url)
-            .bearer_auth(&self.access_token)
-            .send()
-            .await
-            .context("Admin account delete API request failed")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Admin account delete API error (HTTP {status}): {body}");
-        }
+        self.send(self.client.delete(&url), "Admin account delete API")
+            .await?;
 
         Ok(())
     }
@@ -186,18 +155,15 @@ impl MastodonClient {
             .await
             .context("Statuses API request failed")?;
 
-        let status = resp.status();
         // アカウント削除済み等の恒久的エラーは「投稿なし」として扱い、
         // プロフィールのみで判定を続行する(呼び出し側で中断させない)
+        let status = resp.status();
         if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
             warn!(account_id = %account_id, %status, "statuses unavailable, treating as no posts");
             return Ok(Vec::new());
         }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Statuses API error (HTTP {status}): {body}");
-        }
 
+        let resp = http::ensure_success(resp, "Statuses API").await?;
         let statuses: Vec<Status> = resp
             .json()
             .await

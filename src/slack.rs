@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -84,29 +84,14 @@ impl SlackNotifier {
                 // 上限超過で invalid_blocks になり通知ごと失われるのを防ぐ
                 "text": { "type": "mrkdwn", "text": truncate_chars(&text, TEXT_MAX_CHARS) }
             },
-            {
-                "type": "actions",
-                "elements": [{
-                    "type": "button",
-                    "action_id": SUSPEND_ACTION_ID,
-                    "style": "danger",
-                    "text": { "type": "plain_text", "text": "アカウントを停止" },
-                    "value": value,
-                    "confirm": {
-                        "style": "danger",
-                        "title": { "type": "plain_text", "text": "アカウント停止" },
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": truncate_chars(
-                                &format!("`{acct}` を停止します。よろしいですか?"),
-                                CONFIRM_TEXT_MAX_CHARS,
-                            )
-                        },
-                        "confirm": { "type": "plain_text", "text": "停止する" },
-                        "deny": { "type": "plain_text", "text": "キャンセル" }
-                    }
-                }]
-            }
+            confirm_actions_block(
+                SUSPEND_ACTION_ID,
+                "アカウントを停止",
+                &value,
+                "アカウント停止",
+                &format!("`{acct}` を停止します。よろしいですか?"),
+                "停止する",
+            ),
         ]);
 
         let resp = self
@@ -122,12 +107,7 @@ impl SlackNotifier {
             .send()
             .await
             .context("Slack webhook request failed")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Slack webhook error (HTTP {status}): {body}");
-        }
+        http::ensure_success(resp, "Slack webhook").await?;
 
         Ok(())
     }
@@ -137,25 +117,41 @@ impl SlackNotifier {
 /// (DELETE /api/v1/admin/accounts/:id は停止済みアカウントにのみ有効)
 /// value_json には停止ボタンの value(ButtonValue の JSON)をそのまま渡す
 pub fn delete_actions_block(value_json: &str, acct: &str) -> Value {
+    confirm_actions_block(
+        DELETE_ACTION_ID,
+        "アカウントを削除",
+        value_json,
+        "アカウント削除",
+        &format!("`{acct}` のデータを完全に削除します。この操作は取り消せません。よろしいですか?"),
+        "削除する",
+    )
+}
+
+/// confirm ダイアログ付き danger ボタン 1 つの actions ブロックを生成する
+fn confirm_actions_block(
+    action_id: &str,
+    label: &str,
+    value: &str,
+    confirm_title: &str,
+    confirm_text: &str,
+    confirm_label: &str,
+) -> Value {
     json!({
         "type": "actions",
         "elements": [{
             "type": "button",
-            "action_id": DELETE_ACTION_ID,
+            "action_id": action_id,
             "style": "danger",
-            "text": { "type": "plain_text", "text": "アカウントを削除" },
-            "value": value_json,
+            "text": { "type": "plain_text", "text": label },
+            "value": value,
             "confirm": {
                 "style": "danger",
-                "title": { "type": "plain_text", "text": "アカウント削除" },
+                "title": { "type": "plain_text", "text": confirm_title },
                 "text": {
                     "type": "mrkdwn",
-                    "text": truncate_chars(
-                        &format!("`{acct}` のデータを完全に削除します。この操作は取り消せません。よろしいですか?"),
-                        CONFIRM_TEXT_MAX_CHARS,
-                    )
+                    "text": truncate_chars(confirm_text, CONFIRM_TEXT_MAX_CHARS)
                 },
-                "confirm": { "type": "plain_text", "text": "削除する" },
+                "confirm": { "type": "plain_text", "text": confirm_label },
                 "deny": { "type": "plain_text", "text": "キャンセル" }
             }
         }]
