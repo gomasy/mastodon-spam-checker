@@ -8,6 +8,8 @@ pub struct Config {
     pub openai_api_key: String,
     pub openai_model: String,
     pub openai_json_mode: bool,
+    /// スパム確信度がこの閾値(0.0-1.0)未満なら Slack 通知をスキップする
+    pub spam_confidence_threshold: f64,
     pub slack_webhook_url: String,
     pub slack_channel: Option<String>,
 }
@@ -26,6 +28,12 @@ impl Config {
             openai_json_mode: std::env::var("OPENAI_JSON_MODE")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
+            // 未設定・パース失敗時は 0.0(すべて通知)で従来互換
+            spam_confidence_threshold: std::env::var("SPAM_CONFIDENCE_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| (0.0..=1.0).contains(v))
+                .unwrap_or(0.0),
             slack_webhook_url: required_env("SLACK_WEBHOOK_URL")?,
             slack_channel: std::env::var("SLACK_CHANNEL")
                 .ok()

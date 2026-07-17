@@ -78,16 +78,24 @@ pub struct LlmClient {
     api_key: String,
     model: String,
     json_mode: bool,
+    retry: http::RetryConfig,
 }
 
 impl LlmClient {
-    pub fn new(api_base: &str, api_key: &str, model: &str, json_mode: bool) -> Self {
+    pub fn new(
+        api_base: &str,
+        api_key: &str,
+        model: &str,
+        json_mode: bool,
+        retry: http::RetryConfig,
+    ) -> Self {
         Self {
             client: http::client(Duration::from_secs(120)),
             api_base: api_base.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
             json_mode,
+            retry,
         }
     }
 
@@ -118,15 +126,18 @@ impl LlmClient {
 
         let url = format!("{}/chat/completions", self.api_base);
 
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&request)
-            .send()
-            .await
-            .context("LLM API request failed")?;
-        let resp = http::ensure_success(resp, "LLM API").await?;
+        // 一時的な 429 / 5xx・タイムアウトは指数バックオフで再試行する
+        let resp = http::send_with_retry(
+            || {
+                self.client
+                    .post(&url)
+                    .bearer_auth(&self.api_key)
+                    .json(&request)
+            },
+            "LLM API",
+            self.retry,
+        )
+        .await?;
 
         let resp: ChatResponse = resp.json().await.context("failed to parse LLM response")?;
 

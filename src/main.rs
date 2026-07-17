@@ -33,16 +33,25 @@ async fn main() -> Result<()> {
         .init();
 
     match std::env::args().nth(1).as_deref() {
-        None => check().await,
+        None => check(false).await,
         Some("serve") => server::run(config::ServeConfig::from_env()?).await,
-        Some(cmd) => bail!("unknown subcommand: {cmd} (usage: mastodon-spam-checker [serve])"),
+        Some("dry-run") => check(true).await,
+        Some(cmd) => bail!(
+            "unknown subcommand: {cmd} (usage: mastodon-spam-checker [serve|dry-run])"
+        ),
     }
 }
 
 /// 新規リモートアカウントを取得してスパム判定する(デフォルトの一発実行モード)
-async fn check() -> Result<()> {
+///
+/// `dry_run` が true の場合、Slack 通知とカーソル更新をスキップし、判定のみを行う。
+async fn check(dry_run: bool) -> Result<()> {
     let config = config::Config::from_env()?;
-    info!("configuration loaded");
+    info!(
+        dry_run,
+        threshold = config.spam_confidence_threshold,
+        "configuration loaded"
+    );
 
     let mut cursor_store = redis::CursorStore::new(&config.redis_url).await?;
     let mastodon =
@@ -52,8 +61,11 @@ async fn check() -> Result<()> {
         &config.openai_api_key,
         &config.openai_model,
         config.openai_json_mode,
+        http::RetryConfig::default(),
     );
     let slack = slack::SlackNotifier::new(&config.slack_webhook_url, config.slack_channel);
+    // slack_channel を SlackNotifier へムーブした後も使えるよう、閾値(コピー型)は先に取り出す
+    let threshold = config.spam_confidence_threshold;
 
     let cursor = cursor_store.get_cursor().await?;
     info!(
@@ -71,7 +83,8 @@ async fn check() -> Result<()> {
     info!(count = accounts.len(), "fetched new remote accounts");
 
     let mut last_id: Option<String> = None;
-    let mut spam_count = 0u32;
+    let mut spam_detected = 0u32;
+    let mut spam_notified = 0u32;
 
     for account in &accounts {
         let domain = account.domain.as_deref().unwrap_or("?");
@@ -93,9 +106,15 @@ async fn check() -> Result<()> {
             "checking"
         );
 
-        match check_account(&mastodon, &llm, &slack, account).await {
-            Ok(true) => spam_count += 1,
-            Ok(false) => {}
+        match check_account(&mastodon, &llm, &slack, account, threshold, dry_run).await {
+            // スパム検出(通知したかどうかは内部で集計)
+            Ok(Some(notified)) => {
+                spam_detected += 1;
+                if notified {
+                    spam_notified += 1;
+                }
+            }
+            Ok(None) => {}
             // リトライ可能なエラーではカーソルを進めず中断し、次回実行でこのアカウントから再開する
             Err(e) => {
                 error!(
@@ -110,24 +129,47 @@ async fn check() -> Result<()> {
         last_id = Some(account.id.clone());
     }
 
-    if let Some(ref id) = last_id {
-        cursor_store.set_cursor(id).await?;
-        info!(cursor = %id, "cursor saved");
+    // dry-run ではカーソルを進めず、次回も同じアカウントから判定できるようにする
+    if !dry_run {
+        if let Some(ref id) = last_id {
+            cursor_store.set_cursor(id).await?;
+            info!(cursor = %id, "cursor saved");
+        }
+    } else {
+        info!("dry-run: cursor not updated");
     }
 
-    info!(total = accounts.len(), spam = spam_count, "check finished");
+    if dry_run {
+        info!(
+            total = accounts.len(),
+            spam_detected,
+            spam_notified,
+            "dry-run finished"
+        );
+    } else {
+        info!(
+            total = accounts.len(),
+            spam_detected,
+            spam_notified,
+            "check finished"
+        );
+    }
 
     Ok(())
 }
 
-/// 1 アカウントの投稿を取得してスパム判定し、スパムなら Slack に通知する。
-/// 戻り値はスパム判定の有無。Err はリトライ可能な失敗(呼び出し側はカーソルを進めず中断する)
+/// 1 アカウントの投稿を取得してスパム判定し、スパム(かつ確信度が閾値以上)なら Slack に通知する。
+///
+/// 戻り値: `Some(notified)` = スパム検出(`notified` は Slack へ通知したか)、`None` = 非スパム。
+/// `Err` はリトライ可能な失敗(呼び出し側はカーソルを進めず中断する)。
 async fn check_account(
     mastodon: &mastodon::MastodonClient,
     llm: &llm::LlmClient,
     slack: &slack::SlackNotifier,
     account: &mastodon::AdminAccount,
-) -> Result<bool> {
+    threshold: f64,
+    dry_run: bool,
+) -> Result<Option<bool>> {
     let statuses = mastodon
         .fetch_statuses(&account.id)
         .await
@@ -138,27 +180,47 @@ async fn check_account(
         .context("LLM check failed")?;
 
     let domain = account.domain.as_deref().unwrap_or("?");
-    if verdict.spam {
-        warn!(
-            username = %account.username,
-            domain = %domain,
-            confidence = verdict.confidence,
-            reason = %verdict.reason,
-            "spam detected"
-        );
-        // 通知失敗で全体を止めない(判定自体は完了しているためカーソルは進めてよい)
-        if let Err(e) = slack.notify_spam(account, &verdict).await {
-            error!(error = %e, "failed to send Slack notification");
-        }
-    } else {
+    if !verdict.spam {
         info!(
             username = %account.username,
             domain = %domain,
             "not spam"
         );
+        return Ok(None);
     }
 
-    Ok(verdict.spam)
+    // LLM はスパムと判定したが、確信度が閾値未満なら通知・記録のノイズになるためスキップ
+    if verdict.confidence < threshold {
+        info!(
+            username = %account.username,
+            domain = %domain,
+            confidence = verdict.confidence,
+            threshold = threshold,
+            reason = %verdict.reason,
+            "spam detected but below confidence threshold, skipping notification"
+        );
+        return Ok(Some(false));
+    }
+
+    warn!(
+        username = %account.username,
+        domain = %domain,
+        confidence = verdict.confidence,
+        reason = %verdict.reason,
+        "spam detected"
+    );
+
+    if dry_run {
+        info!(username = %account.username, "dry-run: skip Slack notification");
+        return Ok(Some(false));
+    }
+
+    // 通知失敗で全体を止めない(判定自体は完了しているためカーソルは進めてよい)
+    if let Err(e) = slack.notify_spam(account, &verdict).await {
+        error!(error = %e, "failed to send Slack notification");
+    }
+
+    Ok(Some(true))
 }
 
 const SYSTEM_USERNAMES: &[&str] = &["mastodon.internal", "internal.fetch", "system.actor"];

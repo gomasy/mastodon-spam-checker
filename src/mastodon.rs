@@ -35,6 +35,7 @@ pub struct MastodonClient {
     client: Client,
     base_url: String,
     access_token: String,
+    retry: http::RetryConfig,
 }
 
 impl MastodonClient {
@@ -43,6 +44,7 @@ impl MastodonClient {
             client: http::client(Duration::from_secs(30)),
             base_url: base_url.trim_end_matches('/').to_string(),
             access_token: access_token.to_string(),
+            retry: http::RetryConfig::default(),
         }
     }
 
@@ -51,7 +53,8 @@ impl MastodonClient {
         self.client.clone()
     }
 
-    /// 認証を付けて送信し、非成功ステータスはボディ付きエラーにする
+    /// 認証を付けて送信し、非成功ステータスはボディ付きエラーにする(リトライなし)。
+    /// 副作用のある書き込み系(停止・削除)に使う。
     async fn send(&self, req: RequestBuilder, what: &str) -> Result<Response> {
         let resp = req
             .bearer_auth(&self.access_token)
@@ -59,6 +62,15 @@ impl MastodonClient {
             .await
             .with_context(|| format!("{what} request failed"))?;
         http::ensure_success(resp, what).await
+    }
+
+    /// 認証を付け、一時障害を指数バックオフで再試行して送信する。
+    /// 冪等な読み取り系(GET)に使う。`build` は毎回新しい `RequestBuilder` を生成する。
+    async fn send_retry<F>(&self, build: F, what: &str) -> Result<Response>
+    where
+        F: Fn() -> RequestBuilder,
+    {
+        http::send_with_retry(|| build().bearer_auth(&self.access_token), what, self.retry).await
     }
 
     pub async fn fetch_remote_accounts(&self, min_id: Option<&str>) -> Result<Vec<AdminAccount>> {
@@ -73,7 +85,7 @@ impl MastodonClient {
         info!(url = %url, "fetching accounts");
 
         let resp = self
-            .send(self.client.get(&url), "Admin accounts API")
+            .send_retry(|| self.client.get(&url), "Admin accounts API")
             .await?;
         let mut accounts: Vec<AdminAccount> = resp
             .json()
@@ -92,7 +104,7 @@ impl MastodonClient {
         let url = format!("{}/api/v1/admin/accounts/{}", self.base_url, account_id);
 
         let resp = self
-            .send(self.client.get(&url), "Admin account API")
+            .send_retry(|| self.client.get(&url), "Admin account API")
             .await?;
 
         // suspended が欠落・null のバージョン差異でもエラーにせず「未停止」として扱う
@@ -147,13 +159,12 @@ impl MastodonClient {
 
         info!(account_id = %account_id, "fetching statuses");
 
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.access_token)
-            .send()
-            .await
-            .context("Statuses API request failed")?;
+        let resp = http::send_with_retry_raw(
+            || self.client.get(&url).bearer_auth(&self.access_token),
+            "Statuses API",
+            self.retry,
+        )
+        .await?;
 
         // アカウント削除済み等の恒久的エラーは「投稿なし」として扱い、
         // プロフィールのみで判定を続行する(呼び出し側で中断させない)

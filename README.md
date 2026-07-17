@@ -29,6 +29,36 @@ the cursor, so the next run resumes from the same account. Deleted accounts
 The prompt treats all account data as untrusted: instructions embedded in
 profiles or posts are themselves considered a spam indicator.
 
+### Retries and backoff
+
+Transient failures on the Mastodon Admin API (429 rate-limit and 5xx) and
+the LLM API (429 / 5xx) are retried with exponential backoff (base 500 ms,
+doubling up to 3 retries). A `429` response carrying a `Retry-After` header
+is honored instead of the computed backoff. Network-level errors (timeouts,
+connection failures) are retried the same way. Non-retryable errors (e.g.
+4xx other than 429) stop the run without advancing the cursor, so the next
+run resumes from the same account.
+
+### Confidence threshold
+
+Set `SPAM_CONFIDENCE_THRESHOLD` (0.0–1.0) to suppress noisy notifications.
+An account the LLM judges as spam is only reported to Slack when its
+`confidence` meets or exceeds the threshold; detections below the threshold
+are logged but otherwise ignored. The default `0.0` preserves the original
+behavior of notifying on every spam verdict.
+
+### Dry-run mode
+
+```sh
+./target/release/mastodon-spam-checker dry-run
+```
+
+Runs the same fetch → LLM judgment pipeline but **does not** send Slack
+notifications and **does not** advance the Redis cursor. Useful for tuning
+the prompt, model, or `SPAM_CONFIDENCE_THRESHOLD` without spamming moderators
+or consuming the cursor. The judgment results (including below-threshold
+detections) are still logged.
+
 ## Requirements
 
 - A Mastodon access token with the `admin:read:accounts` scope
@@ -62,6 +92,7 @@ cp .env.example .env
 | `OPENAI_API_KEY` | ✅ | – | API key |
 | `OPENAI_MODEL` | | `gpt-4o` | Model name |
 | `OPENAI_JSON_MODE` | | `true` | Set to `false` for APIs without `response_format` support |
+| `SPAM_CONFIDENCE_THRESHOLD` | | `0.0` | Skip Slack notifications for spam verdicts with confidence below this value (0.0–1.0). `0.0` notifies on every spam verdict (backward compatible). |
 | `SLACK_WEBHOOK_URL` | ✅ | – | Slack incoming webhook URL |
 | `SLACK_CHANNEL` | | – | Override the webhook's default channel. Only honored by legacy custom-integration webhooks — Slack-app webhooks (required for the suspend button) ignore channel/username/icon overrides and always post to the channel chosen at install time. Quote the value (`"#spam-alerts"`) so `#` is not parsed as a comment |
 | `SLACK_SIGNING_SECRET` | `serve` only | – | Signing secret of your Slack app (Basic Information page) |
