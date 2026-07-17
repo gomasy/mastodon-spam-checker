@@ -36,9 +36,9 @@ async fn main() -> Result<()> {
         None => check(false).await,
         Some("serve") => server::run(config::ServeConfig::from_env()?).await,
         Some("dry-run") => check(true).await,
-        Some(cmd) => bail!(
-            "unknown subcommand: {cmd} (usage: mastodon-spam-checker [serve|dry-run])"
-        ),
+        Some(cmd) => {
+            bail!("unknown subcommand: {cmd} (usage: mastodon-spam-checker [serve|dry-run])")
+        }
     }
 }
 
@@ -142,16 +142,12 @@ async fn check(dry_run: bool) -> Result<()> {
     if dry_run {
         info!(
             total = accounts.len(),
-            spam_detected,
-            spam_notified,
-            "dry-run finished"
+            spam_detected, spam_notified, "dry-run finished"
         );
     } else {
         info!(
             total = accounts.len(),
-            spam_detected,
-            spam_notified,
-            "check finished"
+            spam_detected, spam_notified, "check finished"
         );
     }
 
