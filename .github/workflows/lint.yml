@@ -6,6 +6,9 @@ on:
     branches:
       - '**'
 
+permissions:
+  contents: read
+
 jobs:
   rustfmt:
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
