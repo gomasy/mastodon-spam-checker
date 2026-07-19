@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 dotenvy = "0.15.7"
 redis = { version = "1.4.1", default-features = false, features = ["tokio-comp"] }
