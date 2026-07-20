@@ -14,7 +14,7 @@ rustls = { version = "0.23.42", default-features = false, features = ["ring", "s
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_urlencoded = "0.7.1"
-tokio = { version = "1.53.0", features = ["rt", "macros", "net", "signal", "time"] }
+tokio = { version = "1.53.1", features = ["rt", "macros", "net", "signal", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 
