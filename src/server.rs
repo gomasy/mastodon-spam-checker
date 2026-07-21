@@ -14,6 +14,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
+use rust_i18n::t;
+
 use crate::config::ServeConfig;
 use crate::mastodon::MastodonClient;
 use crate::slack::{
@@ -261,29 +263,23 @@ async fn process_action(state: Arc<AppState>, interaction: Interaction) {
             if already_suspended {
                 info!(account_id = %value.id, acct = %value.acct, "account already suspended, skipping");
                 replace_buttons_with_delete(&mut blocks, &raw_value, &value.acct);
-                format!(":information_source: `{}` は既に停止済みです", value.acct)
+                t!("already_suspended", acct = &value.acct).to_string()
             } else {
                 match state.mastodon.suspend_account(&value.id).await {
                     Ok(()) => {
                         info!(account_id = %value.id, acct = %value.acct, "account suspended");
                         replace_buttons_with_delete(&mut blocks, &raw_value, &value.acct);
                         if let Some(ref writer) = state.note_writer {
-                            let note = format!(
-                                "[Mastodon Spam Checker] Slack 経由でアカウントを停止 (操作者: <@{}>)",
-                                user_id,
-                            );
+                            let note = t!("note_suspended", user_id = &user_id);
                             if let Err(e) = writer.add_note(&value.id, &note).await {
                                 error!(error = %e, "failed to add moderation note");
                             }
                         }
-                        format!(
-                            ":white_check_mark: <@{user_id}> が `{}` を停止しました",
-                            value.acct
-                        )
+                        t!("suspended", user_id = &user_id, acct = &value.acct).to_string()
                     }
                     Err(e) => {
                         error!(account_id = %value.id, error = %e, "failed to suspend account");
-                        format!(":x: `{}` の停止に失敗しました: {e}", value.acct)
+                        t!("suspend_failed", acct = &value.acct, error = e.to_string()).to_string()
                     }
                 }
             }
@@ -296,29 +292,20 @@ async fn process_action(state: Arc<AppState>, interaction: Interaction) {
                 Ok(()) => {
                     info!(account_id = %value.id, acct = %value.acct, "account data deleted");
                     blocks.retain(|b| b["type"] != "actions");
-                    format!(
-                        ":wastebasket: <@{user_id}> が `{}` のデータを削除しました",
-                        value.acct
-                    )
+                    t!("deleted", user_id = &user_id, acct = &value.acct).to_string()
                 }
                 Err(e) => {
                     error!(account_id = %value.id, error = %e, "failed to delete account");
-                    format!(":x: `{}` の削除に失敗しました: {e}", value.acct)
+                    t!("delete_failed", acct = &value.acct, error = e.to_string()).to_string()
                 }
             },
             Ok(false) => {
                 warn!(account_id = %value.id, "account is not suspended, refusing to delete");
-                format!(
-                    ":x: `{}` は停止されていないため削除を中止しました(停止が解除された可能性があります)",
-                    value.acct
-                )
+                t!("not_suspended", acct = &value.acct).to_string()
             }
             Err(e) => {
                 error!(account_id = %value.id, error = %e, "failed to check suspension state, aborting delete");
-                format!(
-                    ":x: `{}` の停止状態を確認できなかったため削除を中止しました: {e}",
-                    value.acct
-                )
+                t!("check_failed", acct = &value.acct, error = e.to_string()).to_string()
             }
         },
     };

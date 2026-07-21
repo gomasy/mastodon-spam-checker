@@ -8,8 +8,11 @@ mod server;
 mod slack;
 
 use anyhow::{Context, Result, bail};
+use rust_i18n::t;
 use tracing::{error, info, warn};
 use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
+
+rust_i18n::i18n!("locales", fallback = "en");
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -19,6 +22,9 @@ async fn main() -> Result<()> {
         .expect("failed to install rustls crypto provider");
 
     dotenvy::dotenv().ok();
+
+    let locale = std::env::var("APP_LANG").unwrap_or_else(|_| "en".to_string());
+    rust_i18n::set_locale(&locale);
 
     // Use the lightweight Targets filter instead of EnvFilter to avoid pulling in the regex crate.
     // Honour RUST_LOG if set; otherwise default to INFO for this crate only.
@@ -233,10 +239,10 @@ async fn check_account(
     }
 
     if let Some(writer) = note_writer {
-        let note = format!(
-            "[Mastodon Spam Checker] スパムの疑いあり\n確信度: {:.0}%\n理由: {}",
-            verdict.confidence * 100.0,
-            verdict.reason,
+        let note = t!(
+            "note_spam",
+            confidence = format!("{:.0}", verdict.confidence * 100.0),
+            reason = &verdict.reason,
         );
         if let Err(e) = writer.add_note(&account.id, &note).await {
             error!(error = %e, "failed to add moderation note");

@@ -5,6 +5,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use rust_i18n::t;
+
 use crate::http;
 use crate::llm::SpamVerdict;
 use crate::mastodon::AdminAccount;
@@ -57,19 +59,15 @@ impl SlackNotifier {
     pub async fn notify_spam(&self, account: &AdminAccount, verdict: &SpamVerdict) -> Result<()> {
         let domain = account.domain.as_deref().unwrap_or("(local)");
         let acct = format!("{}@{}", account.username, domain);
-        let text = format!(
-            ":warning: *スパムアカウント検出*\n\
-             • アカウント: `{}`\n\
-             • 表示名: {}\n\
-             • URL: {}\n\
-             • 確信度: {:.0}%\n\
-             • 理由: {}",
-            acct,
-            account.account.display_name,
-            account.account.url,
-            verdict.confidence * 100.0,
-            verdict.reason,
-        );
+        let text = t!(
+            "spam_detected",
+            acct = &acct,
+            display_name = &account.account.display_name,
+            url = &account.account.url,
+            confidence = format!("{:.0}", verdict.confidence * 100.0),
+            reason = &verdict.reason,
+        )
+        .to_string();
 
         let value = serde_json::to_string(&ButtonValue {
             id: account.id.clone(),
@@ -79,17 +77,15 @@ impl SlackNotifier {
         let blocks = json!([
             {
                 "type": "section",
-                // The LLM reason and profile-derived strings are unbounded in length,
-                // so truncate to prevent invalid_blocks errors that would silently drop the entire notification.
                 "text": { "type": "mrkdwn", "text": truncate_chars(&text, TEXT_MAX_CHARS) }
             },
             confirm_actions_block(
                 SUSPEND_ACTION_ID,
-                "アカウントを停止",
+                &t!("btn_suspend"),
                 &value,
-                "アカウント停止",
-                &format!("`{acct}` を停止します。よろしいですか?"),
-                "停止する",
+                &t!("btn_suspend_title"),
+                &t!("btn_suspend_confirm", acct = &acct),
+                &t!("btn_suspend_do"),
             ),
         ]);
 
@@ -118,11 +114,11 @@ impl SlackNotifier {
 pub fn delete_actions_block(value_json: &str, acct: &str) -> Value {
     confirm_actions_block(
         DELETE_ACTION_ID,
-        "アカウントを削除",
+        &t!("btn_delete"),
         value_json,
-        "アカウント削除",
-        &format!("`{acct}` のデータを完全に削除します。この操作は取り消せません。よろしいですか?"),
-        "削除する",
+        &t!("btn_delete_title"),
+        &t!("btn_delete_confirm", acct = acct),
+        &t!("btn_delete_do"),
     )
 }
 
@@ -150,7 +146,7 @@ fn confirm_actions_block(
                     "text": truncate_chars(confirm_text, CONFIRM_TEXT_MAX_CHARS)
                 },
                 "confirm": { "type": "plain_text", "text": confirm_label },
-                "deny": { "type": "plain_text", "text": "キャンセル" }
+                "deny": { "type": "plain_text", "text": t!("btn_cancel").to_string() }
             }
         }]
     })
