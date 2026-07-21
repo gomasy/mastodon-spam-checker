@@ -32,6 +32,7 @@ struct AppState {
     http: reqwest::Client,
     /// 処理中のアカウント ID(多重クリック抑止と shutdown 時の完了待ちに使う)
     in_flight: Mutex<HashSet<String>>,
+    note_writer: Option<crate::postgres::ModerationNoteWriter>,
 }
 
 impl AppState {
@@ -64,11 +65,24 @@ struct Interaction {
 
 pub async fn run(config: ServeConfig) -> Result<()> {
     let mastodon = MastodonClient::new(&config.mastodon_base_url, &config.mastodon_access_token);
+
+    let note_writer = match config.postgres {
+        Some(ref pg) => Some(
+            crate::postgres::ModerationNoteWriter::connect(
+                &pg.database_url,
+                pg.moderator_account_id,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+
     let state = Arc::new(AppState {
         http: mastodon.http_client(),
         mastodon,
         signing_secret: config.slack_signing_secret,
         in_flight: Mutex::new(HashSet::new()),
+        note_writer,
     });
 
     let app = Router::new()
@@ -256,6 +270,15 @@ async fn process_action(state: Arc<AppState>, interaction: Interaction) {
                     Ok(()) => {
                         info!(account_id = %value.id, acct = %value.acct, "account suspended");
                         replace_buttons_with_delete(&mut blocks, &raw_value, &value.acct);
+                        if let Some(ref writer) = state.note_writer {
+                            let note = format!(
+                                "[Mastodon Spam Checker] Slack 経由でアカウントを停止 (操作者: <@{}>)",
+                                user_id,
+                            );
+                            if let Err(e) = writer.add_note(&value.id, &note).await {
+                                error!(error = %e, "failed to add moderation note");
+                            }
+                        }
                         format!(
                             ":white_check_mark: <@{user_id}> が `{}` を停止しました",
                             value.acct

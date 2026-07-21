@@ -1,5 +1,27 @@
 use anyhow::{Context, Result};
 
+pub struct PostgresConfig {
+    pub database_url: String,
+    pub moderator_account_id: i64,
+}
+
+impl PostgresConfig {
+    pub fn from_env() -> Result<Option<Self>> {
+        match std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) {
+            Some(url) => {
+                let id: i64 = required_env("MODERATOR_ACCOUNT_ID")?
+                    .parse()
+                    .context("MODERATOR_ACCOUNT_ID is not a valid integer")?;
+                Ok(Some(Self {
+                    database_url: url,
+                    moderator_account_id: id,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 pub struct Config {
     pub mastodon_base_url: String,
     pub mastodon_access_token: String,
@@ -12,6 +34,7 @@ pub struct Config {
     pub spam_confidence_threshold: f64,
     pub slack_webhook_url: String,
     pub slack_channel: Option<String>,
+    pub postgres: Option<PostgresConfig>,
 }
 
 impl Config {
@@ -38,6 +61,7 @@ impl Config {
             slack_channel: std::env::var("SLACK_CHANNEL")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            postgres: PostgresConfig::from_env()?,
         })
     }
 }
@@ -48,6 +72,7 @@ pub struct ServeConfig {
     pub mastodon_access_token: String,
     pub slack_signing_secret: String,
     pub listen_addr: String,
+    pub postgres: Option<PostgresConfig>,
 }
 
 impl ServeConfig {
@@ -58,6 +83,7 @@ impl ServeConfig {
             mastodon_access_token,
             slack_signing_secret: required_env("SLACK_SIGNING_SECRET")?,
             listen_addr: env_or("LISTEN_ADDR", "127.0.0.1:8990"),
+            postgres: PostgresConfig::from_env()?,
         })
     }
 }

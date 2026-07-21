@@ -2,6 +2,7 @@ mod config;
 mod http;
 mod llm;
 mod mastodon;
+mod postgres;
 mod redis;
 mod server;
 mod slack;
@@ -64,6 +65,14 @@ async fn check(dry_run: bool) -> Result<()> {
         http::RetryConfig::default(),
     );
     let slack = slack::SlackNotifier::new(&config.slack_webhook_url, config.slack_channel);
+    let note_writer = match config.postgres {
+        Some(ref pg) => Some(
+            postgres::ModerationNoteWriter::connect(&pg.database_url, pg.moderator_account_id)
+                .await?,
+        ),
+        None => None,
+    };
+
     // slack_channel を SlackNotifier へムーブした後も使えるよう、閾値(コピー型)は先に取り出す
     let threshold = config.spam_confidence_threshold;
 
@@ -106,7 +115,17 @@ async fn check(dry_run: bool) -> Result<()> {
             "checking"
         );
 
-        match check_account(&mastodon, &llm, &slack, account, threshold, dry_run).await {
+        match check_account(
+            &mastodon,
+            &llm,
+            &slack,
+            account,
+            threshold,
+            dry_run,
+            &note_writer,
+        )
+        .await
+        {
             // スパム検出(通知したかどうかは内部で集計)
             Ok(Some(notified)) => {
                 spam_detected += 1;
@@ -165,6 +184,7 @@ async fn check_account(
     account: &mastodon::AdminAccount,
     threshold: f64,
     dry_run: bool,
+    note_writer: &Option<postgres::ModerationNoteWriter>,
 ) -> Result<Option<bool>> {
     let statuses = mastodon
         .fetch_statuses(&account.id)
@@ -214,6 +234,17 @@ async fn check_account(
     // 通知失敗で全体を止めない(判定自体は完了しているためカーソルは進めてよい)
     if let Err(e) = slack.notify_spam(account, &verdict).await {
         error!(error = %e, "failed to send Slack notification");
+    }
+
+    if let Some(writer) = note_writer {
+        let note = format!(
+            "[Mastodon Spam Checker] スパムの疑いあり\n確信度: {:.0}%\n理由: {}",
+            verdict.confidence * 100.0,
+            verdict.reason,
+        );
+        if let Err(e) = writer.add_note(&account.id, &note).await {
+            error!(error = %e, "failed to add moderation note");
+        }
     }
 
     Ok(Some(true))
