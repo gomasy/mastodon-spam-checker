@@ -263,6 +263,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn i18n_keys_resolve() {
+        rust_i18n::set_locale("en");
+        let val = t!("btn_suspend");
+        assert_ne!(val, "btn_suspend", "EN key 'btn_suspend' was not found (returned raw key)");
+        assert!(val.contains("Suspend"), "unexpected EN value: {val}");
+
+        rust_i18n::set_locale("ja");
+        let val = t!("btn_suspend");
+        assert_ne!(val, "btn_suspend", "JA key 'btn_suspend' was not found (returned raw key)");
+        assert!(val.contains("停止"), "unexpected JA value: {val}");
+    }
+
+    #[test]
     fn system_accounts_are_detected() {
         assert!(is_system_account("mastodon.internal", "example.com"));
         assert!(is_system_account("internal.fetch", "example.com"));
