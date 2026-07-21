@@ -48,13 +48,13 @@ impl MastodonClient {
         }
     }
 
-    /// 内部の HTTP クライアントを共有する(clone はコネクションプールを共有)
+    /// Returns a clone of the inner HTTP client (clones share the connection pool).
     pub fn http_client(&self) -> Client {
         self.client.clone()
     }
 
-    /// 認証を付けて送信し、非成功ステータスはボディ付きエラーにする(リトライなし)。
-    /// 副作用のある書き込み系(停止・削除)に使う。
+    /// Send an authenticated request and return an error with the response body on non-success status (no retry).
+    /// Use for write operations with side effects (suspend, delete).
     async fn send(&self, req: RequestBuilder, what: &str) -> Result<Response> {
         let resp = req
             .bearer_auth(&self.access_token)
@@ -64,8 +64,8 @@ impl MastodonClient {
         http::ensure_success(resp, what).await
     }
 
-    /// 認証を付け、一時障害を指数バックオフで再試行して送信する。
-    /// 冪等な読み取り系(GET)に使う。`build` は毎回新しい `RequestBuilder` を生成する。
+    /// Send an authenticated request with exponential-backoff retry on transient failures.
+    /// Use for idempotent read operations (GET). `build` must return a fresh `RequestBuilder` on each call.
     async fn send_retry<F>(&self, build: F, what: &str) -> Result<Response>
     where
         F: Fn() -> RequestBuilder,
@@ -94,12 +94,12 @@ impl MastodonClient {
 
         info!(count = accounts.len(), "fetched");
 
-        // ID は数値文字列なので、桁数→辞書順の順で比較して数値順にする
+        // IDs are numeric strings; sort by length first, then lexicographically to get numeric order.
         accounts.sort_by(|a, b| a.id.len().cmp(&b.id.len()).then_with(|| a.id.cmp(&b.id)));
         Ok(accounts)
     }
 
-    /// アカウントが停止済みかどうかを返す(要 admin:read:accounts スコープ)
+    /// Returns whether the account is suspended (requires admin:read:accounts scope).
     pub async fn is_account_suspended(&self, account_id: &str) -> Result<bool> {
         let url = format!("{}/api/v1/admin/accounts/{}", self.base_url, account_id);
 
@@ -107,7 +107,7 @@ impl MastodonClient {
             .send_retry(|| self.client.get(&url), "Admin account API")
             .await?;
 
-        // suspended が欠落・null のバージョン差異でもエラーにせず「未停止」として扱う
+        // Treat missing or null suspended field as unsuspended to tolerate version differences.
         #[derive(Deserialize)]
         struct Resp {
             #[serde(default)]
@@ -120,7 +120,7 @@ impl MastodonClient {
         Ok(account.suspended.unwrap_or(false))
     }
 
-    /// アカウントを停止する(要 admin:write:accounts スコープ)
+    /// Suspends the account (requires admin:write:accounts scope).
     pub async fn suspend_account(&self, account_id: &str) -> Result<()> {
         let url = format!(
             "{}/api/v1/admin/accounts/{}/action",
@@ -138,8 +138,8 @@ impl MastodonClient {
         Ok(())
     }
 
-    /// 停止済みアカウントのデータを完全に削除する(要 admin:write:accounts スコープ)
-    /// 停止していないアカウントに対しては Mastodon 側が拒否する
+    /// Permanently deletes data for a suspended account (requires admin:write:accounts scope).
+    /// Mastodon rejects this request if the account is not already suspended.
     pub async fn delete_account(&self, account_id: &str) -> Result<()> {
         let url = format!("{}/api/v1/admin/accounts/{}", self.base_url, account_id);
 
@@ -166,8 +166,8 @@ impl MastodonClient {
         )
         .await?;
 
-        // アカウント削除済み等の恒久的エラーは「投稿なし」として扱い、
-        // プロフィールのみで判定を続行する(呼び出し側で中断させない)
+        // Treat permanent errors (e.g. account deleted) as "no posts"
+        // and continue with profile-only classification (do not abort the caller).
         let status = resp.status();
         if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
             warn!(account_id = %account_id, %status, "statuses unavailable, treating as no posts");

@@ -126,7 +126,6 @@ impl LlmClient {
 
         let url = format!("{}/chat/completions", self.api_base);
 
-        // 一時的な 429 / 5xx・タイムアウトは指数バックオフで再試行する
         let resp = http::send_with_retry(
             || {
                 self.client
@@ -258,7 +257,7 @@ mod tests {
             html_to_plain("&lt;b&gt; &quot;x&quot; &#39;y&#39;"),
             "<b> \"x\" 'y'"
         );
-        // 二重エスケープは一段だけ復元される(&amp; を最後に置換しているため)
+        // Double-escaped entities are unescaped only one level deep (because &amp; is replaced last).
         assert_eq!(html_to_plain("&amp;lt;script&amp;gt;"), "&lt;script&gt;");
         assert_eq!(html_to_plain("A &amp; B"), "A & B");
     }

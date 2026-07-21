@@ -11,17 +11,17 @@ use crate::mastodon::AdminAccount;
 
 const APP_NAME: &str = "Mastodon Spam Checker";
 
-/// 停止ボタンの action_id(serve モードのハンドラと共有)
+/// Action ID for the suspend button (shared with the serve-mode handler).
 pub const SUSPEND_ACTION_ID: &str = "suspend_account";
-/// 削除ボタンの action_id(停止後のメッセージにのみ現れる)
+/// Action ID for the delete button (appears only in post-suspension messages).
 pub const DELETE_ACTION_ID: &str = "delete_account";
 
-/// Block Kit の text オブジェクト(mrkdwn)の文字数上限(section / context 共通)
+/// Character limit for Block Kit mrkdwn text objects (shared by section and context blocks).
 pub(crate) const TEXT_MAX_CHARS: usize = 3000;
-/// Block Kit の confirm ダイアログ text の文字数上限
+/// Character limit for the Block Kit confirm dialog text.
 const CONFIRM_TEXT_MAX_CHARS: usize = 300;
 
-/// 停止ボタンの value に埋め込む情報(生成側と serve モードのハンドラで共有)
+/// Information embedded in the suspend button value (shared between the notifier and the serve-mode handler).
 #[derive(Serialize, Deserialize)]
 pub struct ButtonValue {
     pub id: String,
@@ -30,7 +30,7 @@ pub struct ButtonValue {
 
 #[derive(Serialize)]
 struct SlackMessage {
-    // blocks 使用時、text は通知やプレビューのフォールバックとして使われる
+    // When blocks are used, text serves as a notification/preview fallback.
     text: String,
     blocks: Value,
     username: &'static str,
@@ -71,7 +71,6 @@ impl SlackNotifier {
             verdict.reason,
         );
 
-        // serve モードのハンドラが停止処理に使う情報を value に埋め込む
         let value = serde_json::to_string(&ButtonValue {
             id: account.id.clone(),
             acct: acct.clone(),
@@ -80,8 +79,8 @@ impl SlackNotifier {
         let blocks = json!([
             {
                 "type": "section",
-                // LLM の reason やプロフィール由来の文字列は無制限のため、
-                // 上限超過で invalid_blocks になり通知ごと失われるのを防ぐ
+                // The LLM reason and profile-derived strings are unbounded in length,
+                // so truncate to prevent invalid_blocks errors that would silently drop the entire notification.
                 "text": { "type": "mrkdwn", "text": truncate_chars(&text, TEXT_MAX_CHARS) }
             },
             confirm_actions_block(
@@ -113,9 +112,9 @@ impl SlackNotifier {
     }
 }
 
-/// 停止後のメッセージに差し込む「アカウントを削除」ボタンの actions ブロック
-/// (DELETE /api/v1/admin/accounts/:id は停止済みアカウントにのみ有効)
-/// value_json には停止ボタンの value(ButtonValue の JSON)をそのまま渡す
+/// Builds an actions block containing the "Delete Account" button for post-suspension messages.
+/// (DELETE /api/v1/admin/accounts/:id is only valid for suspended accounts.)
+/// Pass the suspend button's value JSON (ButtonValue) as value_json.
 pub fn delete_actions_block(value_json: &str, acct: &str) -> Value {
     confirm_actions_block(
         DELETE_ACTION_ID,
@@ -127,7 +126,6 @@ pub fn delete_actions_block(value_json: &str, acct: &str) -> Value {
     )
 }
 
-/// confirm ダイアログ付き danger ボタン 1 つの actions ブロックを生成する
 fn confirm_actions_block(
     action_id: &str,
     label: &str,
@@ -158,7 +156,6 @@ fn confirm_actions_block(
     })
 }
 
-/// 文字数(chars)で切り詰め、超過時は末尾を … にする
 pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
@@ -181,7 +178,6 @@ mod tests {
 
     #[test]
     fn truncate_chars_truncates_by_chars_not_bytes() {
-        // マルチバイト文字でもバイト境界でパニックしない
         assert_eq!(truncate_chars("あいうえお", 3), "あい…");
         assert_eq!(truncate_chars("あいうえお", 3).chars().count(), 3);
     }

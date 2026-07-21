@@ -21,23 +21,23 @@ use crate::slack::{
     truncate_chars,
 };
 
-/// Slack の署名タイムスタンプの許容ずれ(リプレイ攻撃対策)
+/// Maximum allowed clock skew for Slack request timestamps (replay attack prevention).
 const MAX_TIMESTAMP_SKEW_SECS: i64 = 300;
-/// シャットダウン時に進行中の停止処理を待つ上限
+/// Maximum time to wait for in-flight suspend tasks during shutdown.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 struct AppState {
     mastodon: MastodonClient,
     signing_secret: String,
     http: reqwest::Client,
-    /// 処理中のアカウント ID(多重クリック抑止と shutdown 時の完了待ちに使う)
+    /// Account IDs currently being processed (prevents double-clicks and allows graceful shutdown).
     in_flight: Mutex<HashSet<String>>,
     note_writer: Option<crate::postgres::ModerationNoteWriter>,
 }
 
 impl AppState {
-    /// in_flight のロックを取得する。poisoning(ロック保持中のパニック)が起きても
-    /// HashSet 自体は不整合にならないため、パニックを連鎖させず回復して続行する
+    /// Acquires the in_flight lock. Even if the lock is poisoned (panic while held),
+    /// the HashSet remains consistent, so recover and continue rather than propagating the panic.
     fn lock_in_flight(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
         self.in_flight
             .lock()
@@ -45,21 +45,19 @@ impl AppState {
     }
 }
 
-/// Slack メッセージ上のボタンに対応する操作
 enum ButtonAction {
     Suspend,
     Delete,
 }
 
-/// ボタンクリックのペイロードから取り出した、処理に必要な情報一式
 struct Interaction {
     kind: ButtonAction,
     value: ButtonValue,
-    /// 削除ボタンへの差し替え時に value をそのまま引き継ぐための生 JSON 文字列
+    /// Raw JSON string of the button value, passed through unchanged when replacing with the delete button.
     raw_value: String,
     user_id: String,
     response_url: String,
-    /// 元メッセージの blocks(結果表示を差し込んで replace_original に使う)
+    /// Blocks from the original message, used to insert the result and call replace_original.
     blocks: Vec<Value>,
 }
 
@@ -98,8 +96,8 @@ pub async fn run(config: ServeConfig) -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    // 「Mastodon では停止済みなのに Slack が未更新」で中断しないよう、
-    // 進行中の停止処理の完了を待ってから終了する
+    // Wait for in-flight suspend tasks to finish before exiting, so we don't terminate
+    // while Mastodon is suspended but the Slack message is not yet updated.
     let deadline = Instant::now() + SHUTDOWN_GRACE;
     while !state.lock_in_flight().is_empty() {
         if Instant::now() >= deadline {
@@ -112,7 +110,7 @@ pub async fn run(config: ServeConfig) -> Result<()> {
 }
 
 async fn shutdown_signal() {
-    // SIGTERM ハンドラの登録に失敗してもパニックでサーバを道連れにせず、Ctrl-C のみで継続する
+    // If SIGTERM handler registration fails, do not panic the server; fall back to Ctrl-C only.
     match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(mut sigterm) => {
             tokio::select! {
@@ -140,7 +138,7 @@ async fn handle_interaction(
 
     let interaction = match parse_payload(&body).and_then(extract_interaction) {
         Ok(Some(i)) => i,
-        // 関知しないイベント・ボタンは正常応答して無視する
+        // Acknowledge and ignore unrecognised events or buttons.
         Ok(None) => return StatusCode::OK,
         Err(e) => {
             warn!(error = %e, "invalid interaction payload");
@@ -148,20 +146,19 @@ async fn handle_interaction(
         }
     };
 
-    // 同一アカウントへの処理が既に走っていれば無視する(二重クリック対策)
     if !state.lock_in_flight().insert(interaction.value.id.clone()) {
         info!(account_id = %interaction.value.id, "action already in progress, ignoring click");
         return StatusCode::OK;
     }
 
-    // Slack は 3 秒以内の応答を要求するため、実処理は別タスクで行い即座に 200 を返す
+    // Slack requires a response within 3 seconds, so spawn the real work and return 200 immediately.
     tokio::spawn(process_action(state, interaction));
 
     StatusCode::OK
 }
 
-/// block_actions ペイロードから処理対象のボタン操作を取り出す。
-/// 関知しないイベント・ボタンは Ok(None)、必須情報の欠落・不正は Err
+/// Extracts the target button action from a block_actions payload.
+/// Returns Ok(None) for unrecognised events or buttons; Err for missing or malformed required fields.
 fn extract_interaction(mut payload: Value) -> Result<Option<Interaction>> {
     if payload["type"] != "block_actions" {
         return Ok(None);
@@ -186,8 +183,8 @@ fn extract_interaction(mut payload: Value) -> Result<Option<Interaction>> {
         .context("action has no value")?;
     let value: ButtonValue = serde_json::from_str(&raw_value).context("invalid button value")?;
 
-    // Mastodon のアカウント ID は数値のみ。URL パスに埋め込むため、
-    // 万一改変された値が届いても別エンドポイントに向かわないよう検証する
+    // Mastodon account IDs are numeric only. Validate before embedding in URL paths
+    // to ensure a tampered value cannot be routed to a different endpoint.
     if value.id.is_empty() || !value.id.bytes().all(|b| b.is_ascii_digit()) {
         bail!("account id is not numeric: {}", value.id);
     }
@@ -210,8 +207,8 @@ fn extract_interaction(mut payload: Value) -> Result<Option<Interaction>> {
             _ => None,
         })
         .unwrap_or_default();
-    // blocks が欠けていた場合、replace_original で元の通知内容が
-    // 丸ごと消えないよう text から最低限復元する
+    // If blocks are missing, restore the original notification content from text
+    // so replace_original does not blank the entire message.
     if blocks.is_empty()
         && let Some(text) = payload["message"]["text"]
             .as_str()
@@ -233,7 +230,7 @@ fn extract_interaction(mut payload: Value) -> Result<Option<Interaction>> {
     }))
 }
 
-/// ボタンに応じた Mastodon API を呼び、response_url 経由で元の Slack メッセージを結果で更新する
+/// Calls the appropriate Mastodon API for the button action and updates the Slack message via response_url.
 async fn process_action(state: Arc<AppState>, interaction: Interaction) {
     let Interaction {
         kind,
@@ -244,15 +241,15 @@ async fn process_action(state: Arc<AppState>, interaction: Interaction) {
         mut blocks,
     } = interaction;
 
-    // 過去の結果表示(context)はリトライで無制限に蓄積するため毎回除去する。
-    // 成功時は各分岐でボタンも除去・差し替えして再実行を防ぐ(失敗時は再試行できるよう残す)
+    // Remove any previous context blocks that would accumulate unboundedly on retries.
+    // On success, each branch also removes or replaces the button to prevent re-execution (left on failure to allow retry).
     blocks.retain(|b| b["type"] != "context");
 
     let result_text = match kind {
         ButtonAction::Suspend => {
-            // 手動操作や別の通知メッセージのボタンで既に停止済みの場合は、
-            // 停止 API を呼ばずにその旨を表示して削除ボタンに差し替える。
-            // チェック自体の失敗は停止処理を妨げない(停止 API は冪等)
+            // If already suspended (e.g. via manual action or a button on another notification),
+            // skip the suspend API call, show a notice, and replace the button with the delete button.
+            // A failed check does not block suspension (the suspend API is idempotent).
             let already_suspended = match state.mastodon.is_account_suspended(&value.id).await {
                 Ok(suspended) => suspended,
                 Err(e) => {
@@ -291,14 +288,13 @@ async fn process_action(state: Arc<AppState>, interaction: Interaction) {
                 }
             }
         }
-        // 削除は取り返しがつかないため、Slack メッセージ上のボタンの存在だけを信用せず、
-        // 停止済みであることをサーバ側でも確認してから実行する
-        // (停止後に手動で停止解除された古いボタンが押されるケースへの防御)
+        // Deletion is irreversible, so do not rely solely on the button being present in the Slack message;
+        // verify server-side that the account is suspended before proceeding.
+        // This guards against a stale button being clicked after the suspension was manually lifted.
         ButtonAction::Delete => match state.mastodon.is_account_suspended(&value.id).await {
             Ok(true) => match state.mastodon.delete_account(&value.id).await {
                 Ok(()) => {
                     info!(account_id = %value.id, acct = %value.acct, "account data deleted");
-                    // 削除は最後の操作なのでボタンを除去する
                     blocks.retain(|b| b["type"] != "actions");
                     format!(
                         ":wastebasket: <@{user_id}> が `{}` のデータを削除しました",
@@ -338,7 +334,6 @@ async fn process_action(state: Arc<AppState>, interaction: Interaction) {
     state.lock_in_flight().remove(&value.id);
 }
 
-/// 停止完了後: 停止ボタンを除去し、削除ボタンに差し替える
 fn replace_buttons_with_delete(blocks: &mut Vec<Value>, value_json: &str, acct: &str) {
     blocks.retain(|b| b["type"] != "actions");
     blocks.push(delete_actions_block(value_json, acct));
@@ -347,8 +342,8 @@ fn replace_buttons_with_delete(blocks: &mut Vec<Value>, value_json: &str, acct: 
 fn context_block(text: &str) -> Value {
     json!({
         "type": "context",
-        // Mastodon のエラーボディ等で上限を超えると invalid_blocks で
-        // 更新ごと失われるため、必ず切り詰める
+        // Truncate to avoid invalid_blocks errors when Mastodon error bodies or other content
+        // would exceed the limit and cause the entire update to be silently dropped.
         "elements": [{ "type": "mrkdwn", "text": truncate_chars(text, TEXT_MAX_CHARS) }]
     })
 }
@@ -365,7 +360,6 @@ async fn post_to_slack(http: &reqwest::Client, url: &str, payload: &Value) {
     }
 }
 
-/// `payload=<JSON>` 形式のフォームボディをパースする
 fn parse_payload(body: &[u8]) -> Result<Value> {
     #[derive(Deserialize)]
     struct Form {
@@ -375,7 +369,7 @@ fn parse_payload(body: &[u8]) -> Result<Value> {
     serde_json::from_str(&form.payload).context("failed to parse payload JSON")
 }
 
-/// Slack の署名 (v0=HMAC-SHA256) を検証する
+/// Verifies a Slack request signature (v0=HMAC-SHA256).
 /// https://api.slack.com/authentication/verifying-requests-from-slack
 fn verify_signature(secret: &str, headers: &HeaderMap, body: &[u8]) -> Result<()> {
     let timestamp = headers
@@ -405,7 +399,7 @@ fn verify_signature(secret: &str, headers: &HeaderMap, body: &[u8]) -> Result<()
     let mut base = format!("v0:{timestamp}:").into_bytes();
     base.extend_from_slice(body);
 
-    // ring::hmac::verify は定数時間比較
+    // ring::hmac::verify performs a constant-time comparison.
     ring::hmac::verify(&key, &base, &sig).map_err(|_| anyhow!("signature mismatch"))
 }
 
@@ -483,7 +477,7 @@ mod tests {
 
     #[test]
     fn stale_timestamp_is_rejected() {
-        let ts = "1000000000"; // 2001 年
+        let ts = "1000000000"; // year 2001
         let body = b"payload=%7B%7D";
         let sig = sign("secret", ts, body);
         assert!(verify_signature("secret", &headers(ts, &sig), body).is_err());
@@ -523,11 +517,9 @@ mod tests {
 
     #[test]
     fn unrelated_events_and_buttons_are_ignored() {
-        // block_actions 以外のイベント
         let none = extract_interaction(json!({ "type": "view_submission" })).unwrap();
         assert!(none.is_none());
 
-        // 関知しない action_id のボタン
         let payload = json!({
             "type": "block_actions",
             "actions": [{ "action_id": "other_button", "value": "{}" }]
@@ -537,7 +529,6 @@ mod tests {
 
     #[test]
     fn non_numeric_account_id_is_rejected() {
-        // URL パスに埋め込まれるため、数値以外(パストラバーサル等)は拒否する
         let payload = json!({
             "type": "block_actions",
             "response_url": "https://hooks.slack.com/actions/xxx",

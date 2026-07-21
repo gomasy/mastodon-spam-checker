@@ -30,7 +30,7 @@ pub struct Config {
     pub openai_api_key: String,
     pub openai_model: String,
     pub openai_json_mode: bool,
-    /// スパム確信度がこの閾値(0.0-1.0)未満なら Slack 通知をスキップする
+    /// Skip Slack notifications if the spam confidence is below this threshold (0.0–1.0).
     pub spam_confidence_threshold: f64,
     pub slack_webhook_url: String,
     pub slack_channel: Option<String>,
@@ -47,11 +47,11 @@ impl Config {
             openai_api_base: required_env("OPENAI_API_BASE")?,
             openai_api_key: required_env("OPENAI_API_KEY")?,
             openai_model: env_or("OPENAI_MODEL", "gpt-4o"),
-            // response_format 非対応の OpenAI 互換 API では false にする
+            // Set to false for OpenAI-compatible APIs that do not support response_format.
             openai_json_mode: std::env::var("OPENAI_JSON_MODE")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
-            // 未設定・パース失敗時は 0.0(すべて通知)で従来互換
+            // Defaults to 0.0 (notify all) when unset or unparseable, for backwards compatibility.
             spam_confidence_threshold: std::env::var("SPAM_CONFIDENCE_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
@@ -66,7 +66,6 @@ impl Config {
     }
 }
 
-/// serve モード(Slack インタラクションサーバー)用の設定
 pub struct ServeConfig {
     pub mastodon_base_url: String,
     pub mastodon_access_token: String,

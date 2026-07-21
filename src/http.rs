@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use tracing::warn;
 
-/// 共通設定(User-Agent、タイムアウト)の HTTP クライアントを生成する
+/// Builds an HTTP client with common settings (User-Agent, timeout).
 pub fn client(timeout: Duration) -> Client {
     Client::builder()
         .user_agent(concat!(
@@ -17,7 +17,6 @@ pub fn client(timeout: Duration) -> Client {
         .expect("failed to build HTTP client")
 }
 
-/// 成功ステータスでなければ、レスポンスボディを含むエラーにする
 pub async fn ensure_success(resp: Response, what: &str) -> Result<Response> {
     let status = resp.status();
     if status.is_success() {
@@ -27,12 +26,11 @@ pub async fn ensure_success(resp: Response, what: &str) -> Result<Response> {
     bail!("{what} error (HTTP {status}): {body}")
 }
 
-/// 指数バックオフ付きリトライの設定
 #[derive(Clone, Copy)]
 pub struct RetryConfig {
-    /// 最初の試行後に許容する再試行回数(0 ならリトライしない)
+    /// Maximum number of retries after the first attempt (0 means no retries).
     pub max_retries: u32,
-    /// 1 回目のバックオフ待機時間(以降 2 倍ずつ増える)
+    /// Wait duration before the first retry; doubles on each subsequent attempt.
     pub base_delay: Duration,
 }
 
@@ -46,25 +44,24 @@ impl Default for RetryConfig {
 }
 
 impl RetryConfig {
-    /// attempt 回目(0 始まり)の再試行前に待つ時間。base_delay * 2^attempt。
+    /// Delay before the given attempt (0-based): base_delay * 2^attempt.
     fn backoff(&self, attempt: u32) -> Duration {
         self.base_delay
             .saturating_mul(1u32.checked_shl(attempt).unwrap_or(u32::MAX))
     }
 }
 
-/// 一時的な障害としてリトライすべきステータスか(429 と 5xx)
 fn is_retryable_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
-/// リトライすべきネットワークエラーか(タイムアウト・接続失敗など)。
-/// リクエスト構築エラー(is_request)は設定不備など永続的な原因のためリトライしない。
+/// Returns true for network errors that warrant a retry (timeouts, connection failures, etc.).
+/// Request-builder errors (is_request) are not retried as they indicate configuration problems.
 fn is_retryable_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect()
 }
 
-/// `Retry-After` ヘッダ(秒指定のみ対応)を待機時間として解釈する
+/// Parses the `Retry-After` header (integer seconds only) as a wait duration.
 fn retry_after(resp: &Response) -> Option<Duration> {
     resp.headers()
         .get(reqwest::header::RETRY_AFTER)
@@ -73,11 +70,11 @@ fn retry_after(resp: &Response) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-/// 指数バックオフ付きでリクエストを送信し、成功レスポンスを返す。
+/// Sends a request with exponential-backoff retry and returns the successful response.
 ///
-/// `build` は試行のたびに新しい `RequestBuilder` を生成するクロージャ。
-/// 429 / 5xx とタイムアウト等の一時障害を `retry.max_retries` 回まで再試行する。
-/// リトライ不能な失敗・回数超過時は [`ensure_success`] 相当のボディ付きエラーになる。
+/// `build` is a closure that returns a fresh `RequestBuilder` for each attempt.
+/// Retries 429 / 5xx responses and transient errors up to `retry.max_retries` times.
+/// Non-retryable failures or exhausted retries produce a body-bearing error equivalent to [`ensure_success`].
 pub async fn send_with_retry<F>(build: F, what: &str, retry: RetryConfig) -> Result<Response>
 where
     F: Fn() -> RequestBuilder,
@@ -86,10 +83,10 @@ where
     ensure_success(resp, what).await
 }
 
-/// [`send_with_retry`] と同じくリトライするが、ステータスの成否判定は呼び出し側に委ねる。
+/// Same retry logic as [`send_with_retry`], but leaves success/failure judgement to the caller.
 ///
-/// ネットワークエラーと 429 / 5xx のみを再試行し、最終的なレスポンスを
-/// ステータスに関わらずそのまま返す。404 等を独自に処理したい場合に使う。
+/// Retries only on network errors and 429 / 5xx, then returns the final response
+/// as-is regardless of status. Use when you need to handle 404 or other codes yourself.
 pub async fn send_with_retry_raw<F>(build: F, what: &str, retry: RetryConfig) -> Result<Response>
 where
     F: Fn() -> RequestBuilder,
@@ -157,7 +154,6 @@ mod tests {
             max_retries: 100,
             base_delay: Duration::from_secs(1),
         };
-        // 極端な attempt でもパニックせず飽和する
         let _ = retry.backoff(64);
         let _ = retry.backoff(u32::MAX);
     }

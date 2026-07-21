@@ -13,15 +13,15 @@ use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::Subscriber
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    // reqwest を rustls-no-provider で使うため、TLS 初回利用前にプロバイダの登録が必須
+    // Required before TLS is first used because reqwest is built with rustls-no-provider.
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
 
     dotenvy::dotenv().ok();
 
-    // EnvFilter は regex を引き込みバイナリが肥大化するため、軽量な Targets で代替。
-    // RUST_LOG が設定されていればそれを優先、なければ本クレートのみ info。
+    // Use the lightweight Targets filter instead of EnvFilter to avoid pulling in the regex crate.
+    // Honour RUST_LOG if set; otherwise default to INFO for this crate only.
     let filter: Targets = std::env::var("RUST_LOG")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -43,9 +43,9 @@ async fn main() -> Result<()> {
     }
 }
 
-/// 新規リモートアカウントを取得してスパム判定する(デフォルトの一発実行モード)
+/// Fetch new remote accounts and run spam checks (default one-shot mode).
 ///
-/// `dry_run` が true の場合、Slack 通知とカーソル更新をスキップし、判定のみを行う。
+/// When `dry_run` is true, skips Slack notifications and cursor updates (classification only).
 async fn check(dry_run: bool) -> Result<()> {
     let config = config::Config::from_env()?;
     info!(
@@ -73,7 +73,7 @@ async fn check(dry_run: bool) -> Result<()> {
         None => None,
     };
 
-    // slack_channel を SlackNotifier へムーブした後も使えるよう、閾値(コピー型)は先に取り出す
+    // Extract the threshold (Copy type) before the slack_channel is moved into SlackNotifier.
     let threshold = config.spam_confidence_threshold;
 
     let cursor = cursor_store.get_cursor().await?;
@@ -126,7 +126,6 @@ async fn check(dry_run: bool) -> Result<()> {
         )
         .await
         {
-            // スパム検出(通知したかどうかは内部で集計)
             Ok(Some(notified)) => {
                 spam_detected += 1;
                 if notified {
@@ -134,7 +133,6 @@ async fn check(dry_run: bool) -> Result<()> {
                 }
             }
             Ok(None) => {}
-            // リトライ可能なエラーではカーソルを進めず中断し、次回実行でこのアカウントから再開する
             Err(e) => {
                 error!(
                     username = %account.username,
@@ -148,7 +146,6 @@ async fn check(dry_run: bool) -> Result<()> {
         last_id = Some(account.id.clone());
     }
 
-    // dry-run ではカーソルを進めず、次回も同じアカウントから判定できるようにする
     if !dry_run {
         if let Some(ref id) = last_id {
             cursor_store.set_cursor(id).await?;
@@ -173,10 +170,10 @@ async fn check(dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// 1 アカウントの投稿を取得してスパム判定し、スパム(かつ確信度が閾値以上)なら Slack に通知する。
+/// Fetch one account's posts, run the spam check, and notify Slack if spam confidence meets the threshold.
 ///
-/// 戻り値: `Some(notified)` = スパム検出(`notified` は Slack へ通知したか)、`None` = 非スパム。
-/// `Err` はリトライ可能な失敗(呼び出し側はカーソルを進めず中断する)。
+/// Returns `Some(notified)` when spam is detected (`notified` indicates whether Slack was alerted), `None` for non-spam.
+/// `Err` signals a retryable failure; the caller should stop without advancing the cursor.
 async fn check_account(
     mastodon: &mastodon::MastodonClient,
     llm: &llm::LlmClient,
@@ -205,7 +202,6 @@ async fn check_account(
         return Ok(None);
     }
 
-    // LLM はスパムと判定したが、確信度が閾値未満なら通知・記録のノイズになるためスキップ
     if verdict.confidence < threshold {
         info!(
             username = %account.username,
@@ -231,7 +227,7 @@ async fn check_account(
         return Ok(Some(false));
     }
 
-    // 通知失敗で全体を止めない(判定自体は完了しているためカーソルは進めてよい)
+    // Do not abort on notification failure; the verdict is done so the cursor can still advance.
     if let Err(e) = slack.notify_spam(account, &verdict).await {
         error!(error = %e, "failed to send Slack notification");
     }
@@ -265,7 +261,7 @@ mod tests {
         assert!(is_system_account("mastodon.internal", "example.com"));
         assert!(is_system_account("internal.fetch", "example.com"));
         assert!(is_system_account("system.actor", "example.com"));
-        // インスタンスアクター(ユーザー名 == ドメイン)
+        // Instance actor (username == domain).
         assert!(is_system_account("example.com", "example.com"));
         assert!(!is_system_account("alice", "example.com"));
     }
