@@ -110,42 +110,40 @@ async fn check(dry_run: bool) -> Result<()> {
                 domain = %domain,
                 "system account, skipping"
             );
-            last_id = Some(account.id.clone());
-            continue;
-        }
+        } else {
+            info!(
+                username = %account.username,
+                domain = %domain,
+                id = %account.id,
+                "checking"
+            );
 
-        info!(
-            username = %account.username,
-            domain = %domain,
-            id = %account.id,
-            "checking"
-        );
-
-        match check_account(
-            &mastodon,
-            &llm,
-            &slack,
-            account,
-            threshold,
-            dry_run,
-            &note_writer,
-        )
-        .await
-        {
-            Ok(Some(notified)) => {
-                spam_detected += 1;
-                if notified {
-                    spam_notified += 1;
+            match check_account(
+                &mastodon,
+                &llm,
+                &slack,
+                account,
+                threshold,
+                dry_run,
+                note_writer.as_ref(),
+            )
+            .await
+            {
+                Ok(Some(notified)) => {
+                    spam_detected += 1;
+                    if notified {
+                        spam_notified += 1;
+                    }
                 }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                error!(
-                    username = %account.username,
-                    error = format!("{e:#}"),
-                    "check failed; aborting, next run resumes from this account"
-                );
-                break;
+                Ok(None) => {}
+                Err(e) => {
+                    error!(
+                        username = %account.username,
+                        error = format!("{e:#}"),
+                        "check failed; aborting, next run resumes from this account"
+                    );
+                    break;
+                }
             }
         }
 
@@ -161,17 +159,10 @@ async fn check(dry_run: bool) -> Result<()> {
         info!("dry-run: cursor not updated");
     }
 
-    if dry_run {
-        info!(
-            total = accounts.len(),
-            spam_detected, spam_notified, "dry-run finished"
-        );
-    } else {
-        info!(
-            total = accounts.len(),
-            spam_detected, spam_notified, "check finished"
-        );
-    }
+    info!(
+        total = accounts.len(),
+        spam_detected, spam_notified, dry_run, "check finished"
+    );
 
     Ok(())
 }
@@ -187,7 +178,7 @@ async fn check_account(
     account: &mastodon::AdminAccount,
     threshold: f64,
     dry_run: bool,
-    note_writer: &Option<postgres::ModerationNoteWriter>,
+    note_writer: Option<&postgres::ModerationNoteWriter>,
 ) -> Result<Option<bool>> {
     let statuses = mastodon
         .fetch_statuses(&account.id)

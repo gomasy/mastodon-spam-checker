@@ -169,7 +169,7 @@ impl MastodonClient {
         // Treat permanent errors (e.g. account deleted) as "no posts"
         // and continue with profile-only classification (do not abort the caller).
         let status = resp.status();
-        if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+        if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
             warn!(account_id = %account_id, %status, "statuses unavailable, treating as no posts");
             return Ok(Vec::new());
         }

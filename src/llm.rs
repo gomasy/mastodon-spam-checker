@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use rust_i18n::t;
 
+use std::fmt::Write;
+
 use crate::http;
 use crate::mastodon::{AdminAccount, Status};
 
@@ -204,7 +206,7 @@ fn build_user_prompt(account: &AdminAccount, statuses: &[Status]) -> String {
         prompt.push_str("\n## Recent Posts\n");
         for status in statuses {
             let content_plain = html_to_plain(&status.content);
-            prompt.push_str(&format!("- {}\n", content_plain));
+            let _ = writeln!(prompt, "- {content_plain}");
         }
     }
 
@@ -212,12 +214,11 @@ fn build_user_prompt(account: &AdminAccount, statuses: &[Status]) -> String {
 }
 
 fn html_to_plain(html: &str) -> String {
-    let mut result = html.to_string();
-    result = result
+    let result = html
         .replace("<br>", "\n")
         .replace("<br/>", "\n")
-        .replace("<br />", "\n");
-    result = result.replace("</p><p>", "\n\n");
+        .replace("<br />", "\n")
+        .replace("</p><p>", "\n\n");
 
     let mut plain = String::with_capacity(result.len());
     let mut in_tag = false;
