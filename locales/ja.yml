@@ -1,4 +1,30 @@
-# Slack spam notification
+already_suspended: ":information_source: `%{acct}` は既に停止済みです"
+
+btn_cancel: キャンセル
+btn_delete: アカウントを削除
+btn_delete_confirm: "`%{acct}` のデータを完全に削除します。この操作は取り消せません。よろしいですか?"
+btn_delete_do: 削除する
+btn_delete_title: アカウント削除
+btn_suspend: アカウントを停止
+btn_suspend_confirm: "`%{acct}` を停止します。よろしいですか?"
+btn_suspend_do: 停止する
+btn_suspend_title: アカウント停止
+
+check_failed: ":x: `%{acct}` の停止状態を確認できなかったため削除を中止しました: %{error}"
+
+delete_failed: ":x: `%{acct}` の削除に失敗しました: %{error}"
+deleted: ":wastebasket: <@%{user_id}> が `%{acct}` のデータを削除しました"
+
+llm_reason_lang: Japanese
+
+not_suspended: ":x: `%{acct}` は停止されていないため削除を中止しました（停止が解除された可能性があります）"
+
+note_spam: |-
+  [Mastodon Spam Checker] スパムの疑いあり
+  確信度: %{confidence}%
+  理由: %{reason}
+note_suspended: "[Mastodon Spam Checker] Slack 経由でアカウントを停止 (操作者: <@%{user_id}>)"
+
 spam_detected: |-
   :warning: *スパムアカウント検出*
   • アカウント: `%{acct}`
@@ -7,34 +33,5 @@ spam_detected: |-
   • 確信度: %{confidence}%
   • 理由: %{reason}
 
-# Suspend button
-btn_suspend: アカウントを停止
-btn_suspend_title: アカウント停止
-btn_suspend_confirm: "`%{acct}` を停止します。よろしいですか?"
-btn_suspend_do: 停止する
-btn_cancel: キャンセル
-
-# Delete button
-btn_delete: アカウントを削除
-btn_delete_title: アカウント削除
-btn_delete_confirm: "`%{acct}` のデータを完全に削除します。この操作は取り消せません。よろしいですか?"
-btn_delete_do: 削除する
-
-# Server (Slack interaction responses)
-already_suspended: ":information_source: `%{acct}` は既に停止済みです"
-suspended: ":white_check_mark: <@%{user_id}> が `%{acct}` を停止しました"
 suspend_failed: ":x: `%{acct}` の停止に失敗しました: %{error}"
-deleted: ":wastebasket: <@%{user_id}> が `%{acct}` のデータを削除しました"
-delete_failed: ":x: `%{acct}` の削除に失敗しました: %{error}"
-not_suspended: ":x: `%{acct}` は停止されていないため削除を中止しました（停止が解除された可能性があります）"
-check_failed: ":x: `%{acct}` の停止状態を確認できなかったため削除を中止しました: %{error}"
-
-# Moderation notes
-note_spam: |-
-  [Mastodon Spam Checker] スパムの疑いあり
-  確信度: %{confidence}%
-  理由: %{reason}
-note_suspended: "[Mastodon Spam Checker] Slack 経由でアカウントを停止 (操作者: <@%{user_id}>)"
-
-# LLM system prompt snippet
-llm_reason_lang: Japanese
+suspended: ":white_check_mark: <@%{user_id}> が `%{acct}` を停止しました"

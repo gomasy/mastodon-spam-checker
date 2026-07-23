@@ -1,4 +1,30 @@
-# Slack spam notification
+already_suspended: ":information_source: `%{acct}` is already suspended"
+
+btn_cancel: Cancel
+btn_delete: Delete account
+btn_delete_confirm: This will permanently delete all data for `%{acct}`. This action cannot be undone. Are you sure?
+btn_delete_do: Delete
+btn_delete_title: Delete account
+btn_suspend: Suspend account
+btn_suspend_confirm: Are you sure you want to suspend `%{acct}`?
+btn_suspend_do: Suspend
+btn_suspend_title: Suspend account
+
+check_failed: ":x: Deletion aborted: could not verify suspension status of `%{acct}`: %{error}"
+
+delete_failed: ":x: Failed to delete `%{acct}`: %{error}"
+deleted: ":wastebasket: <@%{user_id}> deleted data for `%{acct}`"
+
+llm_reason_lang: English
+
+not_suspended: ":x: Deletion aborted: `%{acct}` is not suspended (the suspension may have been lifted)"
+
+note_spam: |-
+  [Mastodon Spam Checker] Suspected spam
+  Confidence: %{confidence}%
+  Reason: %{reason}
+note_suspended: "[Mastodon Spam Checker] Account suspended via Slack (by: <@%{user_id}>)"
+
 spam_detected: |-
   :warning: *Spam account detected*
   • Account: `%{acct}`
@@ -7,34 +33,5 @@ spam_detected: |-
   • Confidence: %{confidence}%
   • Reason: %{reason}
 
-# Suspend button
-btn_suspend: Suspend account
-btn_suspend_title: Suspend account
-btn_suspend_confirm: Are you sure you want to suspend `%{acct}`?
-btn_suspend_do: Suspend
-btn_cancel: Cancel
-
-# Delete button
-btn_delete: Delete account
-btn_delete_title: Delete account
-btn_delete_confirm: This will permanently delete all data for `%{acct}`. This action cannot be undone. Are you sure?
-btn_delete_do: Delete
-
-# Server (Slack interaction responses)
-already_suspended: ":information_source: `%{acct}` is already suspended"
-suspended: ":white_check_mark: <@%{user_id}> suspended `%{acct}`"
 suspend_failed: ":x: Failed to suspend `%{acct}`: %{error}"
-deleted: ":wastebasket: <@%{user_id}> deleted data for `%{acct}`"
-delete_failed: ":x: Failed to delete `%{acct}`: %{error}"
-not_suspended: ":x: Deletion aborted: `%{acct}` is not suspended (the suspension may have been lifted)"
-check_failed: ":x: Deletion aborted: could not verify suspension status of `%{acct}`: %{error}"
-
-# Moderation notes
-note_spam: |-
-  [Mastodon Spam Checker] Suspected spam
-  Confidence: %{confidence}%
-  Reason: %{reason}
-note_suspended: "[Mastodon Spam Checker] Account suspended via Slack (by: <@%{user_id}>)"
-
-# LLM system prompt snippet
-llm_reason_lang: English
+suspended: ":white_check_mark: <@%{user_id}> suspended `%{acct}`"
