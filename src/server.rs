@@ -20,7 +20,7 @@ use crate::config::ServeConfig;
 use crate::mastodon::MastodonClient;
 use crate::slack::{
     ButtonValue, DELETE_ACTION_ID, SUSPEND_ACTION_ID, TEXT_MAX_CHARS, delete_actions_block,
-    truncate_chars,
+    sanitize_mrkdwn, truncate_mrkdwn,
 };
 
 /// Maximum allowed clock skew for Slack request timestamps (replay attack prevention).
@@ -64,7 +64,7 @@ struct Interaction {
 }
 
 pub async fn run(config: ServeConfig) -> Result<()> {
-    let mastodon = MastodonClient::new(&config.mastodon_base_url, &config.mastodon_access_token);
+    let mastodon = MastodonClient::new(&config.mastodon_base_url, &config.mastodon_access_token)?;
 
     let note_writer = match config.postgres {
         Some(ref pg) => Some(
@@ -242,6 +242,7 @@ async fn process_action(state: Arc<AppState>, interaction: Interaction) {
         response_url,
         mut blocks,
     } = interaction;
+    let safe_acct = sanitize_mrkdwn(&value.acct);
 
     // Remove any previous context blocks that would accumulate unboundedly on retries.
     // On success, each branch also removes or replaces the button to prevent re-execution (left on failure to allow retry).
@@ -262,24 +263,24 @@ async fn process_action(state: Arc<AppState>, interaction: Interaction) {
 
             if already_suspended {
                 info!(account_id = %value.id, acct = %value.acct, "account already suspended, skipping");
-                replace_buttons_with_delete(&mut blocks, &raw_value, &value.acct);
-                t!("already_suspended", acct = &value.acct).to_string()
+                replace_buttons_with_delete(&mut blocks, &raw_value, &safe_acct);
+                t!("already_suspended", acct = &safe_acct).to_string()
             } else {
                 match state.mastodon.suspend_account(&value.id).await {
                     Ok(()) => {
                         info!(account_id = %value.id, acct = %value.acct, "account suspended");
-                        replace_buttons_with_delete(&mut blocks, &raw_value, &value.acct);
+                        replace_buttons_with_delete(&mut blocks, &raw_value, &safe_acct);
                         if let Some(ref writer) = state.note_writer {
                             let note = t!("note_suspended", user_id = &user_id);
                             if let Err(e) = writer.add_note(&value.id, &note).await {
                                 error!(error = %e, "failed to add moderation note");
                             }
                         }
-                        t!("suspended", user_id = &user_id, acct = &value.acct).to_string()
+                        t!("suspended", user_id = &user_id, acct = &safe_acct).to_string()
                     }
                     Err(e) => {
                         error!(account_id = %value.id, error = %e, "failed to suspend account");
-                        t!("suspend_failed", acct = &value.acct, error = e.to_string()).to_string()
+                        failure_message("suspend_failed", &safe_acct, &e)
                     }
                 }
             }
@@ -292,20 +293,20 @@ async fn process_action(state: Arc<AppState>, interaction: Interaction) {
                 Ok(()) => {
                     info!(account_id = %value.id, acct = %value.acct, "account data deleted");
                     blocks.retain(|b| b["type"] != "actions");
-                    t!("deleted", user_id = &user_id, acct = &value.acct).to_string()
+                    t!("deleted", user_id = &user_id, acct = &safe_acct).to_string()
                 }
                 Err(e) => {
                     error!(account_id = %value.id, error = %e, "failed to delete account");
-                    t!("delete_failed", acct = &value.acct, error = e.to_string()).to_string()
+                    failure_message("delete_failed", &safe_acct, &e)
                 }
             },
             Ok(false) => {
                 warn!(account_id = %value.id, "account is not suspended, refusing to delete");
-                t!("not_suspended", acct = &value.acct).to_string()
+                t!("not_suspended", acct = &safe_acct).to_string()
             }
             Err(e) => {
                 error!(account_id = %value.id, error = %e, "failed to check suspension state, aborting delete");
-                t!("check_failed", acct = &value.acct, error = e.to_string()).to_string()
+                failure_message("check_failed", &safe_acct, &e)
             }
         },
     };
@@ -321,9 +322,20 @@ async fn process_action(state: Arc<AppState>, interaction: Interaction) {
     state.lock_in_flight().remove(&value.id);
 }
 
-fn replace_buttons_with_delete(blocks: &mut Vec<Value>, value_json: &str, acct: &str) {
+/// Renders one of the `*_failed` locale strings. `safe_acct` must already be sanitized;
+/// the error text is sanitized here because it can carry a raw upstream response body.
+fn failure_message(key: &str, safe_acct: &str, error: &anyhow::Error) -> String {
+    t!(
+        key,
+        acct = safe_acct,
+        error = sanitize_mrkdwn(&error.to_string())
+    )
+    .to_string()
+}
+
+fn replace_buttons_with_delete(blocks: &mut Vec<Value>, value_json: &str, safe_acct: &str) {
     blocks.retain(|b| b["type"] != "actions");
-    blocks.push(delete_actions_block(value_json, acct));
+    blocks.push(delete_actions_block(value_json, safe_acct));
 }
 
 fn context_block(text: &str) -> Value {
@@ -331,7 +343,7 @@ fn context_block(text: &str) -> Value {
         "type": "context",
         // Truncate to avoid invalid_blocks errors when Mastodon error bodies or other content
         // would exceed the limit and cause the entire update to be silently dropped.
-        "elements": [{ "type": "mrkdwn", "text": truncate_chars(text, TEXT_MAX_CHARS) }]
+        "elements": [{ "type": "mrkdwn", "text": truncate_mrkdwn(text, TEXT_MAX_CHARS) }]
     })
 }
 

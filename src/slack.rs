@@ -45,64 +45,70 @@ pub struct SlackNotifier {
     client: Client,
     webhook_url: String,
     channel: Option<String>,
+    retry: http::RetryConfig,
 }
 
 impl SlackNotifier {
-    pub fn new(webhook_url: &str, channel: Option<String>) -> Self {
-        Self {
-            client: http::client(Duration::from_secs(30)),
+    pub fn new(webhook_url: &str, channel: Option<String>) -> Result<Self> {
+        Ok(Self {
+            client: http::client(Duration::from_secs(30))?,
             webhook_url: webhook_url.to_string(),
             channel,
-        }
+            retry: http::RetryConfig::default(),
+        })
     }
 
     pub async fn notify_spam(&self, account: &AdminAccount, verdict: &SpamVerdict) -> Result<()> {
-        let domain = account.domain.as_deref().unwrap_or("(local)");
-        let acct = format!("{}@{}", account.username, domain);
+        let acct = account.acct();
+        let safe_acct = sanitize_mrkdwn(&acct);
         let text = t!(
             "spam_detected",
-            acct = &acct,
-            display_name = &account.account.display_name,
-            url = &account.account.url,
+            acct = &safe_acct,
+            display_name = sanitize_mrkdwn(&account.account.display_name),
+            url = sanitize_mrkdwn(&account.account.url),
             confidence = format!("{:.0}", verdict.confidence * 100.0),
-            reason = &verdict.reason,
+            reason = sanitize_mrkdwn(&verdict.reason),
         )
         .to_string();
+        let text = truncate_mrkdwn(&text, TEXT_MAX_CHARS);
 
         let value = serde_json::to_string(&ButtonValue {
             id: account.id.clone(),
-            acct: acct.clone(),
+            acct,
         })
         .context("failed to serialize button value")?;
         let blocks = json!([
             {
                 "type": "section",
-                "text": { "type": "mrkdwn", "text": truncate_chars(&text, TEXT_MAX_CHARS) }
+                "text": { "type": "mrkdwn", "text": text.clone() }
             },
             confirm_actions_block(
                 SUSPEND_ACTION_ID,
                 &t!("btn_suspend"),
                 &value,
                 &t!("btn_suspend_title"),
-                &t!("btn_suspend_confirm", acct = &acct),
+                &t!("btn_suspend_confirm", acct = &safe_acct),
                 &t!("btn_suspend_do"),
             ),
         ]);
 
-        let resp = self
-            .client
-            .post(&self.webhook_url)
-            .json(&SlackMessage {
-                text,
-                blocks,
-                username: APP_NAME,
-                icon_emoji: ":scales:",
-                channel: self.channel.clone(),
-            })
-            .send()
-            .await
-            .context("Slack webhook request failed")?;
-        http::ensure_success(resp, "Slack webhook").await?;
+        let message = SlackMessage {
+            // Doubles as the notification/preview fallback; already within Slack's limit for it.
+            text,
+            blocks,
+            username: APP_NAME,
+            icon_emoji: ":scales:",
+            channel: self.channel.clone(),
+        };
+
+        // Retry transient failures: the caller aborts the whole run on a notification error,
+        // so a momentary blip would otherwise stall the checker on this account.
+        http::send_with_retry(
+            || self.client.post(&self.webhook_url).json(&message),
+            "Slack webhook",
+            self.retry,
+        )
+        .await?;
 
         Ok(())
     }
@@ -110,14 +116,15 @@ impl SlackNotifier {
 
 /// Builds an actions block containing the "Delete Account" button for post-suspension messages.
 /// (DELETE /api/v1/admin/accounts/:id is only valid for suspended accounts.)
-/// Pass the suspend button's value JSON (ButtonValue) as value_json.
-pub fn delete_actions_block(value_json: &str, acct: &str) -> Value {
+/// Pass the suspend button's value JSON (ButtonValue) as value_json, and an account handle
+/// already run through [`sanitize_mrkdwn`] — this does not escape it again.
+pub fn delete_actions_block(value_json: &str, safe_acct: &str) -> Value {
     confirm_actions_block(
         DELETE_ACTION_ID,
         &t!("btn_delete"),
         value_json,
         &t!("btn_delete_title"),
-        &t!("btn_delete_confirm", acct = acct),
+        &t!("btn_delete_confirm", acct = safe_acct),
         &t!("btn_delete_do"),
     )
 }
@@ -143,7 +150,7 @@ fn confirm_actions_block(
                 "title": { "type": "plain_text", "text": confirm_title },
                 "text": {
                     "type": "mrkdwn",
-                    "text": truncate_chars(confirm_text, CONFIRM_TEXT_MAX_CHARS)
+                    "text": truncate_mrkdwn(confirm_text, CONFIRM_TEXT_MAX_CHARS)
                 },
                 "confirm": { "type": "plain_text", "text": confirm_label },
                 "deny": { "type": "plain_text", "text": t!("btn_cancel").to_string() }
@@ -152,14 +159,47 @@ fn confirm_actions_block(
     })
 }
 
-pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let mut truncated: String = s.chars().take(max_chars - 1).collect();
-        truncated.push('…');
-        truncated
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
     }
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut truncated: String = s.chars().take(max_chars - 1).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// Truncates text that has been through [`sanitize_mrkdwn`], without cutting a trailing
+/// `&...;` entity in half (a bare `&am` would render as literal text).
+pub(crate) fn truncate_mrkdwn(s: &str, max_chars: usize) -> String {
+    let truncated = truncate_chars(s, max_chars);
+    // Only a shortened string can end mid-entity, and the ellipsis is what marks that case.
+    if !truncated.ends_with('…') {
+        return truncated;
+    }
+    match truncated.rfind('&') {
+        Some(pos) if !truncated[pos..].contains(';') => format!("{}…", &truncated[..pos]),
+        _ => truncated,
+    }
+}
+
+/// Prepares untrusted text for embedding in an mrkdwn template.
+///
+/// Escapes the three characters Slack treats as control sequences, so the content cannot inject
+/// links, user mentions, or broadcasts such as `<!channel>`, and folds line breaks so it cannot
+/// forge extra lines in the notification (mrkdwn offers no way to escape a newline). Every
+/// account-, LLM-, or error-derived value interpolated into a locale template goes through this.
+///
+/// Not idempotent: applying it twice renders the escapes literally.
+pub(crate) fn sanitize_mrkdwn(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(test)]
@@ -176,5 +216,32 @@ mod tests {
     fn truncate_chars_truncates_by_chars_not_bytes() {
         assert_eq!(truncate_chars("あいうえお", 3), "あい…");
         assert_eq!(truncate_chars("あいうえお", 3).chars().count(), 3);
+        assert_eq!(truncate_chars("abc", 0), "");
+    }
+
+    #[test]
+    fn truncate_mrkdwn_does_not_split_an_escaped_entity() {
+        // "A&amp;B" cut at 6 chars would end in "&am" without the entity guard.
+        assert_eq!(truncate_mrkdwn(&sanitize_mrkdwn("A&B"), 6), "A…");
+        assert_eq!(truncate_mrkdwn("a&amp;bcd", 8), "a&amp;b…");
+        // Untruncated text is returned untouched.
+        assert_eq!(truncate_mrkdwn("a&amp;b", 8), "a&amp;b");
+    }
+
+    #[test]
+    fn mrkdwn_control_sequences_are_escaped() {
+        assert_eq!(
+            sanitize_mrkdwn("A & B <!channel> <https://example.com>"),
+            "A &amp; B &lt;!channel&gt; &lt;https://example.com&gt;"
+        );
+    }
+
+    #[test]
+    fn sanitized_text_cannot_forge_extra_lines() {
+        assert_eq!(
+            sanitize_mrkdwn("spammer\n• Account: `admin@example.com`"),
+            "spammer • Account: `admin@example.com`"
+        );
+        assert_eq!(sanitize_mrkdwn("  padded\tname  "), "padded name");
     }
 }

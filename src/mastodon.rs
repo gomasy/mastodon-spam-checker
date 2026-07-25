@@ -15,6 +15,17 @@ pub struct AdminAccount {
     pub account: Account,
 }
 
+impl AdminAccount {
+    /// `username@domain` as shown to moderators; local accounts have no domain.
+    pub fn acct(&self) -> String {
+        format!(
+            "{}@{}",
+            self.username,
+            self.domain.as_deref().unwrap_or("(local)")
+        )
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Account {
     pub display_name: String,
@@ -39,13 +50,13 @@ pub struct MastodonClient {
 }
 
 impl MastodonClient {
-    pub fn new(base_url: &str, access_token: &str) -> Self {
-        Self {
-            client: http::client(Duration::from_secs(30)),
+    pub fn new(base_url: &str, access_token: &str) -> Result<Self> {
+        Ok(Self {
+            client: http::client(Duration::from_secs(30))?,
             base_url: base_url.trim_end_matches('/').to_string(),
             access_token: access_token.to_string(),
             retry: http::RetryConfig::default(),
-        }
+        })
     }
 
     /// Returns a clone of the inner HTTP client (clones share the connection pool).

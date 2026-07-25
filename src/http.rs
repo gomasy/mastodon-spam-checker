@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use tracing::warn;
 
 /// Builds an HTTP client with common settings (User-Agent, timeout).
-pub fn client(timeout: Duration) -> Client {
+pub fn client(timeout: Duration) -> Result<Client> {
     Client::builder()
         .user_agent(concat!(
             env!("CARGO_PKG_NAME"),
@@ -14,7 +14,7 @@ pub fn client(timeout: Duration) -> Client {
         ))
         .timeout(timeout)
         .build()
-        .expect("failed to build HTTP client")
+        .context("failed to build HTTP client")
 }
 
 pub async fn ensure_success(resp: Response, what: &str) -> Result<Response> {

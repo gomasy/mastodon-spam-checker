@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use rust_i18n::t;
 
@@ -97,15 +98,15 @@ impl LlmClient {
         model: &str,
         json_mode: bool,
         retry: http::RetryConfig,
-    ) -> Self {
-        Self {
-            client: http::client(Duration::from_secs(120)),
+    ) -> Result<Self> {
+        Ok(Self {
+            client: http::client(Duration::from_secs(120))?,
             api_base: api_base.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
             json_mode,
             retry,
-        }
+        })
     }
 
     pub async fn check_spam(
@@ -163,15 +164,42 @@ impl LlmClient {
             .trim_end_matches("```")
             .trim();
 
-        let verdict: SpamVerdict =
-            serde_json::from_str(content).context("failed to parse LLM verdict JSON")?;
-
-        Ok(verdict)
+        parse_verdict(content)
     }
 }
 
+fn parse_verdict(content: &str) -> Result<SpamVerdict> {
+    let mut verdict: SpamVerdict =
+        serde_json::from_str(content).context("failed to parse LLM verdict JSON")?;
+    verdict.confidence = normalize_confidence(verdict.confidence);
+    Ok(verdict)
+}
+
+/// Coerces a verdict confidence into 0.0–1.0.
+///
+/// Some models report confidence on a 0–100 scale or drift slightly out of range. Normalising
+/// keeps a single odd verdict from failing the run forever: an error here would stop the caller
+/// without advancing the cursor, so the same account would be retried on every subsequent run.
+fn normalize_confidence(confidence: f64) -> f64 {
+    let normalized = if confidence.is_nan() {
+        // clamp() would pass NaN straight through.
+        0.0
+    } else if confidence > 1.0 && confidence <= 100.0 {
+        // Within the percentage range, read it as a 0-100 scale; clamp anything beyond.
+        confidence / 100.0
+    } else {
+        confidence.clamp(0.0, 1.0)
+    };
+    if normalized != confidence {
+        warn!(
+            reported = confidence,
+            normalized, "LLM verdict confidence was out of range, normalized"
+        );
+    }
+    normalized
+}
+
 fn build_user_prompt(account: &AdminAccount, statuses: &[Status]) -> String {
-    let domain = account.domain.as_deref().unwrap_or("(local)");
     let note_plain = html_to_plain(&account.account.note);
     // Mastodon serves /avatars/original/missing.png when no avatar is set
     let avatar_state =
@@ -183,14 +211,13 @@ fn build_user_prompt(account: &AdminAccount, statuses: &[Status]) -> String {
 
     let mut prompt = format!(
         "## Account Profile\n\
-         - Username: {}@{}\n\
+         - Username: {}\n\
          - Display Name: {}\n\
          - Bio: {}\n\
          - URL: {}\n\
          - Avatar: {}\n\
          - Followers: {} / Following: {} / Posts: {}\n",
-        account.username,
-        domain,
+        account.acct(),
         account.account.display_name,
         note_plain,
         account.account.url,
@@ -268,5 +295,33 @@ mod tests {
         // Double-escaped entities are unescaped only one level deep (because &amp; is replaced last).
         assert_eq!(html_to_plain("&amp;lt;script&amp;gt;"), "&lt;script&gt;");
         assert_eq!(html_to_plain("A &amp; B"), "A & B");
+    }
+
+    #[test]
+    fn verdict_confidence_is_normalized() {
+        let verdict = parse_verdict(r#"{"spam":true,"reason":"test","confidence":0.8}"#).unwrap();
+        assert_eq!(verdict.confidence, 0.8);
+
+        // A malformed confidence must not fail the run, so it is coerced instead.
+        let verdict = parse_verdict(r#"{"spam":true,"reason":"test","confidence":-0.1}"#).unwrap();
+        assert_eq!(verdict.confidence, 0.0);
+        let verdict = parse_verdict(r#"{"spam":true,"reason":"test","confidence":85}"#).unwrap();
+        assert_eq!(verdict.confidence, 0.85);
+    }
+
+    #[test]
+    fn confidence_is_normalized_from_any_scale() {
+        assert_eq!(normalize_confidence(0.0), 0.0);
+        assert_eq!(normalize_confidence(1.0), 1.0);
+        assert_eq!(normalize_confidence(0.42), 0.42);
+        // 0-100 scale.
+        assert_eq!(normalize_confidence(85.0), 0.85);
+        assert_eq!(normalize_confidence(100.0), 1.0);
+        // Out of every range.
+        assert_eq!(normalize_confidence(-3.0), 0.0);
+        assert_eq!(normalize_confidence(150.0), 1.0);
+        assert_eq!(normalize_confidence(f64::INFINITY), 1.0);
+        assert_eq!(normalize_confidence(f64::NEG_INFINITY), 0.0);
+        assert_eq!(normalize_confidence(f64::NAN), 0.0);
     }
 }

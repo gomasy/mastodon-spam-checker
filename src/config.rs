@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 pub struct PostgresConfig {
     pub database_url: String,
@@ -7,7 +7,7 @@ pub struct PostgresConfig {
 
 impl PostgresConfig {
     pub fn from_env() -> Result<Option<Self>> {
-        match std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) {
+        match optional_env("DATABASE_URL")? {
             Some(url) => {
                 let id: i64 = required_env("MODERATOR_ACCOUNT_ID")?
                     .parse()
@@ -43,24 +43,18 @@ impl Config {
         Ok(Self {
             mastodon_base_url,
             mastodon_access_token,
-            redis_url: env_or("REDIS_URL", "redis://localhost:6379"),
+            redis_url: env_or("REDIS_URL", "redis://localhost:6379")?,
             openai_api_base: required_env("OPENAI_API_BASE")?,
             openai_api_key: required_env("OPENAI_API_KEY")?,
-            openai_model: env_or("OPENAI_MODEL", "gpt-4o"),
+            openai_model: env_or("OPENAI_MODEL", "gpt-4o")?,
             // Set to false for OpenAI-compatible APIs that do not support response_format.
-            openai_json_mode: std::env::var("OPENAI_JSON_MODE")
-                .map(|v| v != "false" && v != "0")
-                .unwrap_or(true),
-            // Defaults to 0.0 (notify all) when unset or unparseable, for backwards compatibility.
-            spam_confidence_threshold: std::env::var("SPAM_CONFIDENCE_THRESHOLD")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .filter(|v| (0.0..=1.0).contains(v))
-                .unwrap_or(0.0),
+            openai_json_mode: bool_env("OPENAI_JSON_MODE", true)?,
+            spam_confidence_threshold: match optional_env("SPAM_CONFIDENCE_THRESHOLD")? {
+                Some(value) => parse_confidence_threshold(&value)?,
+                None => 0.0,
+            },
             slack_webhook_url: required_env("SLACK_WEBHOOK_URL")?,
-            slack_channel: std::env::var("SLACK_CHANNEL")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            slack_channel: optional_env("SLACK_CHANNEL")?,
             postgres: PostgresConfig::from_env()?,
         })
     }
@@ -81,7 +75,7 @@ impl ServeConfig {
             mastodon_base_url,
             mastodon_access_token,
             slack_signing_secret: required_env("SLACK_SIGNING_SECRET")?,
-            listen_addr: env_or("LISTEN_ADDR", "127.0.0.1:8990"),
+            listen_addr: env_or("LISTEN_ADDR", "127.0.0.1:8990")?,
             postgres: PostgresConfig::from_env()?,
         })
     }
@@ -94,10 +88,80 @@ fn mastodon_env() -> Result<(String, String)> {
     ))
 }
 
-fn required_env(key: &str) -> Result<String> {
-    std::env::var(key).with_context(|| format!("environment variable {key} is not set"))
+/// Reads an environment variable, treating a blank value as unset.
+///
+/// `KEY=` in a .env file is the usual way to disable a setting, so it falls back to the default
+/// instead of failing to parse. Matches how SLACK_CHANNEL and DATABASE_URL are handled.
+fn optional_env(key: &str) -> Result<Option<String>> {
+    match std::env::var(key) {
+        Ok(value) => Ok(Some(value).filter(|v| !v.trim().is_empty())),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to read environment variable {key}"))
+        }
+    }
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+fn required_env(key: &str) -> Result<String> {
+    match optional_env(key)? {
+        Some(value) => Ok(value),
+        None => bail!("environment variable {key} is not set"),
+    }
+}
+
+fn env_or(key: &str, default: &str) -> Result<String> {
+    Ok(optional_env(key)?.unwrap_or_else(|| default.to_string()))
+}
+
+fn bool_env(key: &str, default: bool) -> Result<bool> {
+    match optional_env(key)? {
+        Some(value) => parse_bool(key, &value),
+        None => Ok(default),
+    }
+}
+
+fn parse_bool(key: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => bail!("environment variable {key} must be true, false, 1, or 0"),
+    }
+}
+
+fn parse_confidence_threshold(value: &str) -> Result<f64> {
+    let threshold = value
+        .trim()
+        .parse::<f64>()
+        .context("SPAM_CONFIDENCE_THRESHOLD is not a valid number")?;
+    // Also rejects NaN and infinities: comparisons against them are always false.
+    if !(0.0..=1.0).contains(&threshold) {
+        bail!("SPAM_CONFIDENCE_THRESHOLD must be between 0.0 and 1.0");
+    }
+    Ok(threshold)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boolean_values_are_parsed_strictly() {
+        assert!(parse_bool("TEST", " TRUE ").unwrap());
+        assert!(parse_bool("TEST", "1").unwrap());
+        assert!(!parse_bool("TEST", "False").unwrap());
+        assert!(!parse_bool("TEST", "0").unwrap());
+        assert!(parse_bool("TEST", "yes").is_err());
+        assert!(parse_bool("TEST", "").is_err());
+    }
+
+    #[test]
+    fn confidence_threshold_is_validated() {
+        assert_eq!(parse_confidence_threshold("0").unwrap(), 0.0);
+        assert_eq!(parse_confidence_threshold(" 0.75 ").unwrap(), 0.75);
+        assert_eq!(parse_confidence_threshold("1").unwrap(), 1.0);
+        assert!(parse_confidence_threshold("-0.1").is_err());
+        assert!(parse_confidence_threshold("1.1").is_err());
+        assert!(parse_confidence_threshold("NaN").is_err());
+        assert!(parse_confidence_threshold("invalid").is_err());
+    }
 }

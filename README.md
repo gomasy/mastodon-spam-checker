@@ -4,8 +4,10 @@ An LLM-powered spam detector for Mastodon instances. It fetches newly
 federated remote accounts through the Mastodon Admin API, asks an
 OpenAI-compatible LLM whether each account looks like spam, and reports
 detections to Slack. Each notification carries a **Suspend** button so a
-moderator can suspend the account straight from Slack (with a confirmation
-dialog) — handled by an optional companion server (`serve` mode).
+moderator can suspend the account straight from Slack. After suspension, the
+button becomes **Delete account**, which permanently deletes the account's
+data after a second confirmation. Both actions are handled by an optional
+companion server (`serve` mode).
 
 Designed to run periodically (e.g. via cron or a systemd timer): each run
 picks up where the previous one left off, using a cursor stored in Redis.
@@ -18,13 +20,19 @@ picks up where the previous one left off, using a cursor stored in Redis.
 3. Fetches each account's recent posts and builds a prompt from the
    profile and post contents (HTML is converted to plain text).
 4. Asks the LLM for a verdict: `{"spam": bool, "reason": "...", "confidence": 0.0-1.0}`.
+   A confidence outside that range is normalized rather than rejected (values
+   between 1 and 100 are read as a percentage, anything else is clamped), so a
+   single odd verdict cannot stall the run.
 5. Sends a Slack notification (with a suspend button) for each account
    judged as spam.
 6. Saves the last processed account ID to Redis as the cursor.
 
-On retryable errors (fetch or LLM failures) the run stops without advancing
-the cursor, so the next run resumes from the same account. Deleted accounts
-(HTTP 404/410 on the statuses endpoint) are judged from their profile alone.
+Transient HTTP failures (timeouts, connection errors, 429 and 5xx) are retried
+with exponential backoff against Mastodon, the LLM, and the Slack webhook. If a
+failure survives the retries, the run saves progress through the preceding
+account and exits unsuccessfully without advancing past the failed account. The
+next run therefore resumes from that account. Deleted accounts (HTTP 404/410 on
+the statuses endpoint) are judged from their profile alone.
 
 The prompt treats all account data as untrusted: instructions embedded in
 profiles or posts are themselves considered a spam indicator.
@@ -91,12 +99,17 @@ cp .env.example .env
 | `OPENAI_API_BASE` | ✅ | – | OpenAI-compatible API base (e.g. `https://api.openai.com/v1`) |
 | `OPENAI_API_KEY` | ✅ | – | API key |
 | `OPENAI_MODEL` | | `gpt-4o` | Model name |
-| `OPENAI_JSON_MODE` | | `true` | Set to `false` for APIs without `response_format` support |
-| `SPAM_CONFIDENCE_THRESHOLD` | | `0.0` | Skip Slack notifications for spam verdicts with confidence below this value (0.0–1.0). `0.0` notifies on every spam verdict (backward compatible). |
+| `OPENAI_JSON_MODE` | | `true` | Set to `false` for APIs without `response_format` support. Accepted values: `true`, `false`, `1`, or `0` (case-insensitive) |
+| `SPAM_CONFIDENCE_THRESHOLD` | | `0.0` | Skip Slack notifications for spam verdicts with confidence below this value (0.0–1.0). `0.0` notifies on every spam verdict |
 | `SLACK_WEBHOOK_URL` | ✅ | – | Slack incoming webhook URL |
 | `SLACK_CHANNEL` | | – | Override the webhook's default channel. Only honored by legacy custom-integration webhooks — Slack-app webhooks (required for the suspend button) ignore channel/username/icon overrides and always post to the channel chosen at install time. Quote the value (`"#spam-alerts"`) so `#` is not parsed as a comment |
 | `SLACK_SIGNING_SECRET` | `serve` only | – | Signing secret of your Slack app (Basic Information page) |
 | `LISTEN_ADDR` | | `127.0.0.1:8990` | Listen address for `serve` mode |
+
+Values are validated at startup: a malformed `OPENAI_JSON_MODE` or
+`SPAM_CONFIDENCE_THRESHOLD` aborts the run instead of being silently ignored.
+An empty value (`KEY=`) counts as unset and falls back to the default, so a
+required variable set to an empty string is reported as missing.
 
 Logging verbosity can be adjusted with `RUST_LOG`
 (e.g. `RUST_LOG=mastodon_spam_checker=debug`).
@@ -114,8 +127,9 @@ to the periodic checker:
 It listens on `LISTEN_ADDR` and handles `POST /slack/interactions`:
 verifies the request signature with `SLACK_SIGNING_SECRET`, suspends the
 account via `POST /api/v1/admin/accounts/:id/action`, and updates the
-original Slack message with the result (on success the button is removed;
-on failure it is kept so you can retry).
+original Slack message with the result. After suspension, the button is
+replaced with a separately confirmed permanent-delete button. A failed action
+keeps its button so it can be retried.
 
 Setup:
 
@@ -130,7 +144,7 @@ Setup:
    `SLACK_SIGNING_SECRET`, and give the Mastodon token the
    `admin:write:accounts` scope.
 
-The button always asks for confirmation before suspending. Requests with a
+Both destructive actions ask for confirmation. Requests with a
 missing/invalid signature or a stale timestamp (>5 min, replay protection)
 are rejected, duplicate clicks while a suspension is in flight are ignored,
 and on SIGTERM the server finishes in-flight suspensions (up to 30 s)
@@ -201,9 +215,10 @@ sudo systemctl enable --now mastodon-spam-checker.timer
 
 ## Notes
 
-- No account is suspended or silenced automatically. A suspension only
-  happens when a moderator clicks the button in Slack and confirms the
-  dialog; the checker itself only reports.
+- No account is suspended or deleted automatically. These actions only happen
+  when someone with access to the Slack notification clicks the corresponding
+  button and confirms the dialog; the checker itself only reports. Restrict
+  access to the notification channel to trusted moderators.
 - The release profile is tuned for binary size (rustls with the pure-Rust
   `ring` backend, LTO, stripped symbols), producing a ~3 MB binary.
 

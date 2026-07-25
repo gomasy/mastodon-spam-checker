@@ -17,9 +17,12 @@ rust_i18n::i18n!("locales", fallback = "en");
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     // Required before TLS is first used because reqwest is built with rustls-no-provider.
-    rustls::crypto::ring::default_provider()
+    if rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("failed to install rustls crypto provider");
+        .is_err()
+    {
+        bail!("failed to install rustls crypto provider");
+    }
 
     dotenvy::dotenv().ok();
 
@@ -62,15 +65,15 @@ async fn check(dry_run: bool) -> Result<()> {
 
     let mut cursor_store = redis::CursorStore::new(&config.redis_url).await?;
     let mastodon =
-        mastodon::MastodonClient::new(&config.mastodon_base_url, &config.mastodon_access_token);
+        mastodon::MastodonClient::new(&config.mastodon_base_url, &config.mastodon_access_token)?;
     let llm = llm::LlmClient::new(
         &config.openai_api_base,
         &config.openai_api_key,
         &config.openai_model,
         config.openai_json_mode,
         http::RetryConfig::default(),
-    );
-    let slack = slack::SlackNotifier::new(&config.slack_webhook_url, config.slack_channel);
+    )?;
+    let slack = slack::SlackNotifier::new(&config.slack_webhook_url, config.slack_channel)?;
     let note_writer = match config.postgres {
         Some(ref pg) => Some(
             postgres::ModerationNoteWriter::connect(&pg.database_url, pg.moderator_account_id)
@@ -100,6 +103,7 @@ async fn check(dry_run: bool) -> Result<()> {
     let mut last_id: Option<String> = None;
     let mut spam_detected = 0u32;
     let mut spam_notified = 0u32;
+    let mut check_failure = None;
 
     for account in &accounts {
         let domain = account.domain.as_deref().unwrap_or("?");
@@ -129,19 +133,20 @@ async fn check(dry_run: bool) -> Result<()> {
             )
             .await
             {
-                Ok(Some(notified)) => {
+                Ok(AccountCheckOutcome::Spam { notified }) => {
                     spam_detected += 1;
                     if notified {
                         spam_notified += 1;
                     }
                 }
-                Ok(None) => {}
+                Ok(AccountCheckOutcome::NotSpam) => {}
+                // Reported by the caller rather than logged here, so the failure surfaces exactly once.
                 Err(e) => {
-                    error!(
-                        username = %account.username,
-                        error = format!("{e:#}"),
-                        "check failed; aborting, next run resumes from this account"
-                    );
+                    check_failure = Some(e.context(format!(
+                        "check failed for {} (account {}); next run resumes from this account",
+                        account.acct(),
+                        account.id
+                    )));
                     break;
                 }
             }
@@ -152,11 +157,21 @@ async fn check(dry_run: bool) -> Result<()> {
 
     if !dry_run {
         if let Some(ref id) = last_id {
-            cursor_store.set_cursor(id).await?;
-            info!(cursor = %id, "cursor saved");
+            match cursor_store.set_cursor(id).await {
+                Ok(()) => info!(cursor = %id, "cursor saved"),
+                // A pending check failure is the root cause, so report that one and only log this.
+                Err(e) if check_failure.is_some() => {
+                    error!(error = format!("{e:#}"), "failed to save cursor");
+                }
+                Err(e) => return Err(e).context("failed to save cursor"),
+            }
         }
     } else {
         info!("dry-run: cursor not updated");
+    }
+
+    if let Some(error) = check_failure {
+        return Err(error);
     }
 
     info!(
@@ -167,10 +182,14 @@ async fn check(dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+enum AccountCheckOutcome {
+    NotSpam,
+    Spam { notified: bool },
+}
+
 /// Fetch one account's posts, run the spam check, and notify Slack if spam confidence meets the threshold.
 ///
-/// Returns `Some(notified)` when spam is detected (`notified` indicates whether Slack was alerted), `None` for non-spam.
-/// `Err` signals a retryable failure; the caller should stop without advancing the cursor.
+/// `Err` signals a failure; the caller stops without advancing past this account.
 async fn check_account(
     mastodon: &mastodon::MastodonClient,
     llm: &llm::LlmClient,
@@ -179,7 +198,7 @@ async fn check_account(
     threshold: f64,
     dry_run: bool,
     note_writer: Option<&postgres::ModerationNoteWriter>,
-) -> Result<Option<bool>> {
+) -> Result<AccountCheckOutcome> {
     let statuses = mastodon
         .fetch_statuses(&account.id)
         .await
@@ -196,7 +215,7 @@ async fn check_account(
             domain = %domain,
             "not spam"
         );
-        return Ok(None);
+        return Ok(AccountCheckOutcome::NotSpam);
     }
 
     if verdict.confidence < threshold {
@@ -208,7 +227,7 @@ async fn check_account(
             reason = %verdict.reason,
             "spam detected but below confidence threshold, skipping notification"
         );
-        return Ok(Some(false));
+        return Ok(AccountCheckOutcome::Spam { notified: false });
     }
 
     warn!(
@@ -221,13 +240,13 @@ async fn check_account(
 
     if dry_run {
         info!(username = %account.username, "dry-run: skip Slack notification");
-        return Ok(Some(false));
+        return Ok(AccountCheckOutcome::Spam { notified: false });
     }
 
-    // Do not abort on notification failure; the verdict is done so the cursor can still advance.
-    if let Err(e) = slack.notify_spam(account, &verdict).await {
-        error!(error = %e, "failed to send Slack notification");
-    }
+    slack
+        .notify_spam(account, &verdict)
+        .await
+        .context("failed to send Slack notification")?;
 
     if let Some(writer) = note_writer {
         let note = t!(
@@ -240,7 +259,7 @@ async fn check_account(
         }
     }
 
-    Ok(Some(true))
+    Ok(AccountCheckOutcome::Spam { notified: true })
 }
 
 const SYSTEM_USERNAMES: &[&str] = &["mastodon.internal", "internal.fetch", "system.actor"];
