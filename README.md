@@ -18,11 +18,15 @@ picks up where the previous one left off, using a cursor stored in Redis.
    `GET /api/v2/admin/accounts` (up to 100 per run).
 2. Skips system actors (instance actors, `mastodon.internal`, etc.).
 3. Fetches each account's recent posts and builds a prompt from the
-   profile and post contents (HTML is converted to plain text).
+   profile and post contents (HTML is converted to plain text). Long bios and
+   posts are truncated, and the posts share a fixed character budget, so one
+   verbose account cannot overrun the model's context window or its cost.
 4. Asks the LLM for a verdict: `{"spam": bool, "reason": "...", "confidence": 0.0-1.0}`.
    A confidence outside that range is normalized rather than rejected (values
    between 1 and 100 are read as a percentage, anything else is clamped), so a
-   single odd verdict cannot stall the run.
+   single odd verdict cannot stall the run. A reply with no usable verdict at all
+   (not JSON, or no choices) is logged and the account is skipped, for the same
+   reason: the same reply would come back on every later run.
 5. Sends a Slack notification (with a suspend button) for each account
    judged as spam.
 6. Saves the last processed account ID to Redis as the cursor.
@@ -33,6 +37,11 @@ failure survives the retries, the run saves progress through the preceding
 account and exits unsuccessfully without advancing past the failed account. The
 next run therefore resumes from that account. Deleted accounts (HTTP 404/410 on
 the statuses endpoint) are judged from their profile alone.
+
+The exception is a failure that a later run cannot recover from — an LLM reply
+that carries no verdict. Stopping there would park the cursor in front of that
+account permanently, so the account is skipped and the run continues; the count
+of skipped accounts is reported at the end of the run.
 
 The prompt treats all account data as untrusted: instructions embedded in
 profiles or posts are themselves considered a spam indicator.
@@ -105,11 +114,22 @@ cp .env.example .env
 | `SLACK_CHANNEL` | | – | Override the webhook's default channel. Only honored by legacy custom-integration webhooks — Slack-app webhooks (required for the suspend button) ignore channel/username/icon overrides and always post to the channel chosen at install time. Quote the value (`"#spam-alerts"`) so `#` is not parsed as a comment |
 | `SLACK_SIGNING_SECRET` | `serve` only | – | Signing secret of your Slack app (Basic Information page) |
 | `LISTEN_ADDR` | | `127.0.0.1:8990` | Listen address for `serve` mode |
+| `DATABASE_URL` | | – | Mastodon's PostgreSQL database. When set, moderation notes are written on spam detection and on suspension. Connects without TLS, so point it at a local socket or `localhost` |
+| `MODERATOR_ACCOUNT_ID` | with `DATABASE_URL` | – | `account.id` shown as the note author in the Mastodon admin UI |
 
 Values are validated at startup: a malformed `OPENAI_JSON_MODE` or
 `SPAM_CONFIDENCE_THRESHOLD` aborts the run instead of being silently ignored.
 An empty value (`KEY=`) counts as unset and falls back to the default, so a
 required variable set to an empty string is reported as missing.
+
+### Moderation notes
+
+With `DATABASE_URL` and `MODERATOR_ACCOUNT_ID` set, a row is inserted into
+Mastodon's `account_moderation_notes` when an account is reported as spam and
+when one is suspended from Slack, so the reasoning is visible in the admin UI.
+A note that fails to write is logged and does not abort the action it
+accompanies. Because `serve` mode is long-running, a connection lost to a
+database restart or idle timeout is re-established on the next write.
 
 Logging verbosity can be adjusted with `RUST_LOG`
 (e.g. `RUST_LOG=mastodon_spam_checker=debug`).

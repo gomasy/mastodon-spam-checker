@@ -10,6 +10,7 @@ use rust_i18n::t;
 use crate::http;
 use crate::llm::SpamVerdict;
 use crate::mastodon::AdminAccount;
+use crate::text::truncate_chars;
 
 const APP_NAME: &str = "Mastodon Spam Checker";
 
@@ -159,18 +160,6 @@ fn confirm_actions_block(
     })
 }
 
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let mut truncated: String = s.chars().take(max_chars - 1).collect();
-    truncated.push('…');
-    truncated
-}
-
 /// Truncates text that has been through [`sanitize_mrkdwn`], without cutting a trailing
 /// `&...;` entity in half (a bare `&am` would render as literal text).
 pub(crate) fn truncate_mrkdwn(s: &str, max_chars: usize) -> String {
@@ -205,19 +194,6 @@ pub(crate) fn sanitize_mrkdwn(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn truncate_chars_keeps_short_strings() {
-        assert_eq!(truncate_chars("abc", 3), "abc");
-        assert_eq!(truncate_chars("", 10), "");
-    }
-
-    #[test]
-    fn truncate_chars_truncates_by_chars_not_bytes() {
-        assert_eq!(truncate_chars("あいうえお", 3), "あい…");
-        assert_eq!(truncate_chars("あいうえお", 3).chars().count(), 3);
-        assert_eq!(truncate_chars("abc", 0), "");
-    }
 
     #[test]
     fn truncate_mrkdwn_does_not_split_an_escaped_entity() {

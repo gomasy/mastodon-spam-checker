@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   rustfmt:
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
@@ -17,3 +20,19 @@ jobs:
       - uses: actions/checkout@v7
       - name: Check formatting
         run: cargo fmt --all --check
+
+  clippy:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test
+        run: cargo test --locked

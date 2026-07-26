@@ -6,6 +6,7 @@ mod postgres;
 mod redis;
 mod server;
 mod slack;
+mod text;
 
 use anyhow::{Context, Result, bail};
 use rust_i18n::t;
@@ -103,6 +104,7 @@ async fn check(dry_run: bool) -> Result<()> {
     let mut last_id: Option<String> = None;
     let mut spam_detected = 0u32;
     let mut spam_notified = 0u32;
+    let mut undetermined = 0u32;
     let mut check_failure = None;
 
     for account in &accounts {
@@ -140,6 +142,8 @@ async fn check(dry_run: bool) -> Result<()> {
                     }
                 }
                 Ok(AccountCheckOutcome::NotSpam) => {}
+                // Already logged at the point of the decision, with the offending reply.
+                Ok(AccountCheckOutcome::Undetermined) => undetermined += 1,
                 // Reported by the caller rather than logged here, so the failure surfaces exactly once.
                 Err(e) => {
                     check_failure = Some(e.context(format!(
@@ -176,7 +180,7 @@ async fn check(dry_run: bool) -> Result<()> {
 
     info!(
         total = accounts.len(),
-        spam_detected, spam_notified, dry_run, "check finished"
+        spam_detected, spam_notified, undetermined, dry_run, "check finished"
     );
 
     Ok(())
@@ -184,7 +188,12 @@ async fn check(dry_run: bool) -> Result<()> {
 
 enum AccountCheckOutcome {
     NotSpam,
-    Spam { notified: bool },
+    Spam {
+        notified: bool,
+    },
+    /// The LLM returned no usable verdict. Skipped rather than retried, because retrying would
+    /// stall the cursor on this account forever — see [`llm::UnparseableVerdict`].
+    Undetermined,
 }
 
 /// Fetch one account's posts, run the spam check, and notify Slack if spam confidence meets the threshold.
@@ -203,12 +212,24 @@ async fn check_account(
         .fetch_statuses(&account.id)
         .await
         .context("failed to fetch statuses")?;
-    let verdict = llm
-        .check_spam(account, &statuses)
-        .await
-        .context("LLM check failed")?;
 
     let domain = account.domain.as_deref().unwrap_or("?");
+    let verdict = match llm.check_spam(account, &statuses).await {
+        Ok(verdict) => verdict,
+        // Aborting here would leave the cursor pointing before this account, so every later run
+        // would re-check it and fail the same way. Skip it and keep the run going instead.
+        Err(e) if llm::is_unparseable_verdict(&e) => {
+            warn!(
+                username = %account.username,
+                domain = %domain,
+                error = format!("{e:#}"),
+                "no usable LLM verdict, skipping account"
+            );
+            return Ok(AccountCheckOutcome::Undetermined);
+        }
+        Err(e) => return Err(e).context("LLM check failed"),
+    };
+
     if !verdict.spam {
         info!(
             username = %account.username,

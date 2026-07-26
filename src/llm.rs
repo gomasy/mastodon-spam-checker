@@ -11,12 +11,61 @@ use std::fmt::Write;
 
 use crate::http;
 use crate::mastodon::{AdminAccount, Status};
+use crate::text::truncate_chars;
+
+// Caps on the untrusted account text copied into the prompt. Without them a single account with
+// very long posts can exceed the model's context window, which fails its check on every run (see
+// UnparseableVerdict for why a permanent per-account failure matters), and inflates cost for every
+// account.
+const FIELD_MAX_CHARS: usize = 200;
+const BIO_MAX_CHARS: usize = 1_000;
+const POST_MAX_CHARS: usize = 500;
+const POSTS_TOTAL_MAX_CHARS: usize = 4_000;
+
+/// How much of the offending reply [`UnparseableVerdict`] quotes back for diagnosis.
+const VERDICT_SNIPPET_MAX_CHARS: usize = 200;
 
 #[derive(Debug, Deserialize)]
 pub struct SpamVerdict {
     pub spam: bool,
     pub reason: String,
     pub confidence: f64,
+}
+
+/// The model replied, but the reply carried no verdict this program can act on.
+///
+/// Retrying cannot help: the same prompt yields the same unusable reply, so failing the run here
+/// would park the cursor in front of this account forever and stop the checker entirely until
+/// someone intervenes. Callers skip the account instead — the same reasoning as
+/// [`normalize_confidence`], one level further out.
+///
+/// Deliberately *not* used for a response body that does not even deserialize as a chat completion:
+/// that points at a misconfigured or non-OpenAI-compatible endpoint, which affects every account
+/// and should fail loudly.
+#[derive(Debug)]
+pub struct UnparseableVerdict(String);
+
+impl UnparseableVerdict {
+    /// `reply` is quoted back, truncated, so the prompt or model can be adjusted.
+    fn new(reason: impl std::fmt::Display, reply: &str) -> Self {
+        Self(format!(
+            "no usable LLM verdict: {reason} (reply: {:?})",
+            truncate_chars(reply, VERDICT_SNIPPET_MAX_CHARS)
+        ))
+    }
+}
+
+impl std::fmt::Display for UnparseableVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnparseableVerdict {}
+
+/// Whether `error` was caused by a reply carrying no usable verdict (see [`UnparseableVerdict`]).
+pub fn is_unparseable_verdict(error: &anyhow::Error) -> bool {
+    error.chain().any(|e| e.is::<UnparseableVerdict>())
 }
 
 #[derive(Serialize)]
@@ -153,7 +202,7 @@ impl LlmClient {
         let content = &resp
             .choices
             .first()
-            .context("LLM response has no choices")?
+            .ok_or_else(|| UnparseableVerdict::new("response has no choices", ""))?
             .message
             .content;
 
@@ -170,7 +219,7 @@ impl LlmClient {
 
 fn parse_verdict(content: &str) -> Result<SpamVerdict> {
     let mut verdict: SpamVerdict =
-        serde_json::from_str(content).context("failed to parse LLM verdict JSON")?;
+        serde_json::from_str(content).map_err(|e| UnparseableVerdict::new(e, content))?;
     verdict.confidence = normalize_confidence(verdict.confidence);
     Ok(verdict)
 }
@@ -217,10 +266,10 @@ fn build_user_prompt(account: &AdminAccount, statuses: &[Status]) -> String {
          - URL: {}\n\
          - Avatar: {}\n\
          - Followers: {} / Following: {} / Posts: {}\n",
-        account.acct(),
-        account.account.display_name,
-        note_plain,
-        account.account.url,
+        truncate_chars(&account.acct(), FIELD_MAX_CHARS),
+        truncate_chars(&account.account.display_name, FIELD_MAX_CHARS),
+        truncate_chars(&note_plain, BIO_MAX_CHARS),
+        truncate_chars(&account.account.url, FIELD_MAX_CHARS),
         avatar_state,
         account.account.followers_count,
         account.account.following_count,
@@ -231,9 +280,23 @@ fn build_user_prompt(account: &AdminAccount, statuses: &[Status]) -> String {
         prompt.push_str("\n## Recent Posts\n(No posts found)\n");
     } else {
         prompt.push_str("\n## Recent Posts\n");
-        for status in statuses {
+        // Spend a shared character budget across the posts so a few very long ones cannot crowd out
+        // the rest of the prompt. A trailing ellipsis tells the model the text was cut.
+        let mut budget = POSTS_TOTAL_MAX_CHARS;
+        let mut remaining = statuses.iter();
+        for status in remaining.by_ref() {
             let content_plain = html_to_plain(&status.content);
-            let _ = writeln!(prompt, "- {content_plain}");
+            let post = truncate_chars(&content_plain, POST_MAX_CHARS.min(budget));
+            budget -= post.chars().count();
+            let _ = writeln!(prompt, "- {post}");
+            if budget == 0 {
+                break;
+            }
+        }
+        // Whatever the loop did not reach; zero when the budget outlasted the posts.
+        let omitted = remaining.count();
+        if omitted > 0 {
+            let _ = writeln!(prompt, "({omitted} further post(s) omitted)");
         }
     }
 
@@ -295,6 +358,85 @@ mod tests {
         // Double-escaped entities are unescaped only one level deep (because &amp; is replaced last).
         assert_eq!(html_to_plain("&amp;lt;script&amp;gt;"), "&lt;script&gt;");
         assert_eq!(html_to_plain("A &amp; B"), "A & B");
+    }
+
+    fn account(note: &str) -> AdminAccount {
+        AdminAccount {
+            id: "1".to_string(),
+            username: "alice".to_string(),
+            domain: Some("example.com".to_string()),
+            account: crate::mastodon::Account {
+                display_name: "Alice".to_string(),
+                note: note.to_string(),
+                avatar: "https://example.com/avatar.png".to_string(),
+                url: "https://example.com/@alice".to_string(),
+                followers_count: 1,
+                following_count: 2,
+                statuses_count: 3,
+            },
+        }
+    }
+
+    #[test]
+    fn a_reply_without_a_verdict_is_flagged_as_skippable() {
+        let error = parse_verdict("I'm sorry, I can't help with that.").unwrap_err();
+        assert!(is_unparseable_verdict(&error));
+        // The reply is quoted back so the prompt or model can be adjusted.
+        assert!(error.to_string().contains("I'm sorry"), "{error}");
+
+        // A wrapping context must not hide it from the caller that decides to skip the account.
+        let wrapped = error.context("LLM check failed");
+        assert!(is_unparseable_verdict(&wrapped));
+
+        // A transport-level failure is a different thing and must stay fatal.
+        assert!(!is_unparseable_verdict(&anyhow::anyhow!(
+            "connection reset"
+        )));
+    }
+
+    #[test]
+    fn long_profile_fields_are_capped() {
+        let prompt = build_user_prompt(&account(&"あ".repeat(BIO_MAX_CHARS * 3)), &[]);
+        assert!(
+            prompt.chars().count() < BIO_MAX_CHARS + 500,
+            "bio was not capped"
+        );
+        assert!(prompt.contains('…'));
+    }
+
+    #[test]
+    fn posts_share_a_total_character_budget() {
+        let statuses: Vec<Status> = (0..10)
+            .map(|_| Status {
+                content: "x".repeat(POST_MAX_CHARS * 2),
+            })
+            .collect();
+        let prompt = build_user_prompt(&account(""), &statuses);
+
+        // Each post is capped, and the shared budget stops the list well before all ten fit.
+        let posts: Vec<&str> = prompt.lines().filter(|l| l.starts_with("- x")).collect();
+        assert_eq!(posts.len(), POSTS_TOTAL_MAX_CHARS / POST_MAX_CHARS);
+        assert!(
+            posts
+                .iter()
+                .all(|p| p.chars().count() == POST_MAX_CHARS + 2)
+        );
+        assert!(prompt.contains("further post(s) omitted"));
+    }
+
+    #[test]
+    fn short_posts_are_all_included_verbatim() {
+        let statuses = vec![
+            Status {
+                content: "<p>hello</p>".to_string(),
+            },
+            Status {
+                content: "<p>world</p>".to_string(),
+            },
+        ];
+        let prompt = build_user_prompt(&account(""), &statuses);
+        assert!(prompt.contains("- hello\n- world\n"));
+        assert!(!prompt.contains("omitted"));
     }
 
     #[test]

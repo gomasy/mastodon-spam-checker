@@ -385,7 +385,9 @@ fn verify_signature(secret: &str, headers: &HeaderMap, body: &[u8]) -> Result<()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the UNIX epoch")?
         .as_secs() as i64;
-    if (now - ts).abs() > MAX_TIMESTAMP_SKEW_SECS {
+    // Saturating arithmetic: `ts` is attacker-supplied, and an extreme value would otherwise
+    // overflow the subtraction or `abs()`. Saturating keeps such a value far outside the window.
+    if now.saturating_sub(ts).saturating_abs() > MAX_TIMESTAMP_SKEW_SECS {
         bail!("timestamp outside allowed window (possible replay)");
     }
 
@@ -411,12 +413,16 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     }
-    let b = s.as_bytes();
-    if b.is_empty() || !b.len().is_multiple_of(2) {
+    // as_chunks splits into fixed-size pairs and hands back whatever did not divide evenly, so the
+    // even-length requirement and the decode share one expression instead of the decode depending
+    // on a length check made earlier.
+    let (pairs, rest) = s.as_bytes().as_chunks::<2>();
+    if pairs.is_empty() || !rest.is_empty() {
         return None;
     }
-    b.chunks(2)
-        .map(|c| Some(val(c[0])? << 4 | val(c[1])?))
+    pairs
+        .iter()
+        .map(|&[hi, lo]| Some(val(hi)? << 4 | val(lo)?))
         .collect()
 }
 
@@ -480,6 +486,29 @@ mod tests {
         let body = b"payload=%7B%7D";
         let sig = sign("secret", ts, body);
         assert!(verify_signature("secret", &headers(ts, &sig), body).is_err());
+    }
+
+    #[test]
+    fn extreme_timestamps_are_rejected_without_overflow() {
+        let body = b"payload=%7B%7D";
+        for ts in [i64::MIN.to_string(), i64::MAX.to_string()] {
+            let sig = sign("secret", &ts, body);
+            assert!(
+                verify_signature("secret", &headers(&ts, &sig), body).is_err(),
+                "accepted timestamp {ts}"
+            );
+        }
+    }
+
+    #[test]
+    fn hex_decode_accepts_only_even_length_hex() {
+        assert_eq!(hex_decode("0a_FF"), None);
+        assert_eq!(hex_decode("0aFF"), Some(vec![0x0a, 0xff]));
+        assert_eq!(hex_decode(""), None);
+        // Odd length, and an odd length whose complete pairs are all valid.
+        assert_eq!(hex_decode("abc"), None);
+        assert_eq!(hex_decode("f"), None);
+        assert_eq!(hex_decode("zz"), None);
     }
 
     #[test]
