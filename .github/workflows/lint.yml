@@ -1,6 +1,7 @@
 name: Lint
 
 on:
+  workflow_call:
   workflow_dispatch:
   push:
     branches:
@@ -14,7 +15,6 @@ env:
 
 jobs:
   rustfmt:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -22,7 +22,6 @@ jobs:
         run: cargo fmt --all --check
 
   clippy:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -30,7 +29,6 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

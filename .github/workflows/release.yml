@@ -10,7 +10,12 @@ permissions:
   contents: write
 
 jobs:
+  checks:
+    uses: ./.github/workflows/lint.yml
+
   build:
+    needs:
+      - checks
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
