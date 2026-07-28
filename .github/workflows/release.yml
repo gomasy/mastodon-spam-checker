@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   checks:
-    uses: ./.github/workflows/lint.yml
+    uses: ./.github/workflows/check.yml
 
   build:
     needs:
