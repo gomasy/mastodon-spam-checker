@@ -10,38 +10,51 @@ data after a second confirmation. Both actions are handled by an optional
 companion server (`serve` mode).
 
 Designed to run periodically (e.g. via cron or a systemd timer): each run
-picks up where the previous one left off, using a cursor stored in Redis.
+picks up where the previous one left off. Redis stores both the cursor and a
+durable per-account record containing verdicts, attempts, campaign matches,
+moderator feedback, and failures.
 
 ## How it works
 
 1. Fetches remote accounts newer than the saved cursor via
-   `GET /api/v2/admin/accounts` (up to 100 per run).
+   `GET /api/v2/admin/accounts`, advancing its pagination cursor up to
+   `MAX_ACCOUNTS_PER_RUN`.
 2. Skips system actors (instance actors, `mastodon.internal`, etc.).
-3. Fetches each account's recent posts and builds a prompt from the
-   profile and post contents (HTML is converted to plain text). Long bios and
-   posts are truncated, and the posts share a fixed character budget, so one
-   verbose account cannot overrun the model's context window or its cost.
-4. Asks the LLM for a verdict: `{"spam": bool, "reason": "...", "confidence": 0.0-1.0}`.
+3. Fetches each account's recent posts and builds a prompt from profile fields,
+   extracted link destinations, account metadata, content warnings, language,
+   timestamps, and media descriptions. Long inputs are bounded.
+4. Correlates substantial bio fingerprints and linked domains with a capped
+   sample of accounts observed during the last 30 days, exposing coordinated
+   campaigns to the LLM without an unbounded Redis index.
+5. Asks the LLM for a verdict: `{"spam": bool, "reason": "...", "confidence": 0.0-1.0}`.
    A confidence outside that range is normalized rather than rejected (values
    between 1 and 100 are read as a percentage, anything else is clamped), so a
    single odd verdict cannot stall the run. A reply with no usable verdict at all
-   (not JSON, or no choices) is logged and the account is skipped, for the same
-   reason: the same reply would come back on every later run.
-5. Sends a Slack notification (with a suspend button) for each account
-   judged as spam.
-6. Saves the last processed account ID to Redis as the cursor.
+   (not JSON, or no choices) is stored as `undetermined`, for the same reason:
+   the same reply would come back on every later run.
+6. Persists the verdict and sends a Slack notification for each account judged
+   as spam. Notifications include the local moderation page, feedback actions,
+   and a suspend button.
+7. Saves the last contiguous successfully processed account ID as the cursor.
 
 Transient HTTP failures (timeouts, connection errors, 429 and 5xx) are retried
 with exponential backoff against Mastodon, the LLM, and the Slack webhook. If a
 failure survives the retries, the run saves progress through the preceding
-account and exits unsuccessfully without advancing past the failed account. The
-next run therefore resumes from that account. Deleted accounts (HTTP 404/410 on
-the statuses endpoint) are judged from their profile alone.
+account, adds the failed ID to a durable retry queue, and exits unsuccessfully.
+Successfully completed accounts later in the same concurrent batch are skipped
+from their stored records on the next run. Deleted accounts (HTTP 404/410 on the
+statuses endpoint) are judged from their profile alone.
+
+Normal checks, retries, and backfills share a renewable Redis lease, so
+overlapping invocations fail instead of producing duplicate work. A Slack
+delivery interrupted after it starts is stored as pending and is not retried by
+the periodic checker automatically; `retry-failed` explicitly retries it using
+the persisted verdict.
 
 The exception is a failure that a later run cannot recover from — an LLM reply
 that carries no verdict. Stopping there would park the cursor in front of that
-account permanently, so the account is skipped and the run continues; the count
-of skipped accounts is reported at the end of the run.
+account permanently, so the account is stored as `undetermined` and the run
+continues; the count is reported at the end of the run.
 
 The prompt treats all account data as untrusted: instructions embedded in
 profiles or posts are themselves considered a spam indicator.
@@ -51,8 +64,9 @@ profiles or posts are themselves considered a spam indicator.
 Transient failures on the Mastodon Admin API (429 rate-limit and 5xx) and
 the LLM API (429 / 5xx) are retried with exponential backoff (base 500 ms,
 doubling up to 3 retries). A `429` response carrying a `Retry-After` header
-is honored instead of the computed backoff. Network-level errors (timeouts,
-connection failures) are retried the same way. Non-retryable errors (e.g.
+is honored instead of the computed backoff, capped at 30 seconds so leases and
+notification claims cannot expire during an unbounded wait. Network-level
+errors (timeouts, connection failures) are retried the same way. Non-retryable errors (e.g.
 4xx other than 429) stop the run without advancing the cursor, so the next
 run resumes from the same account.
 
@@ -71,7 +85,8 @@ behavior of notifying on every spam verdict.
 ```
 
 Runs the same fetch → LLM judgment pipeline but **does not** send Slack
-notifications and **does not** advance the Redis cursor. Useful for tuning
+notifications, require `SLACK_WEBHOOK_URL`, persist account jobs, or advance
+the Redis cursor. Useful for tuning
 the prompt, model, or `SPAM_CONFIDENCE_THRESHOLD` without spamming moderators
 or consuming the cursor. The judgment results (including below-threshold
 detections) are still logged.
@@ -105,20 +120,22 @@ cp .env.example .env
 | `MASTODON_BASE_URL` | ✅ | – | Base URL of your instance (e.g. `https://mastodon.example`) |
 | `MASTODON_ACCESS_TOKEN` | ✅ | – | Access token with `admin:read:accounts` |
 | `REDIS_URL` | | `redis://localhost:6379` | Redis connection URL |
+| `MAX_ACCOUNTS_PER_RUN` | | `1000` | Maximum accounts fetched across pagination in one run |
+| `CHECK_CONCURRENCY` | | `4` | Maximum concurrent account checks |
 | `OPENAI_API_BASE` | ✅ | – | OpenAI-compatible API base (e.g. `https://api.openai.com/v1`) |
 | `OPENAI_API_KEY` | ✅ | – | API key |
 | `OPENAI_MODEL` | | `gpt-4o` | Model name |
 | `OPENAI_JSON_MODE` | | `true` | Set to `false` for APIs without `response_format` support. Accepted values: `true`, `false`, `1`, or `0` (case-insensitive) |
 | `SPAM_CONFIDENCE_THRESHOLD` | | `0.0` | Skip Slack notifications for spam verdicts with confidence below this value (0.0–1.0). `0.0` notifies on every spam verdict |
-| `SLACK_WEBHOOK_URL` | ✅ | – | Slack incoming webhook URL |
+| `SLACK_WEBHOOK_URL` | normal check | – | Slack incoming webhook URL. Not required by `dry-run`, `check-account`, or backfill without `--notify` |
 | `SLACK_CHANNEL` | | – | Override the webhook's default channel. Only honored by legacy custom-integration webhooks — Slack-app webhooks (required for the suspend button) ignore channel/username/icon overrides and always post to the channel chosen at install time. Quote the value (`"#spam-alerts"`) so `#` is not parsed as a comment |
 | `SLACK_SIGNING_SECRET` | `serve` only | – | Signing secret of your Slack app (Basic Information page) |
 | `LISTEN_ADDR` | | `127.0.0.1:8990` | Listen address for `serve` mode |
 | `DATABASE_URL` | | – | Mastodon's PostgreSQL database. When set, moderation notes are written on spam detection and on suspension. Connects without TLS, so point it at a local socket or `localhost` |
 | `MODERATOR_ACCOUNT_ID` | with `DATABASE_URL` | – | `account.id` shown as the note author in the Mastodon admin UI |
 
-Values are validated at startup: a malformed `OPENAI_JSON_MODE` or
-`SPAM_CONFIDENCE_THRESHOLD` aborts the run instead of being silently ignored.
+Values are validated at startup: malformed booleans, confidence thresholds,
+or zero/invalid processing limits abort the run instead of being ignored.
 An empty value (`KEY=`) counts as unset and falls back to the default, so a
 required variable set to an empty string is reported as missing.
 
@@ -134,7 +151,39 @@ database restart or idle timeout is re-established on the next write.
 Logging verbosity can be adjusted with `RUST_LOG`
 (e.g. `RUST_LOG=mastodon_spam_checker=debug`).
 
-## Suspend button (`serve` mode)
+## Operator commands
+
+Classify one account without Redis, Slack, PostgreSQL, or cursor changes:
+
+```sh
+mastodon-spam-checker check-account 1234567890
+```
+
+Print the current Redis cursor:
+
+```sh
+mastodon-spam-checker cursor
+```
+
+Retry failed jobs and pending Slack deliveries. Successful retries are removed
+from the retry queue; pending deliveries reuse the persisted verdict instead of
+calling the LLM again:
+
+```sh
+mastodon-spam-checker retry-failed
+mastodon-spam-checker retry-failed --max 25
+```
+
+Backfill an ID range. Both `--from` and `--to` are exclusive bounds; `--to` is
+an optional upper bound. Results are persisted without changing the periodic
+cursor. Slack notifications are disabled unless `--notify` is explicitly supplied:
+
+```sh
+mastodon-spam-checker backfill --from 1000000000 --to 2000000000 --max 500
+mastodon-spam-checker backfill --from 1000000000 --max 100 --notify
+```
+
+## Slack actions (`serve` mode)
 
 Clicking a button in Slack sends an interaction payload to a public HTTPS
 endpoint, so the suspend button needs a small always-on server in addition
@@ -145,9 +194,9 @@ to the periodic checker:
 ```
 
 It listens on `LISTEN_ADDR` and handles `POST /slack/interactions`:
-verifies the request signature with `SLACK_SIGNING_SECRET`, suspends the
-account via `POST /api/v1/admin/accounts/:id/action`, and updates the
-original Slack message with the result. After suspension, the button is
+verifies the request signature with `SLACK_SIGNING_SECRET`, records feedback
+in Redis, suspends accounts via `POST /api/v1/admin/accounts/:id/action`, and
+updates the original Slack message. After suspension, the button is
 replaced with a separately confirmed permanent-delete button. A failed action
 keeps its button so it can be retried.
 
@@ -169,6 +218,10 @@ missing/invalid signature or a stale timestamp (>5 min, replay protection)
 are rejected, duplicate clicks while a suspension is in flight are ignored,
 and on SIGTERM the server finishes in-flight suspensions (up to 30 s)
 before exiting.
+
+**Confirm spam** stores a human-confirmed label and leaves suspension
+available. **False positive** stores the correction and removes destructive
+actions from that Slack message. Both records include the acting Slack user ID.
 
 Note: because app-owned webhooks ignore the `SLACK_CHANNEL` /
 username / icon overrides, notifications will post to the channel chosen
