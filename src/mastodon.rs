@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 use crate::http;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct AdminAccount {
     pub id: String,
     pub username: String,
@@ -26,7 +26,7 @@ impl AdminAccount {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Account {
     pub display_name: String,
     pub note: String,
@@ -35,13 +35,48 @@ pub struct Account {
     pub followers_count: u64,
     pub following_count: u64,
     pub statuses_count: u64,
+    #[serde(default)]
+    pub bot: bool,
+    #[serde(default)]
+    pub group: bool,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub last_status_at: Option<String>,
+    #[serde(default)]
+    pub fields: Vec<ProfileField>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
+pub struct ProfileField {
+    pub name: String,
+    pub value: String,
+    #[serde(default)]
+    pub verified_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct Status {
     pub content: String,
+    #[serde(default)]
+    pub spoiler_text: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub media_attachments: Vec<MediaAttachment>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct MediaAttachment {
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Clone)]
 pub struct MastodonClient {
     client: Client,
     base_url: String,
@@ -84,30 +119,96 @@ impl MastodonClient {
         http::send_with_retry(|| build().bearer_auth(&self.access_token), what, self.retry).await
     }
 
-    pub async fn fetch_remote_accounts(&self, min_id: Option<&str>) -> Result<Vec<AdminAccount>> {
-        let mut url = format!(
-            "{}/api/v2/admin/accounts?origin=remote&limit=100",
-            self.base_url
-        );
-        if let Some(id) = min_id {
-            url.push_str(&format!("&min_id={id}"));
+    pub async fn fetch_remote_accounts(
+        &self,
+        min_id: Option<&str>,
+        max_id: Option<&str>,
+        max_accounts: usize,
+    ) -> Result<Vec<AdminAccount>> {
+        let page_limit = max_accounts.min(200);
+        let mut accounts = Vec::new();
+        let forward = min_id.is_some();
+        let mut page_min_id = min_id.map(str::to_string);
+        let mut page_max_id = max_id.map(str::to_string);
+        while accounts.len() < max_accounts {
+            let remaining = max_accounts - accounts.len();
+            let limit = page_limit.min(remaining);
+            let mut url = format!(
+                "{}/api/v2/admin/accounts?origin=remote&limit={limit}",
+                self.base_url
+            );
+            if let Some(id) = &page_min_id {
+                url.push_str(&format!("&min_id={id}"));
+            }
+            if let Some(id) = &page_max_id {
+                url.push_str(&format!("&max_id={id}"));
+            }
+            info!(url = %url, "fetching accounts");
+            let resp = self
+                .send_retry(|| self.client.get(&url), "Admin accounts API")
+                .await?;
+            let mut page: Vec<AdminAccount> = resp
+                .json()
+                .await
+                .context("failed to parse admin accounts response")?;
+            page.sort_by(|a, b| numeric_id_cmp(&a.id, &b.id));
+            page.dedup_by(|a, b| a.id == b.id);
+            let page_len = page.len();
+            let next_min_id = page.last().map(|account| account.id.clone());
+            let next_max_id = page.first().map(|account| account.id.clone());
+            accounts.extend(page);
+            if page_len < limit || accounts.len() >= max_accounts {
+                break;
+            }
+            if forward {
+                if next_min_id == page_min_id {
+                    warn!(min_id = ?page_min_id, "account pagination made no progress");
+                    break;
+                }
+                page_min_id = next_min_id;
+            } else {
+                if next_max_id == page_max_id {
+                    warn!(max_id = ?page_max_id, "account pagination made no progress");
+                    break;
+                }
+                page_max_id = next_max_id;
+            }
         }
 
-        info!(url = %url, "fetching accounts");
-
-        let resp = self
-            .send_retry(|| self.client.get(&url), "Admin accounts API")
-            .await?;
-        let mut accounts: Vec<AdminAccount> = resp
-            .json()
-            .await
-            .context("failed to parse admin accounts response")?;
-
-        info!(count = accounts.len(), "fetched");
+        info!(count = accounts.len(), "fetched accounts across pages");
 
         // IDs are numeric strings; sort by length first, then lexicographically to get numeric order.
-        accounts.sort_by(|a, b| a.id.len().cmp(&b.id.len()).then_with(|| a.id.cmp(&b.id)));
+        accounts.sort_by(|a, b| numeric_id_cmp(&a.id, &b.id));
+        accounts.dedup_by(|a, b| a.id == b.id);
         Ok(accounts)
+    }
+
+    pub async fn fetch_admin_account(&self, account_id: &str) -> Result<AdminAccount> {
+        self.fetch_admin_account_optional(account_id)
+            .await?
+            .with_context(|| format!("admin account {account_id} was not found"))
+    }
+
+    pub async fn fetch_admin_account_optional(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<AdminAccount>> {
+        let url = format!("{}/api/v1/admin/accounts/{account_id}", self.base_url);
+        let resp = http::send_with_retry_raw(
+            || self.client.get(&url).bearer_auth(&self.access_token),
+            "Admin account API",
+            self.retry,
+        )
+        .await?;
+        if matches!(resp.status(), StatusCode::NOT_FOUND | StatusCode::GONE) {
+            return Ok(None);
+        }
+        let account = http::ensure_success(resp, "Admin account API")
+            .await?
+            .json()
+            .await
+            .context("failed to parse admin account response")?;
+        Ok(Some(account))
     }
 
     /// Returns whether the account is suspended (requires admin:read:accounts scope).
@@ -193,4 +294,8 @@ impl MastodonClient {
 
         Ok(statuses)
     }
+}
+
+fn numeric_id_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }

@@ -18,9 +18,10 @@ use rust_i18n::t;
 
 use crate::config::ServeConfig;
 use crate::mastodon::MastodonClient;
+use crate::redis::{JobStatus, StateStore};
 use crate::slack::{
-    ButtonValue, DELETE_ACTION_ID, SUSPEND_ACTION_ID, TEXT_MAX_CHARS, delete_actions_block,
-    sanitize_mrkdwn, truncate_mrkdwn,
+    ButtonValue, CONFIRM_SPAM_ACTION_ID, DELETE_ACTION_ID, FALSE_POSITIVE_ACTION_ID,
+    SUSPEND_ACTION_ID, TEXT_MAX_CHARS, delete_actions_block, sanitize_mrkdwn, truncate_mrkdwn,
 };
 
 /// Maximum allowed clock skew for Slack request timestamps (replay attack prevention).
@@ -35,6 +36,7 @@ struct AppState {
     /// Account IDs currently being processed (prevents double-clicks and allows graceful shutdown).
     in_flight: Mutex<HashSet<String>>,
     note_writer: Option<crate::postgres::ModerationNoteWriter>,
+    store: StateStore,
 }
 
 impl AppState {
@@ -50,6 +52,8 @@ impl AppState {
 enum ButtonAction {
     Suspend,
     Delete,
+    ConfirmSpam,
+    FalsePositive,
 }
 
 struct Interaction {
@@ -83,6 +87,7 @@ pub async fn run(config: ServeConfig) -> Result<()> {
         signing_secret: config.slack_signing_secret,
         in_flight: Mutex::new(HashSet::new()),
         note_writer,
+        store: StateStore::new(&config.redis_url).await?,
     });
 
     let app = Router::new()
@@ -171,6 +176,8 @@ fn extract_interaction(mut payload: Value) -> Result<Option<Interaction>> {
             let kind = match a["action_id"].as_str()? {
                 SUSPEND_ACTION_ID => ButtonAction::Suspend,
                 DELETE_ACTION_ID => ButtonAction::Delete,
+                CONFIRM_SPAM_ACTION_ID => ButtonAction::ConfirmSpam,
+                FALSE_POSITIVE_ACTION_ID => ButtonAction::FalsePositive,
                 _ => return None,
             };
             Some((kind, a))
@@ -249,64 +256,142 @@ async fn process_action(state: Arc<AppState>, interaction: Interaction) {
     blocks.retain(|b| b["type"] != "context");
 
     let result_text = match kind {
-        ButtonAction::Suspend => {
-            // If already suspended (e.g. via manual action or a button on another notification),
-            // skip the suspend API call, show a notice, and replace the button with the delete button.
-            // A failed check does not block suspension (the suspend API is idempotent).
-            let already_suspended = match state.mastodon.is_account_suspended(&value.id).await {
-                Ok(suspended) => suspended,
-                Err(e) => {
-                    warn!(account_id = %value.id, error = %e, "failed to check suspension state, proceeding to suspend");
-                    false
-                }
-            };
-
-            if already_suspended {
-                info!(account_id = %value.id, acct = %value.acct, "account already suspended, skipping");
-                replace_buttons_with_delete(&mut blocks, &raw_value, &safe_acct);
-                t!("already_suspended", acct = &safe_acct).to_string()
-            } else {
-                match state.mastodon.suspend_account(&value.id).await {
-                    Ok(()) => {
-                        info!(account_id = %value.id, acct = %value.acct, "account suspended");
-                        replace_buttons_with_delete(&mut blocks, &raw_value, &safe_acct);
-                        if let Some(ref writer) = state.note_writer {
-                            let note = t!("note_suspended", user_id = &user_id);
-                            if let Err(e) = writer.add_note(&value.id, &note).await {
-                                error!(error = %e, "failed to add moderation note");
-                            }
-                        }
-                        t!("suspended", user_id = &user_id, acct = &safe_acct).to_string()
-                    }
+        ButtonAction::Suspend => match state.store.is_false_positive(&value.id).await {
+            Ok(true) => {
+                warn!(account_id = %value.id, "refusing to suspend an account marked as a false positive");
+                blocks.retain(|block| block["type"] != "actions");
+                t!("suspend_refused_false_positive", acct = &safe_acct).to_string()
+            }
+            Err(e) => {
+                error!(account_id = %value.id, error = %e, "failed to check moderator feedback");
+                failure_message("feedback_check_failed", &safe_acct, &e)
+            }
+            Ok(false) => {
+                // If already suspended (e.g. via manual action or a button on another notification),
+                // skip the suspend API call, show a notice, and replace the button with the delete button.
+                // A failed check does not block suspension (the suspend API is idempotent).
+                let already_suspended = match state.mastodon.is_account_suspended(&value.id).await {
+                    Ok(suspended) => suspended,
                     Err(e) => {
-                        error!(account_id = %value.id, error = %e, "failed to suspend account");
-                        failure_message("suspend_failed", &safe_acct, &e)
+                        warn!(account_id = %value.id, error = %e, "failed to check suspension state, proceeding to suspend");
+                        false
+                    }
+                };
+
+                if already_suspended {
+                    info!(account_id = %value.id, acct = %value.acct, "account already suspended, skipping");
+                    if let Err(e) = state
+                        .store
+                        .record_action(&value.id, JobStatus::Suspended)
+                        .await
+                    {
+                        error!(error = %e, "failed to record observed suspension state");
+                    }
+                    replace_buttons_with_delete(&mut blocks, &raw_value, &safe_acct);
+                    t!("already_suspended", acct = &safe_acct).to_string()
+                } else {
+                    match state.mastodon.suspend_account(&value.id).await {
+                        Ok(()) => {
+                            info!(account_id = %value.id, acct = %value.acct, "account suspended");
+                            if let Err(e) = state
+                                .store
+                                .record_action(&value.id, JobStatus::Suspended)
+                                .await
+                            {
+                                error!(error = %e, "failed to record suspension state");
+                            }
+                            replace_buttons_with_delete(&mut blocks, &raw_value, &safe_acct);
+                            if let Some(ref writer) = state.note_writer {
+                                let note = t!("note_suspended", user_id = &user_id);
+                                if let Err(e) = writer.add_note(&value.id, &note).await {
+                                    error!(error = %e, "failed to add moderation note");
+                                }
+                            }
+                            t!("suspended", user_id = &user_id, acct = &safe_acct).to_string()
+                        }
+                        Err(e) => {
+                            error!(account_id = %value.id, error = %e, "failed to suspend account");
+                            failure_message("suspend_failed", &safe_acct, &e)
+                        }
                     }
                 }
             }
-        }
+        },
         // Deletion is irreversible, so do not rely solely on the button being present in the Slack message;
         // verify server-side that the account is suspended before proceeding.
         // This guards against a stale button being clicked after the suspension was manually lifted.
-        ButtonAction::Delete => match state.mastodon.is_account_suspended(&value.id).await {
-            Ok(true) => match state.mastodon.delete_account(&value.id).await {
-                Ok(()) => {
-                    info!(account_id = %value.id, acct = %value.acct, "account data deleted");
-                    blocks.retain(|b| b["type"] != "actions");
-                    t!("deleted", user_id = &user_id, acct = &safe_acct).to_string()
-                }
-                Err(e) => {
-                    error!(account_id = %value.id, error = %e, "failed to delete account");
-                    failure_message("delete_failed", &safe_acct, &e)
-                }
-            },
-            Ok(false) => {
-                warn!(account_id = %value.id, "account is not suspended, refusing to delete");
-                t!("not_suspended", acct = &safe_acct).to_string()
+        ButtonAction::Delete => match state.store.is_false_positive(&value.id).await {
+            Ok(true) => {
+                warn!(account_id = %value.id, "refusing to delete an account marked as a false positive");
+                blocks.retain(|block| block["type"] != "actions");
+                t!("delete_refused_false_positive", acct = &safe_acct).to_string()
             }
             Err(e) => {
-                error!(account_id = %value.id, error = %e, "failed to check suspension state, aborting delete");
-                failure_message("check_failed", &safe_acct, &e)
+                error!(account_id = %value.id, error = %e, "failed to check moderator feedback");
+                failure_message("feedback_check_failed_delete", &safe_acct, &e)
+            }
+            Ok(false) => match state.mastodon.is_account_suspended(&value.id).await {
+                Ok(true) => match state.mastodon.delete_account(&value.id).await {
+                    Ok(()) => {
+                        info!(account_id = %value.id, acct = %value.acct, "account data deleted");
+                        if let Err(e) = state
+                            .store
+                            .record_action(&value.id, JobStatus::Deleted)
+                            .await
+                        {
+                            error!(error = %e, "failed to record deletion state");
+                        }
+                        blocks.retain(|b| b["type"] != "actions");
+                        t!("deleted", user_id = &user_id, acct = &safe_acct).to_string()
+                    }
+                    Err(e) => {
+                        error!(account_id = %value.id, error = %e, "failed to delete account");
+                        failure_message("delete_failed", &safe_acct, &e)
+                    }
+                },
+                Ok(false) => {
+                    warn!(account_id = %value.id, "account is not suspended, refusing to delete");
+                    t!("not_suspended", acct = &safe_acct).to_string()
+                }
+                Err(e) => {
+                    error!(account_id = %value.id, error = %e, "failed to check suspension state, aborting delete");
+                    failure_message("check_failed", &safe_acct, &e)
+                }
+            },
+        },
+        ButtonAction::ConfirmSpam => match state
+            .store
+            .record_feedback(&value.id, JobStatus::ConfirmedSpam, &user_id)
+            .await
+        {
+            Ok(()) => {
+                info!(account_id = %value.id, user_id = %user_id, "spam verdict confirmed");
+                remove_feedback_buttons(&mut blocks);
+                t!("feedback_confirmed", user_id = &user_id, acct = &safe_acct).to_string()
+            }
+            Err(e) => {
+                error!(account_id = %value.id, error = %e, "failed to record spam feedback");
+                failure_message("feedback_failed", &safe_acct, &e)
+            }
+        },
+        ButtonAction::FalsePositive => match state
+            .store
+            .record_feedback(&value.id, JobStatus::FalsePositive, &user_id)
+            .await
+        {
+            Ok(()) => {
+                info!(account_id = %value.id, user_id = %user_id, "false positive recorded");
+                blocks.retain(|block| block["type"] != "actions");
+                t!(
+                    "feedback_false_positive",
+                    user_id = &user_id,
+                    acct = &safe_acct
+                )
+                .to_string()
+            }
+            Err(e) => {
+                error!(account_id = %value.id, error = %e, "failed to record false-positive feedback");
+                failure_message("feedback_failed", &safe_acct, &e)
             }
         },
     };
@@ -336,6 +421,20 @@ fn failure_message(key: &str, safe_acct: &str, error: &anyhow::Error) -> String 
 fn replace_buttons_with_delete(blocks: &mut Vec<Value>, value_json: &str, safe_acct: &str) {
     blocks.retain(|b| b["type"] != "actions");
     blocks.push(delete_actions_block(value_json, safe_acct));
+}
+
+fn remove_feedback_buttons(blocks: &mut Vec<Value>) {
+    for block in blocks {
+        let Some(elements) = block["elements"].as_array_mut() else {
+            continue;
+        };
+        elements.retain(|element| {
+            !matches!(
+                element["action_id"].as_str(),
+                Some(CONFIRM_SPAM_ACTION_ID | FALSE_POSITIVE_ACTION_ID)
+            )
+        });
+    }
 }
 
 fn context_block(text: &str) -> Value {
@@ -541,6 +640,24 @@ mod tests {
         assert_eq!(i.user_id, "U123");
         assert_eq!(i.response_url, "https://hooks.slack.com/actions/xxx");
         assert_eq!(i.blocks.len(), 1);
+    }
+
+    #[test]
+    fn feedback_interaction_is_extracted() {
+        let payload = json!({
+            "type": "block_actions",
+            "response_url": "https://hooks.slack.com/actions/xxx",
+            "user": { "id": "U123" },
+            "message": { "blocks": [{ "type": "actions" }] },
+            "actions": [{
+                "action_id": FALSE_POSITIVE_ACTION_ID,
+                "value": r#"{"id":"42","acct":"alice@example.com"}"#
+            }]
+        });
+        let interaction = extract_interaction(payload).unwrap().unwrap();
+        assert!(matches!(interaction.kind, ButtonAction::FalsePositive));
+        assert_eq!(interaction.value.id, "42");
+        assert_eq!(interaction.user_id, "U123");
     }
 
     #[test]

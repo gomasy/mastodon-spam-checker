@@ -1,10 +1,12 @@
 already_suspended: ":information_source: `%{acct}` は既に停止済みです"
 
 btn_cancel: キャンセル
+btn_confirm_spam: スパム確定
 btn_delete: アカウントを削除
 btn_delete_confirm: "`%{acct}` のデータを完全に削除します。この操作は取り消せません。よろしいですか?"
 btn_delete_do: 削除する
 btn_delete_title: アカウント削除
+btn_false_positive: 誤検知
 btn_suspend: アカウントを停止
 btn_suspend_confirm: "`%{acct}` を停止します。よろしいですか?"
 btn_suspend_do: 停止する
@@ -13,7 +15,14 @@ btn_suspend_title: アカウント停止
 check_failed: ":x: `%{acct}` の停止状態を確認できなかったため削除を中止しました: %{error}"
 
 delete_failed: ":x: `%{acct}` の削除に失敗しました: %{error}"
+delete_refused_false_positive: ":information_source: `%{acct}` は誤検知として記録されているため削除を中止しました"
 deleted: ":wastebasket: <@%{user_id}> が `%{acct}` のデータを削除しました"
+
+feedback_confirmed: ":white_check_mark: <@%{user_id}> が `%{acct}` をスパムと確定しました"
+feedback_check_failed: ":x: `%{acct}` のフィードバックを確認できなかったため停止を中止しました: %{error}"
+feedback_check_failed_delete: ":x: `%{acct}` のフィードバックを確認できなかったため削除を中止しました: %{error}"
+feedback_failed: ":x: `%{acct}` のフィードバック保存に失敗しました: %{error}"
+feedback_false_positive: ":information_source: <@%{user_id}> が `%{acct}` を誤検知として記録しました"
 
 llm_reason_lang: Japanese
 
@@ -30,8 +39,10 @@ spam_detected: |-
   • アカウント: `%{acct}`
   • 表示名: %{display_name}
   • URL: %{url}
+  • 管理画面: <%{admin_url}|モデレーション画面を開く>
   • 確信度: %{confidence}%
   • 理由: %{reason}
 
 suspend_failed: ":x: `%{acct}` の停止に失敗しました: %{error}"
+suspend_refused_false_positive: ":information_source: `%{acct}` は誤検知として記録されているため停止を中止しました"
 suspended: ":white_check_mark: <@%{user_id}> が `%{acct}` を停止しました"

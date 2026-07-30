@@ -1,10 +1,12 @@
 already_suspended: ":information_source: `%{acct}` is already suspended"
 
 btn_cancel: Cancel
+btn_confirm_spam: Confirm spam
 btn_delete: Delete account
 btn_delete_confirm: This will permanently delete all data for `%{acct}`. This action cannot be undone. Are you sure?
 btn_delete_do: Delete
 btn_delete_title: Delete account
+btn_false_positive: False positive
 btn_suspend: Suspend account
 btn_suspend_confirm: Are you sure you want to suspend `%{acct}`?
 btn_suspend_do: Suspend
@@ -13,7 +15,14 @@ btn_suspend_title: Suspend account
 check_failed: ":x: Deletion aborted: could not verify suspension status of `%{acct}`: %{error}"
 
 delete_failed: ":x: Failed to delete `%{acct}`: %{error}"
+delete_refused_false_positive: ":information_source: Deletion aborted: `%{acct}` was marked as a false positive"
 deleted: ":wastebasket: <@%{user_id}> deleted data for `%{acct}`"
+
+feedback_confirmed: ":white_check_mark: <@%{user_id}> confirmed `%{acct}` as spam"
+feedback_check_failed: ":x: Suspension aborted: could not check feedback for `%{acct}`: %{error}"
+feedback_check_failed_delete: ":x: Deletion aborted: could not check feedback for `%{acct}`: %{error}"
+feedback_failed: ":x: Failed to save feedback for `%{acct}`: %{error}"
+feedback_false_positive: ":information_source: <@%{user_id}> marked `%{acct}` as a false positive"
 
 llm_reason_lang: English
 
@@ -30,8 +39,10 @@ spam_detected: |-
   • Account: `%{acct}`
   • Display name: %{display_name}
   • URL: %{url}
+  • Admin: <%{admin_url}|Open moderation page>
   • Confidence: %{confidence}%
   • Reason: %{reason}
 
 suspend_failed: ":x: Failed to suspend `%{acct}`: %{error}"
+suspend_refused_false_positive: ":information_source: Suspension aborted: `%{acct}` was marked as a false positive"
 suspended: ":white_check_mark: <@%{user_id}> suspended `%{acct}`"

@@ -5,19 +5,25 @@ mod mastodon;
 mod postgres;
 mod redis;
 mod server;
+mod signals;
 mod slack;
 mod text;
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use rust_i18n::t;
 use tracing::{error, info, warn};
 use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::redis::{CampaignContext, JobRecord, JobStatus, StateStore, StoredVerdict};
+
 rust_i18n::i18n!("locales", fallback = "en");
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    // Required before TLS is first used because reqwest is built with rustls-no-provider.
     if rustls::crypto::ring::default_provider()
         .install_default()
         .is_err()
@@ -26,15 +32,62 @@ async fn main() -> Result<()> {
     }
 
     dotenvy::dotenv().ok();
-
     let locale = std::env::var("APP_LANG").unwrap_or_else(|_| "en".to_string());
     rust_i18n::set_locale(&locale);
+    init_logging();
 
-    // Use the lightweight Targets filter instead of EnvFilter to avoid pulling in the regex crate.
-    // Honour RUST_LOG if set; otherwise default to INFO for this crate only.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => exclusive_run(check(false)).await,
+        Some("serve") if args.len() == 1 => server::run(config::ServeConfig::from_env()?).await,
+        Some("dry-run") if args.len() == 1 => check(true).await,
+        Some("check-account") => check_account_command(&args[1..]).await,
+        Some("cursor") => cursor_command(&args[1..]).await,
+        Some("retry-failed") => exclusive_run(retry_failed_command(&args[1..])).await,
+        Some("backfill") => exclusive_run(backfill_command(&args[1..])).await,
+        _ => bail!(usage()),
+    }
+}
+
+async fn exclusive_run(operation: impl Future<Output = Result<()>>) -> Result<()> {
+    let store = StateStore::new(&redis_url()).await?;
+    let token = store.acquire_run_lease().await?;
+    let renewal_store = store.clone();
+    let renewal_token = token.clone();
+    let renewal = async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                renewal_store.renew_run_lease(&renewal_token),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => break Err(error),
+                Err(_) => break Err(anyhow::anyhow!("timed out renewing run lease")),
+            }
+        }
+    };
+    tokio::pin!(operation);
+    tokio::pin!(renewal);
+    let result = tokio::select! {
+        result = &mut operation => result,
+        lease_result = &mut renewal => lease_result,
+    };
+    if let Err(error) = store.release_run_lease(&token).await {
+        if result.is_ok() {
+            return Err(error);
+        }
+        error!(error = %error, "failed to release run lease");
+    }
+    result
+}
+
+fn init_logging() {
     let filter: Targets = std::env::var("RUST_LOG")
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|value| value.parse().ok())
         .unwrap_or_else(|| {
             Targets::new().with_target("mastodon_spam_checker", tracing::Level::INFO)
         });
@@ -42,245 +95,732 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .with(filter)
         .init();
-
-    match std::env::args().nth(1).as_deref() {
-        None => check(false).await,
-        Some("serve") => server::run(config::ServeConfig::from_env()?).await,
-        Some("dry-run") => check(true).await,
-        Some(cmd) => {
-            bail!("unknown subcommand: {cmd} (usage: mastodon-spam-checker [serve|dry-run])")
-        }
-    }
 }
 
-/// Fetch new remote accounts and run spam checks (default one-shot mode).
-///
-/// When `dry_run` is true, skips Slack notifications and cursor updates (classification only).
+fn usage() -> &'static str {
+    "usage: mastodon-spam-checker [serve|dry-run|check-account <ID>|cursor|retry-failed [--max N]|backfill --from ID [--to ID] [--max N] [--notify]]"
+}
+
+#[derive(Clone)]
+struct CheckServices {
+    mastodon: mastodon::MastodonClient,
+    llm: llm::LlmClient,
+    slack: Option<slack::SlackNotifier>,
+    store: Option<StateStore>,
+    note_writer: Option<Arc<postgres::ModerationNoteWriter>>,
+    threshold: f64,
+    persist: bool,
+    retry_pending: bool,
+}
+
+#[derive(Debug)]
+enum AccountCheckOutcome {
+    Existing,
+    System,
+    NotSpam,
+    Spam { notified: bool },
+    Undetermined,
+}
+
+struct CheckedAccount {
+    outcome: AccountCheckOutcome,
+    status: JobStatus,
+    verdict: Option<llm::SpamVerdict>,
+    campaign: CampaignContext,
+    notified: bool,
+}
+
+#[derive(Default)]
+struct ProcessSummary {
+    last_contiguous_id: Option<String>,
+    spam_detected: u32,
+    spam_notified: u32,
+    undetermined: u32,
+    skipped_existing: u32,
+    first_failure: Option<anyhow::Error>,
+}
+
 async fn check(dry_run: bool) -> Result<()> {
-    let config = config::Config::from_env()?;
+    let config = config::Config::from_env(!dry_run)?;
     info!(
         dry_run,
-        threshold = config.spam_confidence_threshold,
+        threshold = config.detection.spam_confidence_threshold,
+        max_accounts = config.max_accounts_per_run,
+        concurrency = config.check_concurrency,
         "configuration loaded"
     );
 
-    let mut cursor_store = redis::CursorStore::new(&config.redis_url).await?;
-    let mastodon =
-        mastodon::MastodonClient::new(&config.mastodon_base_url, &config.mastodon_access_token)?;
-    let llm = llm::LlmClient::new(
-        &config.openai_api_base,
-        &config.openai_api_key,
-        &config.openai_model,
-        config.openai_json_mode,
-        http::RetryConfig::default(),
-    )?;
-    let slack = slack::SlackNotifier::new(&config.slack_webhook_url, config.slack_channel)?;
-    let note_writer = match config.postgres {
-        Some(ref pg) => Some(
-            postgres::ModerationNoteWriter::connect(&pg.database_url, pg.moderator_account_id)
-                .await?,
-        ),
-        None => None,
-    };
-
-    // Extract the threshold (Copy type) before the slack_channel is moved into SlackNotifier.
-    let threshold = config.spam_confidence_threshold;
-
-    let cursor = cursor_store.get_cursor().await?;
+    let store = StateStore::new(&config.redis_url).await?;
+    let cursor = store.get_cursor().await?;
     info!(
         cursor = cursor.as_deref().unwrap_or("(none)"),
         "previous cursor"
     );
 
-    let accounts = mastodon.fetch_remote_accounts(cursor.as_deref()).await?;
-
+    let services = build_services(&config, Some(store.clone()), !dry_run).await?;
+    let accounts = services
+        .mastodon
+        .fetch_remote_accounts(cursor.as_deref(), None, config.max_accounts_per_run)
+        .await?;
     if accounts.is_empty() {
         info!("no new remote accounts");
         return Ok(());
     }
 
-    info!(count = accounts.len(), "fetched new remote accounts");
+    let summary = process_accounts(accounts, services, config.check_concurrency).await;
+    if !dry_run {
+        if let Some(id) = &summary.last_contiguous_id {
+            store
+                .set_cursor(id)
+                .await
+                .context("failed to save cursor")?;
+            info!(cursor = %id, "cursor saved");
+        }
+    } else {
+        info!("dry-run: cursor and account jobs not updated");
+    }
 
-    let mut last_id: Option<String> = None;
-    let mut spam_detected = 0u32;
-    let mut spam_notified = 0u32;
-    let mut undetermined = 0u32;
-    let mut check_failure = None;
+    if let Some(error) = summary.first_failure {
+        return Err(error);
+    }
+    log_summary(&summary, dry_run);
+    Ok(())
+}
 
-    for account in &accounts {
-        let domain = account.domain.as_deref().unwrap_or("?");
+async fn build_services(
+    config: &config::Config,
+    store: Option<StateStore>,
+    notify: bool,
+) -> Result<CheckServices> {
+    let detection = &config.detection;
+    let mastodon = mastodon::MastodonClient::new(
+        &detection.mastodon_base_url,
+        &detection.mastodon_access_token,
+    )?;
+    let llm = llm::LlmClient::new(
+        &detection.openai_api_base,
+        &detection.openai_api_key,
+        &detection.openai_model,
+        detection.openai_json_mode,
+        http::RetryConfig::default(),
+    )?;
+    let slack = if notify {
+        Some(slack::SlackNotifier::new(
+            config
+                .slack_webhook_url
+                .as_deref()
+                .context("SLACK_WEBHOOK_URL is required when notifications are enabled")?,
+            config.slack_channel.clone(),
+            &detection.mastodon_base_url,
+        )?)
+    } else {
+        None
+    };
+    let note_writer = match config.postgres {
+        Some(ref pg) if notify => Some(Arc::new(
+            postgres::ModerationNoteWriter::connect(&pg.database_url, pg.moderator_account_id)
+                .await?,
+        )),
+        _ => None,
+    };
+    Ok(CheckServices {
+        mastodon,
+        llm,
+        slack,
+        store,
+        note_writer,
+        threshold: detection.spam_confidence_threshold,
+        persist: notify,
+        retry_pending: false,
+    })
+}
 
-        if is_system_account(&account.username, domain) {
-            info!(
-                username = %account.username,
-                domain = %domain,
-                "system account, skipping"
-            );
-        } else {
-            info!(
-                username = %account.username,
-                domain = %domain,
-                id = %account.id,
-                "checking"
-            );
+async fn process_accounts(
+    accounts: Vec<mastodon::AdminAccount>,
+    services: CheckServices,
+    concurrency: usize,
+) -> ProcessSummary {
+    let mut summary = ProcessSummary::default();
 
-            match check_account(
-                &mastodon,
-                &llm,
-                &slack,
-                account,
-                threshold,
-                dry_run,
-                note_writer.as_ref(),
-            )
-            .await
-            {
-                Ok(AccountCheckOutcome::Spam { notified }) => {
-                    spam_detected += 1;
-                    if notified {
-                        spam_notified += 1;
-                    }
+    for chunk in accounts.chunks(concurrency) {
+        let mut tasks = tokio::task::JoinSet::new();
+        for account in chunk.iter().cloned() {
+            let services = services.clone();
+            tasks.spawn(async move {
+                let id = account.id.clone();
+                (id, check_one(account, services, false).await)
+            });
+        }
+
+        let mut results = HashMap::new();
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((id, result)) => {
+                    results.insert(id, result);
                 }
-                Ok(AccountCheckOutcome::NotSpam) => {}
-                // Already logged at the point of the decision, with the offending reply.
-                Ok(AccountCheckOutcome::Undetermined) => undetermined += 1,
-                // Reported by the caller rather than logged here, so the failure surfaces exactly once.
-                Err(e) => {
-                    check_failure = Some(e.context(format!(
-                        "check failed for {} (account {}); next run resumes from this account",
-                        account.acct(),
-                        account.id
-                    )));
+                Err(error) => {
+                    summary.first_failure = Some(anyhow::Error::new(error));
+                }
+            }
+        }
+
+        for account in chunk {
+            let result = results
+                .remove(&account.id)
+                .unwrap_or_else(|| Err(anyhow::anyhow!("account check task produced no result")));
+            match result {
+                Ok(AccountCheckOutcome::Spam { notified }) => {
+                    summary.spam_detected += 1;
+                    summary.spam_notified += u32::from(notified);
+                    summary.last_contiguous_id = Some(account.id.clone());
+                }
+                Ok(AccountCheckOutcome::Undetermined) => {
+                    summary.undetermined += 1;
+                    summary.last_contiguous_id = Some(account.id.clone());
+                }
+                Ok(AccountCheckOutcome::Existing) => {
+                    summary.skipped_existing += 1;
+                    summary.last_contiguous_id = Some(account.id.clone());
+                }
+                Ok(AccountCheckOutcome::System | AccountCheckOutcome::NotSpam) => {
+                    summary.last_contiguous_id = Some(account.id.clone());
+                }
+                Err(error) => {
+                    if summary.first_failure.is_none() {
+                        summary.first_failure = Some(error.context(format!(
+                            "check failed for {} (account {}); retry with retry-failed",
+                            account.acct(),
+                            account.id
+                        )));
+                    }
                     break;
                 }
             }
         }
-
-        last_id = Some(account.id.clone());
+        if summary.first_failure.is_some() {
+            break;
+        }
     }
 
-    if !dry_run {
-        if let Some(ref id) = last_id {
-            match cursor_store.set_cursor(id).await {
-                Ok(()) => info!(cursor = %id, "cursor saved"),
-                // A pending check failure is the root cause, so report that one and only log this.
-                Err(e) if check_failure.is_some() => {
-                    error!(error = format!("{e:#}"), "failed to save cursor");
+    summary
+}
+
+async fn check_one(
+    account: mastodon::AdminAccount,
+    services: CheckServices,
+    force: bool,
+) -> Result<AccountCheckOutcome> {
+    let domain = account.domain.as_deref().unwrap_or("?");
+    if is_system_account(&account.username, domain) {
+        info!(username = %account.username, %domain, "system account, skipping");
+        return Ok(AccountCheckOutcome::System);
+    }
+
+    if services.persist && !force {
+        let store = services
+            .store
+            .as_ref()
+            .context("persistent check has no state store")?;
+        if store.has_terminal_feedback(&account.id).await? {
+            info!(account_id = %account.id, "account has terminal moderator feedback");
+            return Ok(AccountCheckOutcome::Existing);
+        }
+        if let Some(job) = store.get_job(&account.id).await? {
+            if job.status == JobStatus::NotificationPending {
+                if services.retry_pending {
+                    return retry_pending_notification(account, services, job).await;
                 }
-                Err(e) => return Err(e).context("failed to save cursor"),
+                warn!(account_id = %account.id, "notification delivery is uncertain; use retry-failed to retry explicitly");
+                return Ok(AccountCheckOutcome::Existing);
+            }
+            if job.status.is_completed() {
+                info!(account_id = %account.id, status = ?job.status, "account already processed");
+                return Ok(AccountCheckOutcome::Existing);
             }
         }
-    } else {
-        info!("dry-run: cursor not updated");
     }
 
-    if let Some(error) = check_failure {
-        return Err(error);
+    info!(username = %account.username, %domain, id = %account.id, "checking");
+    let mut job = None;
+    if services.persist {
+        job = Some(
+            services
+                .store
+                .as_ref()
+                .context("persistent check has no state store")?
+                .begin_job(
+                    &account.id,
+                    &account.acct(),
+                    services.llm.model(),
+                    llm::PROMPT_VERSION,
+                )
+                .await?,
+        );
     }
 
-    info!(
-        total = accounts.len(),
-        spam_detected, spam_notified, undetermined, dry_run, "check finished"
-    );
-
-    Ok(())
+    let result = check_one_inner(&account, &services).await;
+    match result {
+        Ok(checked) => {
+            if let (Some(store), Some(job)) = (&services.store, job) {
+                store
+                    .complete_job(
+                        job,
+                        checked.status,
+                        checked.verdict.as_ref().map(stored_verdict),
+                        checked.notified,
+                        &checked.campaign,
+                    )
+                    .await?;
+            }
+            Ok(checked.outcome)
+        }
+        Err(error) => {
+            if let (Some(store), Some(job)) = (&services.store, job)
+                && let Err(store_error) = store.fail_job(job, &error).await
+            {
+                error!(error = %store_error, "failed to persist account failure");
+            }
+            Err(error)
+        }
+    }
 }
 
-enum AccountCheckOutcome {
-    NotSpam,
-    Spam {
-        notified: bool,
-    },
-    /// The LLM returned no usable verdict. Skipped rather than retried, because retrying would
-    /// stall the cursor on this account forever — see [`llm::UnparseableVerdict`].
-    Undetermined,
-}
-
-/// Fetch one account's posts, run the spam check, and notify Slack if spam confidence meets the threshold.
-///
-/// `Err` signals a failure; the caller stops without advancing past this account.
-async fn check_account(
-    mastodon: &mastodon::MastodonClient,
-    llm: &llm::LlmClient,
-    slack: &slack::SlackNotifier,
+async fn check_one_inner(
     account: &mastodon::AdminAccount,
-    threshold: f64,
-    dry_run: bool,
-    note_writer: Option<&postgres::ModerationNoteWriter>,
-) -> Result<AccountCheckOutcome> {
-    let statuses = mastodon
+    services: &CheckServices,
+) -> Result<CheckedAccount> {
+    let statuses = services
+        .mastodon
         .fetch_statuses(&account.id)
         .await
         .context("failed to fetch statuses")?;
-
-    let domain = account.domain.as_deref().unwrap_or("?");
-    let verdict = match llm.check_spam(account, &statuses).await {
-        Ok(verdict) => verdict,
-        // Aborting here would leave the cursor pointing before this account, so every later run
-        // would re-check it and fail the same way. Skip it and keep the run going instead.
-        Err(e) if llm::is_unparseable_verdict(&e) => {
-            warn!(
-                username = %account.username,
-                domain = %domain,
-                error = format!("{e:#}"),
-                "no usable LLM verdict, skipping account"
-            );
-            return Ok(AccountCheckOutcome::Undetermined);
+    let signals = signals::analyze(account, &statuses);
+    let campaign = match &services.store {
+        Some(store) => {
+            store
+                .campaign_context(
+                    &account.id,
+                    signals.bio_fingerprint.as_deref(),
+                    &signals.link_domains,
+                    services.persist,
+                )
+                .await?
         }
-        Err(e) => return Err(e).context("LLM check failed"),
+        None => CampaignContext::default(),
     };
 
+    let verdict = match services.llm.check_spam(account, &statuses, &campaign).await {
+        Ok(verdict) => verdict,
+        Err(error) if llm::is_unparseable_verdict(&error) => {
+            warn!(
+                account_id = %account.id,
+                error = format!("{error:#}"),
+                "no usable LLM verdict, storing as undetermined"
+            );
+            return Ok(CheckedAccount {
+                outcome: AccountCheckOutcome::Undetermined,
+                status: JobStatus::Undetermined,
+                verdict: None,
+                campaign,
+                notified: false,
+            });
+        }
+        Err(error) => return Err(error).context("LLM check failed"),
+    };
+
+    let domain = account.domain.as_deref().unwrap_or("?");
     if !verdict.spam {
-        info!(
-            username = %account.username,
-            domain = %domain,
-            "not spam"
-        );
-        return Ok(AccountCheckOutcome::NotSpam);
+        persist_classification(services, account, JobStatus::NotSpam, &verdict, &campaign).await?;
+        info!(username = %account.username, %domain, "not spam");
+        return Ok(CheckedAccount {
+            outcome: AccountCheckOutcome::NotSpam,
+            status: JobStatus::NotSpam,
+            verdict: Some(verdict),
+            campaign,
+            notified: false,
+        });
     }
 
-    if verdict.confidence < threshold {
+    if verdict.confidence < services.threshold {
+        persist_classification(services, account, JobStatus::Spam, &verdict, &campaign).await?;
         info!(
             username = %account.username,
-            domain = %domain,
+            %domain,
             confidence = verdict.confidence,
-            threshold = threshold,
+            threshold = services.threshold,
             reason = %verdict.reason,
-            "spam detected but below confidence threshold, skipping notification"
+            "spam detected below notification threshold"
         );
-        return Ok(AccountCheckOutcome::Spam { notified: false });
+        return Ok(CheckedAccount {
+            outcome: AccountCheckOutcome::Spam { notified: false },
+            status: JobStatus::Spam,
+            verdict: Some(verdict),
+            campaign,
+            notified: false,
+        });
     }
 
     warn!(
         username = %account.username,
-        domain = %domain,
+        %domain,
         confidence = verdict.confidence,
         reason = %verdict.reason,
+        campaign_matches = campaign.match_count(),
         "spam detected"
     );
 
-    if dry_run {
-        info!(username = %account.username, "dry-run: skip Slack notification");
-        return Ok(AccountCheckOutcome::Spam { notified: false });
+    let pending_status = if services.slack.is_some() {
+        JobStatus::NotificationPending
+    } else {
+        JobStatus::Spam
+    };
+    persist_classification(services, account, pending_status, &verdict, &campaign).await?;
+
+    let notified = notify_with_claim(services, account, &verdict).await?;
+    if notified {
+        if let Some(writer) = &services.note_writer {
+            let note = t!(
+                "note_spam",
+                confidence = format!("{:.0}", verdict.confidence * 100.0),
+                reason = &verdict.reason,
+            );
+            if let Err(error) = writer.add_note(&account.id, &note).await {
+                error!(error = %error, "failed to add moderation note");
+            }
+        }
+    } else {
+        info!(account_id = %account.id, "notification disabled");
     }
 
-    slack
-        .notify_spam(account, &verdict)
-        .await
-        .context("failed to send Slack notification")?;
+    Ok(CheckedAccount {
+        outcome: AccountCheckOutcome::Spam { notified },
+        status: JobStatus::Spam,
+        verdict: Some(verdict),
+        campaign,
+        notified,
+    })
+}
 
-    if let Some(writer) = note_writer {
-        let note = t!(
-            "note_spam",
-            confidence = format!("{:.0}", verdict.confidence * 100.0),
-            reason = &verdict.reason,
-        );
-        if let Err(e) = writer.add_note(&account.id, &note).await {
-            error!(error = %e, "failed to add moderation note");
+async fn retry_pending_notification(
+    account: mastodon::AdminAccount,
+    services: CheckServices,
+    job: JobRecord,
+) -> Result<AccountCheckOutcome> {
+    let stored = job
+        .verdict
+        .clone()
+        .context("pending notification has no stored verdict")?;
+    let verdict = llm::SpamVerdict {
+        spam: stored.spam,
+        reason: stored.reason,
+        confidence: stored.confidence,
+    };
+    let campaign = CampaignContext {
+        matching_accounts: job.campaign_accounts.clone(),
+    };
+    let result = notify_with_claim(&services, &account, &verdict).await;
+    match result {
+        Ok(notified) => {
+            services
+                .store
+                .as_ref()
+                .context("pending notification retry has no state store")?
+                .complete_job(
+                    job,
+                    JobStatus::Spam,
+                    Some(stored_verdict(&verdict)),
+                    notified,
+                    &campaign,
+                )
+                .await?;
+            Ok(AccountCheckOutcome::Spam { notified })
+        }
+        Err(error) => {
+            if let Some(store) = &services.store
+                && let Err(store_error) = store.fail_job(job, &error).await
+            {
+                error!(error = %store_error, "failed to persist notification retry failure");
+            }
+            Err(error)
         }
     }
+}
 
-    Ok(AccountCheckOutcome::Spam { notified: true })
+async fn notify_with_claim(
+    services: &CheckServices,
+    account: &mastodon::AdminAccount,
+    verdict: &llm::SpamVerdict,
+) -> Result<bool> {
+    let Some(slack) = &services.slack else {
+        return Ok(false);
+    };
+    let store = services
+        .store
+        .as_ref()
+        .context("Slack notification has no state store")?;
+    let Some(token) = store.claim_notification(&account.id).await? else {
+        if store.has_terminal_feedback(&account.id).await? {
+            info!(account_id = %account.id, "notification suppressed by moderator feedback");
+            return Ok(false);
+        }
+        bail!(
+            "notification delivery is already claimed for account {}",
+            account.id
+        );
+    };
+    let result = slack
+        .notify_spam(account, verdict)
+        .await
+        .context("failed to send Slack notification");
+    if let Err(error) = store.release_notification_claim(&account.id, &token).await {
+        error!(account_id = %account.id, error = %error, "failed to release notification claim");
+    }
+    result.map(|()| true)
+}
+
+async fn persist_classification(
+    services: &CheckServices,
+    account: &mastodon::AdminAccount,
+    status: JobStatus,
+    verdict: &llm::SpamVerdict,
+    campaign: &CampaignContext,
+) -> Result<()> {
+    if services.persist {
+        services
+            .store
+            .as_ref()
+            .context("persistent check has no state store")?
+            .record_classification(&account.id, status, stored_verdict(verdict), campaign)
+            .await?;
+    }
+    Ok(())
+}
+
+fn stored_verdict(verdict: &llm::SpamVerdict) -> StoredVerdict {
+    StoredVerdict {
+        spam: verdict.spam,
+        reason: verdict.reason.clone(),
+        confidence: verdict.confidence,
+    }
+}
+
+async fn check_account_command(args: &[String]) -> Result<()> {
+    let [account_id] = args else {
+        bail!("usage: mastodon-spam-checker check-account <ID>");
+    };
+    validate_account_id(account_id)?;
+    let detection = config::DetectionConfig::from_env()?;
+    let mastodon = mastodon::MastodonClient::new(
+        &detection.mastodon_base_url,
+        &detection.mastodon_access_token,
+    )?;
+    let llm = llm::LlmClient::new(
+        &detection.openai_api_base,
+        &detection.openai_api_key,
+        &detection.openai_model,
+        detection.openai_json_mode,
+        http::RetryConfig::default(),
+    )?;
+    let account = mastodon.fetch_admin_account(account_id).await?;
+    let statuses = mastodon.fetch_statuses(account_id).await?;
+    let verdict = llm
+        .check_spam(&account, &statuses, &CampaignContext::default())
+        .await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "account_id": account.id,
+            "acct": account.acct(),
+            "spam": verdict.spam,
+            "confidence": verdict.confidence,
+            "reason": verdict.reason,
+        }))?
+    );
+    Ok(())
+}
+
+async fn cursor_command(args: &[String]) -> Result<()> {
+    if !args.is_empty() {
+        bail!("usage: mastodon-spam-checker cursor");
+    }
+    let store = StateStore::new(&redis_url()).await?;
+    println!(
+        "{}",
+        store.get_cursor().await?.as_deref().unwrap_or("(none)")
+    );
+    Ok(())
+}
+
+async fn retry_failed_command(args: &[String]) -> Result<()> {
+    let max = parse_optional_max(args, 100)?;
+    let config = config::Config::from_env(true)?;
+    let store = StateStore::new(&config.redis_url).await?;
+    let ids = store.failed_ids(max.saturating_mul(10)).await?;
+    if ids.is_empty() {
+        info!("retry queue is empty");
+        return Ok(());
+    }
+    let mut services = build_services(&config, Some(store.clone()), true).await?;
+    services.retry_pending = true;
+    let mut accounts = Vec::with_capacity(max.min(ids.len()));
+    let mut unavailable = 0usize;
+    let mut fetch_failures = 0usize;
+    for id in ids {
+        match services.mastodon.fetch_admin_account_optional(&id).await {
+            Ok(Some(account)) => accounts.push(account),
+            Ok(None) => {
+                warn!(account_id = %id, "queued account no longer exists, marking terminal");
+                store.mark_unavailable(&id).await?;
+                unavailable += 1;
+            }
+            Err(error) => {
+                warn!(account_id = %id, error = %error, "failed to fetch queued account, leaving it queued");
+                fetch_failures += 1;
+            }
+        }
+        if accounts.len() == max {
+            break;
+        }
+    }
+    if accounts.is_empty() {
+        if fetch_failures > 0 {
+            bail!("no queued account could be fetched from Mastodon");
+        }
+        info!(
+            unavailable,
+            "retry queue contained only unavailable accounts"
+        );
+        return Ok(());
+    }
+    let summary = process_accounts(accounts, services, config.check_concurrency).await;
+    if let Some(error) = summary.first_failure {
+        return Err(error);
+    }
+    log_summary(&summary, false);
+    Ok(())
+}
+
+async fn backfill_command(args: &[String]) -> Result<()> {
+    let options = BackfillOptions::parse(args)?;
+    let config = config::Config::from_env(options.notify)?;
+    let store = StateStore::new(&config.redis_url).await?;
+    let mut services = build_services(&config, Some(store), options.notify).await?;
+    // Backfills persist results even when notifications are intentionally disabled.
+    services.persist = true;
+    let accounts = services
+        .mastodon
+        .fetch_remote_accounts(Some(&options.from), options.to.as_deref(), options.max)
+        .await?;
+    let summary = process_accounts(accounts, services, config.check_concurrency).await;
+    if let Some(error) = summary.first_failure {
+        return Err(error);
+    }
+    log_summary(&summary, false);
+    Ok(())
+}
+
+struct BackfillOptions {
+    from: String,
+    to: Option<String>,
+    max: usize,
+    notify: bool,
+}
+
+impl BackfillOptions {
+    fn parse(args: &[String]) -> Result<Self> {
+        let mut from = None;
+        let mut to = None;
+        let mut max = 1_000;
+        let mut notify = false;
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--from" | "--to" | "--max" => {
+                    let flag = args[index].as_str();
+                    let value = args
+                        .get(index + 1)
+                        .with_context(|| format!("{flag} needs a value"))?;
+                    match flag {
+                        "--from" => {
+                            validate_account_id(value)?;
+                            from = Some(value.clone());
+                        }
+                        "--to" => {
+                            validate_account_id(value)?;
+                            to = Some(value.clone());
+                        }
+                        "--max" => max = parse_positive_usize(value, "--max")?,
+                        _ => unreachable!(),
+                    }
+                    index += 2;
+                }
+                "--notify" => {
+                    notify = true;
+                    index += 1;
+                }
+                unknown => bail!("unknown backfill option: {unknown}"),
+            }
+        }
+        let from = from.context("backfill requires --from <ID>")?;
+        if let Some(to) = &to
+            && numeric_id_cmp(&from, to) != std::cmp::Ordering::Less
+        {
+            bail!("backfill requires --from to be less than --to");
+        }
+        Ok(Self {
+            from,
+            to,
+            max,
+            notify,
+        })
+    }
+}
+
+fn parse_optional_max(args: &[String], default: usize) -> Result<usize> {
+    match args {
+        [] => Ok(default),
+        [flag, value] if flag == "--max" => parse_positive_usize(value, "--max"),
+        _ => bail!("usage: mastodon-spam-checker retry-failed [--max N]"),
+    }
+}
+
+fn parse_positive_usize(value: &str, name: &str) -> Result<usize> {
+    let parsed = value
+        .parse::<usize>()
+        .with_context(|| format!("{name} must be a positive integer"))?;
+    if parsed == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(parsed)
+}
+
+fn validate_account_id(id: &str) -> Result<()> {
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("account ID must contain digits only");
+    }
+    Ok(())
+}
+
+fn numeric_id_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+fn redis_url() -> String {
+    std::env::var("REDIS_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "redis://localhost:6379".to_string())
+}
+
+fn log_summary(summary: &ProcessSummary, dry_run: bool) {
+    info!(
+        spam_detected = summary.spam_detected,
+        spam_notified = summary.spam_notified,
+        undetermined = summary.undetermined,
+        skipped_existing = summary.skipped_existing,
+        dry_run,
+        "check finished"
+    );
 }
 
 const SYSTEM_USERNAMES: &[&str] = &["mastodon.internal", "internal.fetch", "system.actor"];
@@ -296,20 +836,9 @@ mod tests {
     #[test]
     fn i18n_keys_resolve() {
         rust_i18n::set_locale("en");
-        let val = t!("btn_suspend");
-        assert_ne!(
-            val, "btn_suspend",
-            "EN key 'btn_suspend' was not found (returned raw key)"
-        );
-        assert!(val.contains("Suspend"), "unexpected EN value: {val}");
-
+        assert!(t!("btn_suspend").contains("Suspend"));
         rust_i18n::set_locale("ja");
-        let val = t!("btn_suspend");
-        assert_ne!(
-            val, "btn_suspend",
-            "JA key 'btn_suspend' was not found (returned raw key)"
-        );
-        assert!(val.contains("停止"), "unexpected JA value: {val}");
+        assert!(t!("btn_suspend").contains("停止"));
     }
 
     #[test]
@@ -317,8 +846,35 @@ mod tests {
         assert!(is_system_account("mastodon.internal", "example.com"));
         assert!(is_system_account("internal.fetch", "example.com"));
         assert!(is_system_account("system.actor", "example.com"));
-        // Instance actor (username == domain).
         assert!(is_system_account("example.com", "example.com"));
         assert!(!is_system_account("alice", "example.com"));
+    }
+
+    #[test]
+    fn backfill_options_are_parsed() {
+        let options = BackfillOptions::parse(&[
+            "--from".into(),
+            "10".into(),
+            "--to".into(),
+            "20".into(),
+            "--max".into(),
+            "5".into(),
+            "--notify".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.from, "10");
+        assert_eq!(options.to.as_deref(), Some("20"));
+        assert_eq!(options.max, 5);
+        assert!(options.notify);
+        assert!(
+            BackfillOptions::parse(&["--from".into(), "20".into(), "--to".into(), "10".into(),])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn account_ids_are_numeric() {
+        assert!(validate_account_id("123").is_ok());
+        assert!(validate_account_id("12/action").is_err());
     }
 }

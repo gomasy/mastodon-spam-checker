@@ -18,6 +18,8 @@ const APP_NAME: &str = "Mastodon Spam Checker";
 pub const SUSPEND_ACTION_ID: &str = "suspend_account";
 /// Action ID for the delete button (appears only in post-suspension messages).
 pub const DELETE_ACTION_ID: &str = "delete_account";
+pub const CONFIRM_SPAM_ACTION_ID: &str = "confirm_spam";
+pub const FALSE_POSITIVE_ACTION_ID: &str = "false_positive";
 
 /// Character limit for Block Kit mrkdwn text objects (shared by section and context blocks).
 pub(crate) const TEXT_MAX_CHARS: usize = 3000;
@@ -42,18 +44,25 @@ struct SlackMessage {
     channel: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct SlackNotifier {
     client: Client,
     webhook_url: String,
+    mastodon_base_url: String,
     channel: Option<String>,
     retry: http::RetryConfig,
 }
 
 impl SlackNotifier {
-    pub fn new(webhook_url: &str, channel: Option<String>) -> Result<Self> {
+    pub fn new(
+        webhook_url: &str,
+        channel: Option<String>,
+        mastodon_base_url: &str,
+    ) -> Result<Self> {
         Ok(Self {
             client: http::client(Duration::from_secs(30))?,
             webhook_url: webhook_url.to_string(),
+            mastodon_base_url: mastodon_base_url.trim_end_matches('/').to_string(),
             channel,
             retry: http::RetryConfig::default(),
         })
@@ -62,6 +71,7 @@ impl SlackNotifier {
     pub async fn notify_spam(&self, account: &AdminAccount, verdict: &SpamVerdict) -> Result<()> {
         let acct = account.acct();
         let safe_acct = sanitize_mrkdwn(&acct);
+        let admin_url = format!("{}/admin/accounts/{}", self.mastodon_base_url, account.id);
         let text = t!(
             "spam_detected",
             acct = &safe_acct,
@@ -69,6 +79,7 @@ impl SlackNotifier {
             url = sanitize_mrkdwn(&account.account.url),
             confidence = format!("{:.0}", verdict.confidence * 100.0),
             reason = sanitize_mrkdwn(&verdict.reason),
+            admin_url = &admin_url,
         )
         .to_string();
         let text = truncate_mrkdwn(&text, TEXT_MAX_CHARS);
@@ -83,14 +94,7 @@ impl SlackNotifier {
                 "type": "section",
                 "text": { "type": "mrkdwn", "text": text.clone() }
             },
-            confirm_actions_block(
-                SUSPEND_ACTION_ID,
-                &t!("btn_suspend"),
-                &value,
-                &t!("btn_suspend_title"),
-                &t!("btn_suspend_confirm", acct = &safe_acct),
-                &t!("btn_suspend_do"),
-            ),
+            spam_actions_block(&value, &safe_acct),
         ]);
 
         let message = SlackMessage {
@@ -130,6 +134,34 @@ pub fn delete_actions_block(value_json: &str, safe_acct: &str) -> Value {
     )
 }
 
+fn spam_actions_block(value_json: &str, safe_acct: &str) -> Value {
+    json!({
+        "type": "actions",
+        "elements": [
+            confirm_button(
+                SUSPEND_ACTION_ID,
+                &t!("btn_suspend"),
+                value_json,
+                &t!("btn_suspend_title"),
+                &t!("btn_suspend_confirm", acct = safe_acct),
+                &t!("btn_suspend_do"),
+            ),
+            {
+                "type": "button",
+                "action_id": CONFIRM_SPAM_ACTION_ID,
+                "text": { "type": "plain_text", "text": t!("btn_confirm_spam").to_string() },
+                "value": value_json,
+            },
+            {
+                "type": "button",
+                "action_id": FALSE_POSITIVE_ACTION_ID,
+                "text": { "type": "plain_text", "text": t!("btn_false_positive").to_string() },
+                "value": value_json,
+            }
+        ]
+    })
+}
+
 fn confirm_actions_block(
     action_id: &str,
     label: &str,
@@ -140,23 +172,41 @@ fn confirm_actions_block(
 ) -> Value {
     json!({
         "type": "actions",
-        "elements": [{
-            "type": "button",
-            "action_id": action_id,
+        "elements": [confirm_button(
+            action_id,
+            label,
+            value,
+            confirm_title,
+            confirm_text,
+            confirm_label,
+        )]
+    })
+}
+
+fn confirm_button(
+    action_id: &str,
+    label: &str,
+    value: &str,
+    confirm_title: &str,
+    confirm_text: &str,
+    confirm_label: &str,
+) -> Value {
+    json!({
+        "type": "button",
+        "action_id": action_id,
+        "style": "danger",
+        "text": { "type": "plain_text", "text": label },
+        "value": value,
+        "confirm": {
             "style": "danger",
-            "text": { "type": "plain_text", "text": label },
-            "value": value,
-            "confirm": {
-                "style": "danger",
-                "title": { "type": "plain_text", "text": confirm_title },
-                "text": {
-                    "type": "mrkdwn",
-                    "text": truncate_mrkdwn(confirm_text, CONFIRM_TEXT_MAX_CHARS)
-                },
-                "confirm": { "type": "plain_text", "text": confirm_label },
-                "deny": { "type": "plain_text", "text": t!("btn_cancel").to_string() }
-            }
-        }]
+            "title": { "type": "plain_text", "text": confirm_title },
+            "text": {
+                "type": "mrkdwn",
+                "text": truncate_mrkdwn(confirm_text, CONFIRM_TEXT_MAX_CHARS)
+            },
+            "confirm": { "type": "plain_text", "text": confirm_label },
+            "deny": { "type": "plain_text", "text": t!("btn_cancel").to_string() }
+        }
     })
 }
 
@@ -219,5 +269,27 @@ mod tests {
             "spammer • Account: `admin@example.com`"
         );
         assert_eq!(sanitize_mrkdwn("  padded\tname  "), "padded name");
+    }
+
+    #[test]
+    fn spam_actions_include_feedback_and_suspension() {
+        let block = spam_actions_block(
+            r#"{"id":"42","acct":"alice@example.com"}"#,
+            "alice@example.com",
+        );
+        let action_ids: Vec<&str> = block["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|element| element["action_id"].as_str())
+            .collect();
+        assert_eq!(
+            action_ids,
+            [
+                SUSPEND_ACTION_ID,
+                CONFIRM_SPAM_ACTION_ID,
+                FALSE_POSITIVE_ACTION_ID
+            ]
+        );
     }
 }

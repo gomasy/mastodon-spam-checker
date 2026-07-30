@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use tracing::warn;
 
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
 /// Builds an HTTP client with common settings (User-Agent, timeout).
 pub fn client(timeout: Duration) -> Result<Client> {
     Client::builder()
@@ -68,6 +70,7 @@ fn retry_after(resp: &Response) -> Option<Duration> {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(Duration::from_secs)
+        .map(|duration| duration.min(MAX_RETRY_AFTER))
 }
 
 /// Sends a request with exponential-backoff retry and returns the successful response.

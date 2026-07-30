@@ -22,38 +22,57 @@ impl PostgresConfig {
     }
 }
 
-pub struct Config {
+pub struct DetectionConfig {
     pub mastodon_base_url: String,
     pub mastodon_access_token: String,
-    pub redis_url: String,
     pub openai_api_base: String,
     pub openai_api_key: String,
     pub openai_model: String,
     pub openai_json_mode: bool,
     /// Skip Slack notifications if the spam confidence is below this threshold (0.0–1.0).
     pub spam_confidence_threshold: f64,
-    pub slack_webhook_url: String,
-    pub slack_channel: Option<String>,
-    pub postgres: Option<PostgresConfig>,
 }
 
-impl Config {
+impl DetectionConfig {
     pub fn from_env() -> Result<Self> {
         let (mastodon_base_url, mastodon_access_token) = mastodon_env()?;
         Ok(Self {
             mastodon_base_url,
             mastodon_access_token,
-            redis_url: env_or("REDIS_URL", "redis://localhost:6379")?,
             openai_api_base: required_env("OPENAI_API_BASE")?,
             openai_api_key: required_env("OPENAI_API_KEY")?,
             openai_model: env_or("OPENAI_MODEL", "gpt-4o")?,
-            // Set to false for OpenAI-compatible APIs that do not support response_format.
             openai_json_mode: bool_env("OPENAI_JSON_MODE", true)?,
             spam_confidence_threshold: match optional_env("SPAM_CONFIDENCE_THRESHOLD")? {
                 Some(value) => parse_confidence_threshold(&value)?,
                 None => 0.0,
             },
-            slack_webhook_url: required_env("SLACK_WEBHOOK_URL")?,
+        })
+    }
+}
+
+pub struct Config {
+    pub detection: DetectionConfig,
+    pub redis_url: String,
+    pub max_accounts_per_run: usize,
+    pub check_concurrency: usize,
+    pub slack_webhook_url: Option<String>,
+    pub slack_channel: Option<String>,
+    pub postgres: Option<PostgresConfig>,
+}
+
+impl Config {
+    pub fn from_env(require_slack: bool) -> Result<Self> {
+        Ok(Self {
+            detection: DetectionConfig::from_env()?,
+            redis_url: env_or("REDIS_URL", "redis://localhost:6379")?,
+            max_accounts_per_run: positive_usize_env("MAX_ACCOUNTS_PER_RUN", 1_000)?,
+            check_concurrency: positive_usize_env("CHECK_CONCURRENCY", 4)?,
+            slack_webhook_url: if require_slack {
+                Some(required_env("SLACK_WEBHOOK_URL")?)
+            } else {
+                optional_env("SLACK_WEBHOOK_URL")?
+            },
             slack_channel: optional_env("SLACK_CHANNEL")?,
             postgres: PostgresConfig::from_env()?,
         })
@@ -65,6 +84,7 @@ pub struct ServeConfig {
     pub mastodon_access_token: String,
     pub slack_signing_secret: String,
     pub listen_addr: String,
+    pub redis_url: String,
     pub postgres: Option<PostgresConfig>,
 }
 
@@ -76,6 +96,7 @@ impl ServeConfig {
             mastodon_access_token,
             slack_signing_secret: required_env("SLACK_SIGNING_SECRET")?,
             listen_addr: env_or("LISTEN_ADDR", "127.0.0.1:8990")?,
+            redis_url: env_or("REDIS_URL", "redis://localhost:6379")?,
             postgres: PostgresConfig::from_env()?,
         })
     }
@@ -118,6 +139,19 @@ fn bool_env(key: &str, default: bool) -> Result<bool> {
         Some(value) => parse_bool(key, &value),
         None => Ok(default),
     }
+}
+
+fn positive_usize_env(key: &str, default: usize) -> Result<usize> {
+    let Some(value) = optional_env(key)? else {
+        return Ok(default);
+    };
+    let parsed = value
+        .parse::<usize>()
+        .with_context(|| format!("{key} is not a valid positive integer"))?;
+    if parsed == 0 {
+        bail!("{key} must be greater than zero");
+    }
+    Ok(parsed)
 }
 
 fn parse_bool(key: &str, value: &str) -> Result<bool> {
@@ -163,5 +197,11 @@ mod tests {
         assert!(parse_confidence_threshold("1.1").is_err());
         assert!(parse_confidence_threshold("NaN").is_err());
         assert!(parse_confidence_threshold("invalid").is_err());
+    }
+
+    #[test]
+    fn positive_sizes_are_validated_without_environment_access() {
+        assert!("4".parse::<usize>().is_ok());
+        assert_eq!("0".parse::<usize>().unwrap(), 0);
     }
 }
