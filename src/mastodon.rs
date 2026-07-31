@@ -134,16 +134,15 @@ impl MastodonClient {
         while accounts.len() < max_accounts {
             let remaining = max_accounts - accounts.len();
             let limit = page_limit.min(remaining);
-            let mut url = format!(
-                "{}/api/v2/admin/accounts?origin=remote&limit={limit}",
-                self.base_url
-            );
-            if let Some(id) = &page_min_id {
-                url.push_str(&format!("&min_id={id}"));
-            }
-            if let Some(id) = &page_max_id {
-                url.push_str(&format!("&max_id={id}"));
-            }
+            // Encoded rather than concatenated, so the pagination bounds cannot smuggle in extra
+            // query parameters even though both reach here already validated as digits.
+            let limit_param = limit.to_string();
+            let mut query = vec![("origin", "remote"), ("limit", limit_param.as_str())];
+            query.extend(page_min_id.as_deref().map(|id| ("min_id", id)));
+            query.extend(page_max_id.as_deref().map(|id| ("max_id", id)));
+            let query =
+                serde_urlencoded::to_string(&query).context("failed to build account query")?;
+            let url = format!("{}/api/v2/admin/accounts?{query}", self.base_url);
             info!(url = %url, "fetching accounts");
             let resp = self
                 .send_retry(|| self.client.get(&url), "Admin accounts API")
@@ -193,11 +192,19 @@ impl MastodonClient {
             .with_context(|| format!("admin account {account_id} was not found"))
     }
 
+    /// The admin endpoint for a single account, shared by the read, suspend, and delete paths.
+    ///
+    /// `account_id` reaches this as a path segment, and callers are responsible for having
+    /// validated it with [`crate::ids::validate_account_id`] first.
+    fn admin_account_url(&self, account_id: &str) -> String {
+        format!("{}/api/v1/admin/accounts/{account_id}", self.base_url)
+    }
+
     pub async fn fetch_admin_account_optional(
         &self,
         account_id: &str,
     ) -> Result<Option<AdminAccount>> {
-        let url = format!("{}/api/v1/admin/accounts/{account_id}", self.base_url);
+        let url = self.admin_account_url(account_id);
         let resp = http::send_with_retry_raw(
             || self.client.get(&url).bearer_auth(&self.access_token),
             "Admin account API",
@@ -217,19 +224,21 @@ impl MastodonClient {
 
     /// Returns whether the account is suspended (requires admin:read:accounts scope).
     pub async fn is_account_suspended(&self, account_id: &str) -> Result<bool> {
-        let url = format!("{}/api/v1/admin/accounts/{}", self.base_url, account_id);
-
-        let resp = self
-            .send_retry(|| self.client.get(&url), "Admin account API")
-            .await?;
-
-        // Treat missing or null suspended field as unsuspended to tolerate version differences.
+        /// Only the suspension flag is read here. A missing or null field is treated as
+        /// unsuspended, to tolerate Mastodon version differences.
         #[derive(Deserialize)]
-        struct Resp {
+        struct SuspensionState {
             #[serde(default)]
             suspended: Option<bool>,
         }
-        let account: Resp = resp
+
+        let resp = self
+            .send_retry(
+                || self.client.get(self.admin_account_url(account_id)),
+                "Admin account API",
+            )
+            .await?;
+        let account: SuspensionState = resp
             .json()
             .await
             .context("failed to parse admin account response")?;
@@ -238,16 +247,11 @@ impl MastodonClient {
 
     /// Suspends the account (requires admin:write:accounts scope).
     pub async fn suspend_account(&self, account_id: &str) -> Result<()> {
-        let url = format!(
-            "{}/api/v1/admin/accounts/{}/action",
-            self.base_url, account_id
-        );
-
         info!(account_id = %account_id, "suspending account");
 
         let req = self
             .client
-            .post(&url)
+            .post(format!("{}/action", self.admin_account_url(account_id)))
             .json(&serde_json::json!({ "type": "suspend" }));
         self.send(req, "Admin action API").await?;
 
@@ -257,12 +261,13 @@ impl MastodonClient {
     /// Permanently deletes data for a suspended account (requires admin:write:accounts scope).
     /// Mastodon rejects this request if the account is not already suspended.
     pub async fn delete_account(&self, account_id: &str) -> Result<()> {
-        let url = format!("{}/api/v1/admin/accounts/{}", self.base_url, account_id);
-
         info!(account_id = %account_id, "deleting account data");
 
-        self.send(self.client.delete(&url), "Admin account delete API")
-            .await?;
+        self.send(
+            self.client.delete(self.admin_account_url(account_id)),
+            "Admin account delete API",
+        )
+        .await?;
 
         Ok(())
     }
