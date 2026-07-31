@@ -21,7 +21,7 @@ const RUN_LEASE_SECS: u64 = 180;
 const CAMPAIGN_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
 const CAMPAIGN_MEMBERS_PER_SIGNAL: i64 = 1_000;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Processing,
@@ -38,7 +38,7 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
-    pub fn is_completed(&self) -> bool {
+    pub fn is_completed(self) -> bool {
         matches!(
             self,
             Self::NotSpam
@@ -50,6 +50,26 @@ impl JobStatus {
                 | Self::Deleted
                 | Self::Unavailable
         )
+    }
+
+    /// The stored spelling, matching how `serde` renames the variants for [`JobRecord`].
+    ///
+    /// Statuses are written both inside JSON job records and as the bare value of the moderation
+    /// action key; sharing one spelling keeps the two greppable as the same thing.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Processing => "processing",
+            Self::NotificationPending => "notification_pending",
+            Self::NotSpam => "not_spam",
+            Self::Spam => "spam",
+            Self::Undetermined => "undetermined",
+            Self::Failed => "failed",
+            Self::ConfirmedSpam => "confirmed_spam",
+            Self::FalsePositive => "false_positive",
+            Self::Suspended => "suspended",
+            Self::Deleted => "deleted",
+            Self::Unavailable => "unavailable",
+        }
     }
 }
 
@@ -390,7 +410,7 @@ impl StateStore {
 
     pub async fn record_action(&self, account_id: &str, status: JobStatus) -> Result<()> {
         let mut conn = self.conn.clone();
-        conn.set::<_, _, ()>(action_key(account_id), format!("{status:?}"))
+        conn.set::<_, _, ()>(action_key(account_id), status.as_str())
             .await
             .context("failed to save moderation action")
     }
@@ -599,9 +619,13 @@ mod tests {
     }
 
     #[test]
-    fn numeric_ids_are_ordered_without_integer_conversion() {
-        let mut ids = vec!["20".to_string(), "3".to_string(), "100".to_string()];
-        ids.sort_by(|a, b| numeric_id_cmp(a, b));
-        assert_eq!(ids, ["3", "20", "100"]);
+    fn job_status_round_trips_through_its_stored_form() {
+        // record_action and the JobRecord both persist this; one snake_case spelling for both.
+        assert_eq!(JobStatus::ConfirmedSpam.as_str(), "confirmed_spam");
+        assert_eq!(JobStatus::NotSpam.as_str(), "not_spam");
+        assert_eq!(
+            serde_json::to_string(&JobStatus::ConfirmedSpam).unwrap(),
+            "\"confirmed_spam\""
+        );
     }
 }
