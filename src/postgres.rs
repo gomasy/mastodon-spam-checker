@@ -21,8 +21,8 @@ const INSERT_NOTE: &str = "INSERT INTO account_moderation_notes \
 /// a database restart, idle timeout, or brief network loss would otherwise silence moderation notes
 /// permanently. Each write checks the connection first and redials when it has gone.
 ///
-/// [`crate::redis::CursorStore`] deliberately has no equivalent: it is only used by the one-shot
-/// `check` run, which exits long before an idle connection can be dropped underneath it.
+/// [`crate::redis::StateStore`] deliberately has no equivalent: its multiplexed connection
+/// reconnects on its own, so nothing here has to redial it.
 pub struct ModerationNoteWriter {
     database_url: String,
     moderator_account_id: i64,
