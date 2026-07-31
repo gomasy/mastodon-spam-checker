@@ -34,19 +34,54 @@ struct AppState {
     mastodon: MastodonClient,
     signing_secret: String,
     http: reqwest::Client,
-    /// Account IDs currently being processed (prevents double-clicks and allows graceful shutdown).
-    in_flight: Mutex<HashSet<String>>,
+    /// Accounts currently being processed (prevents double-clicks and allows graceful shutdown).
+    in_flight: Arc<InFlight>,
     note_writer: Option<crate::postgres::ModerationNoteWriter>,
     store: StateStore,
 }
 
-impl AppState {
-    /// Acquires the in_flight lock. Even if the lock is poisoned (panic while held),
-    /// the HashSet remains consistent, so recover and continue rather than propagating the panic.
-    fn lock_in_flight(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
-        self.in_flight
+/// The set of accounts whose button click is still being handled.
+#[derive(Default)]
+struct InFlight(Mutex<HashSet<String>>);
+
+impl InFlight {
+    /// Acquires the lock. Even if it is poisoned (a panic while held), the set itself remains
+    /// consistent, so recover and continue rather than propagating the panic.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// Claims `account_id`, or returns `None` if a click for it is already being handled.
+    ///
+    /// The claim is released when the returned guard drops, including if the handling task panics.
+    /// Removing the ID by hand at the end of the happy path would leak it on a panic, and a leaked
+    /// ID is permanent: every later click on that account is silently dropped as a double-click,
+    /// and every shutdown waits out the full grace period.
+    fn claim(self: &Arc<Self>, account_id: &str) -> Option<InFlightGuard> {
+        self.lock()
+            .insert(account_id.to_string())
+            .then(|| InFlightGuard {
+                in_flight: Arc::clone(self),
+                account_id: account_id.to_string(),
+            })
+    }
+}
+
+/// Holds an account's in-flight claim for as long as its action is being processed.
+struct InFlightGuard {
+    in_flight: Arc<InFlight>,
+    account_id: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight.lock().remove(&self.account_id);
     }
 }
 
@@ -86,7 +121,7 @@ pub async fn run(config: ServeConfig) -> Result<()> {
         http: mastodon.http_client(),
         mastodon,
         signing_secret: config.slack_signing_secret,
-        in_flight: Mutex::new(HashSet::new()),
+        in_flight: Arc::new(InFlight::default()),
         note_writer,
         store: StateStore::new(&config.redis_url).await?,
     });
@@ -107,7 +142,7 @@ pub async fn run(config: ServeConfig) -> Result<()> {
     // Wait for in-flight suspend tasks to finish before exiting, so we don't terminate
     // while Mastodon is suspended but the Slack message is not yet updated.
     let deadline = Instant::now() + SHUTDOWN_GRACE;
-    while !state.lock_in_flight().is_empty() {
+    while !state.in_flight.is_empty() {
         if Instant::now() >= deadline {
             warn!("shutting down with suspend tasks still in flight");
             break;
@@ -154,13 +189,13 @@ async fn handle_interaction(
         }
     };
 
-    if !state.lock_in_flight().insert(interaction.value.id.clone()) {
+    let Some(guard) = state.in_flight.claim(&interaction.value.id) else {
         info!(account_id = %interaction.value.id, "action already in progress, ignoring click");
         return StatusCode::OK;
-    }
+    };
 
     // Slack requires a response within 3 seconds, so spawn the real work and return 200 immediately.
-    tokio::spawn(process_action(state, interaction));
+    tokio::spawn(process_action(state, interaction, guard));
 
     StatusCode::OK
 }
@@ -241,7 +276,9 @@ fn extract_interaction(mut payload: Value) -> Result<Option<Interaction>> {
 }
 
 /// Calls the appropriate Mastodon API for the button action and updates the Slack message via response_url.
-async fn process_action(state: Arc<AppState>, interaction: Interaction) {
+///
+/// `_guard` is held for the whole call so the account's in-flight claim outlives it either way.
+async fn process_action(state: Arc<AppState>, interaction: Interaction, _guard: InFlightGuard) {
     let Interaction {
         kind,
         value,
@@ -404,8 +441,6 @@ async fn process_action(state: Arc<AppState>, interaction: Interaction) {
         "blocks": blocks,
     });
     post_to_slack(&state.http, &response_url, &update).await;
-
-    state.lock_in_flight().remove(&value.id);
 }
 
 /// Renders one of the `*_failed` locale strings. `safe_acct` must already be sanitized;
@@ -684,6 +719,45 @@ mod tests {
             }]
         });
         assert!(extract_interaction(payload).is_err());
+    }
+
+    #[test]
+    fn a_second_click_is_rejected_while_the_first_is_in_flight() {
+        let in_flight = Arc::new(InFlight::default());
+        let first = in_flight
+            .claim("42")
+            .expect("first click claims the account");
+        assert!(
+            in_flight.claim("42").is_none(),
+            "double-click was not rejected"
+        );
+        // A different account is unaffected.
+        let other = in_flight.claim("43");
+        assert!(other.is_some());
+
+        drop(first);
+        assert!(
+            in_flight.claim("42").is_some(),
+            "claim was not released when the guard dropped"
+        );
+    }
+
+    #[test]
+    fn a_panicking_action_still_releases_its_claim() {
+        let in_flight = Arc::new(InFlight::default());
+        let panicked = std::panic::catch_unwind({
+            let in_flight = Arc::clone(&in_flight);
+            move || {
+                let _guard = in_flight.claim("42").expect("claim");
+                panic!("action handler blew up");
+            }
+        });
+
+        assert!(panicked.is_err());
+        assert!(
+            in_flight.is_empty(),
+            "a panicking handler leaked its claim, permanently deadening the account's buttons"
+        );
     }
 
     #[test]
