@@ -219,9 +219,7 @@ impl StateStore {
             .get(job_key(account_id))
             .await
             .context("failed to read account job from Redis")?;
-        value
-            .map(|value| serde_json::from_str(&value).context("invalid account job in Redis"))
-            .transpose()
+        parse_job(value.as_deref())
     }
 
     pub async fn begin_job(
@@ -435,41 +433,38 @@ impl StateStore {
             .get(feedback_key(account_id))
             .await
             .context("failed to read moderator feedback")?;
-        let feedback: Option<FeedbackRecord> = value
-            .map(|value| {
-                serde_json::from_str(&value).context("invalid moderator feedback in Redis")
-            })
-            .transpose()?;
-        Ok(feedback.map(|feedback| feedback.status))
+        Ok(parse_feedback(value.as_deref())?.map(|feedback| feedback.status))
     }
 
     pub async fn failed_ids(&self, limit: usize) -> Result<Vec<String>> {
         let mut conn = self.conn.clone();
-        let mut ids: Vec<String> = conn
+        let (mut ids, pending): (Vec<String>, Vec<String>) = redis::pipe()
             .smembers(FAILED_KEY)
+            .smembers(PENDING_NOTIFICATION_KEY)
+            .query_async(&mut conn)
             .await
             .context("failed to read retry queue")?;
-        let pending: Vec<String> = conn
-            .smembers(PENDING_NOTIFICATION_KEY)
-            .await
-            .context("failed to read pending notification queue")?;
         ids.extend(pending);
         ids.sort_by(|a, b| numeric_id_cmp(a, b));
         ids.dedup();
+
         let mut failed = Vec::new();
         for id in ids {
-            if self.has_terminal_feedback(&id).await?
-                || self
-                    .get_job(&id)
-                    .await?
-                    .is_some_and(|job| job.status.is_completed())
-            {
+            // Both keys in one round trip: the queue can hold thousands of IDs, and this walks it
+            // until `limit` live ones are found.
+            let (feedback, job): (Option<String>, Option<String>) = redis::pipe()
+                .get(feedback_key(&id))
+                .get(job_key(&id))
+                .query_async(&mut conn)
+                .await
+                .context("failed to read queued account state")?;
+            if is_terminal_feedback(feedback.as_deref())? || is_completed_job(job.as_deref())? {
                 self.remove_failed(&id).await?;
-            } else {
-                failed.push(id);
-                if failed.len() == limit {
-                    break;
-                }
+                continue;
+            }
+            failed.push(id);
+            if failed.len() == limit {
+                break;
             }
         }
         Ok(failed)
@@ -573,6 +568,31 @@ impl StateStore {
             .await
             .context("failed to save account job to Redis")
     }
+}
+
+fn parse_feedback(value: Option<&str>) -> Result<Option<FeedbackRecord>> {
+    value
+        .map(|value| serde_json::from_str(value).context("invalid moderator feedback in Redis"))
+        .transpose()
+}
+
+fn parse_job(value: Option<&str>) -> Result<Option<JobRecord>> {
+    value
+        .map(|value| serde_json::from_str(value).context("invalid account job in Redis"))
+        .transpose()
+}
+
+/// Whether a raw feedback value marks the account as decided by a moderator.
+fn is_terminal_feedback(value: Option<&str>) -> Result<bool> {
+    Ok(matches!(
+        parse_feedback(value)?.map(|feedback| feedback.status),
+        Some(JobStatus::FalsePositive | JobStatus::ConfirmedSpam)
+    ))
+}
+
+/// Whether a raw job value shows the account has already reached a terminal status.
+fn is_completed_job(value: Option<&str>) -> Result<bool> {
+    Ok(parse_job(value)?.is_some_and(|job| job.status.is_completed()))
 }
 
 fn job_key(account_id: &str) -> String {
