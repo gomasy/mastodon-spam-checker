@@ -6,6 +6,9 @@ use redis::AsyncCommands;
 use redis::aio::MultiplexedConnection;
 use serde::{Deserialize, Serialize};
 
+use crate::ids::numeric_id_cmp;
+use crate::signals::digest;
+
 const KEY_PREFIX: &str = "mastodon_spam_checker";
 const CURSOR_KEY: &str = "mastodon_spam_checker:last_account_id";
 const FAILED_KEY: &str = "mastodon_spam_checker:failed_accounts";
@@ -580,18 +583,6 @@ fn now_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn numeric_id_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
-}
-
-fn digest(value: &str) -> String {
-    ring::digest::digest(&ring::digest::SHA256, value.as_bytes())
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 #[cfg(test)]

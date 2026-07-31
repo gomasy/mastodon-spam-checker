@@ -1,5 +1,6 @@
 mod config;
 mod http;
+mod ids;
 mod llm;
 mod mastodon;
 mod postgres;
@@ -18,6 +19,8 @@ use rust_i18n::t;
 use tracing::{error, info, warn};
 use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::config::parse_positive_usize;
+use crate::ids::{numeric_id_cmp, validate_account_id};
 use crate::redis::{CampaignContext, JobRecord, JobStatus, StateStore, StoredVerdict};
 
 rust_i18n::i18n!("locales", fallback = "en");
@@ -50,7 +53,7 @@ async fn main() -> Result<()> {
 }
 
 async fn exclusive_run(operation: impl Future<Output = Result<()>>) -> Result<()> {
-    let store = StateStore::new(&redis_url()).await?;
+    let store = StateStore::new(&config::redis_url_env()?).await?;
     let token = store.acquire_run_lease().await?;
     let renewal_store = store.clone();
     let renewal_token = token.clone();
@@ -643,7 +646,7 @@ async fn cursor_command(args: &[String]) -> Result<()> {
     if !args.is_empty() {
         bail!("usage: mastodon-spam-checker cursor");
     }
-    let store = StateStore::new(&redis_url()).await?;
+    let store = StateStore::new(&config::redis_url_env()?).await?;
     println!(
         "{}",
         store.get_cursor().await?.as_deref().unwrap_or("(none)")
@@ -782,34 +785,6 @@ fn parse_optional_max(args: &[String], default: usize) -> Result<usize> {
         [flag, value] if flag == "--max" => parse_positive_usize(value, "--max"),
         _ => bail!("usage: mastodon-spam-checker retry-failed [--max N]"),
     }
-}
-
-fn parse_positive_usize(value: &str, name: &str) -> Result<usize> {
-    let parsed = value
-        .parse::<usize>()
-        .with_context(|| format!("{name} must be a positive integer"))?;
-    if parsed == 0 {
-        bail!("{name} must be greater than zero");
-    }
-    Ok(parsed)
-}
-
-fn validate_account_id(id: &str) -> Result<()> {
-    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
-        bail!("account ID must contain digits only");
-    }
-    Ok(())
-}
-
-fn numeric_id_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
-}
-
-fn redis_url() -> String {
-    std::env::var("REDIS_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "redis://localhost:6379".to_string())
 }
 
 fn log_summary(summary: &ProcessSummary, dry_run: bool) {

@@ -6,6 +6,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::http;
+use crate::ids::numeric_id_cmp;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AdminAccount {
@@ -294,8 +295,4 @@ impl MastodonClient {
 
         Ok(statuses)
     }
-}
-
-fn numeric_id_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }

@@ -65,7 +65,7 @@ impl Config {
     pub fn from_env(require_slack: bool) -> Result<Self> {
         Ok(Self {
             detection: DetectionConfig::from_env()?,
-            redis_url: env_or("REDIS_URL", "redis://localhost:6379")?,
+            redis_url: redis_url_env()?,
             max_accounts_per_run: positive_usize_env("MAX_ACCOUNTS_PER_RUN", 1_000)?,
             check_concurrency: positive_usize_env("CHECK_CONCURRENCY", 4)?,
             slack_webhook_url: if require_slack {
@@ -96,10 +96,18 @@ impl ServeConfig {
             mastodon_access_token,
             slack_signing_secret: required_env("SLACK_SIGNING_SECRET")?,
             listen_addr: env_or("LISTEN_ADDR", "127.0.0.1:8990")?,
-            redis_url: env_or("REDIS_URL", "redis://localhost:6379")?,
+            redis_url: redis_url_env()?,
             postgres: PostgresConfig::from_env()?,
         })
     }
+}
+
+const DEFAULT_REDIS_URL: &str = "redis://localhost:6379";
+
+/// `REDIS_URL`, or the local default. Every entry point reaches Redis, including the subcommands
+/// that build no full [`Config`], so the default lives here rather than at each call site.
+pub fn redis_url_env() -> Result<String> {
+    env_or("REDIS_URL", DEFAULT_REDIS_URL)
 }
 
 fn mastodon_env() -> Result<(String, String)> {
@@ -142,14 +150,21 @@ fn bool_env(key: &str, default: bool) -> Result<bool> {
 }
 
 fn positive_usize_env(key: &str, default: usize) -> Result<usize> {
-    let Some(value) = optional_env(key)? else {
-        return Ok(default);
-    };
+    match optional_env(key)? {
+        Some(value) => parse_positive_usize(&value, key),
+        None => Ok(default),
+    }
+}
+
+/// Parses a count that must be at least one, naming `source` (an environment variable or a CLI
+/// flag) in the error. Shared with the command-line argument parsing in `main`.
+pub fn parse_positive_usize(value: &str, source: &str) -> Result<usize> {
     let parsed = value
+        .trim()
         .parse::<usize>()
-        .with_context(|| format!("{key} is not a valid positive integer"))?;
+        .with_context(|| format!("{source} is not a valid positive integer"))?;
     if parsed == 0 {
-        bail!("{key} must be greater than zero");
+        bail!("{source} must be greater than zero");
     }
     Ok(parsed)
 }
@@ -200,8 +215,15 @@ mod tests {
     }
 
     #[test]
-    fn positive_sizes_are_validated_without_environment_access() {
-        assert!("4".parse::<usize>().is_ok());
-        assert_eq!("0".parse::<usize>().unwrap(), 0);
+    fn positive_sizes_are_validated() {
+        assert_eq!(parse_positive_usize("4", "TEST").unwrap(), 4);
+        assert_eq!(parse_positive_usize(" 4 ", "TEST").unwrap(), 4);
+        assert!(parse_positive_usize("0", "TEST").is_err());
+        assert!(parse_positive_usize("-1", "TEST").is_err());
+        assert!(parse_positive_usize("", "TEST").is_err());
+        assert!(parse_positive_usize("abc", "TEST").is_err());
+        // The failing source is named, so the message points at the setting to fix.
+        let error = parse_positive_usize("0", "--max").unwrap_err().to_string();
+        assert!(error.contains("--max"), "{error}");
     }
 }

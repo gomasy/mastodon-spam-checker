@@ -116,12 +116,17 @@ fn collect_url(candidate: &str, links: &mut BTreeSet<String>) {
     }
 }
 
-fn digest(value: &str) -> String {
+/// Hex SHA-256 of `value`, used to key campaign signals by content without storing the content.
+pub fn digest(value: &str) -> String {
+    use std::fmt::Write;
+
     ring::digest::digest(&ring::digest::SHA256, value.as_bytes())
         .as_ref()
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 #[cfg(test)]

@@ -17,6 +17,7 @@ use tracing::{error, info, warn};
 use rust_i18n::t;
 
 use crate::config::ServeConfig;
+use crate::ids::is_numeric_id;
 use crate::mastodon::MastodonClient;
 use crate::redis::{JobStatus, StateStore};
 use crate::slack::{
@@ -194,7 +195,7 @@ fn extract_interaction(mut payload: Value) -> Result<Option<Interaction>> {
 
     // Mastodon account IDs are numeric only. Validate before embedding in URL paths
     // to ensure a tampered value cannot be routed to a different endpoint.
-    if value.id.is_empty() || !value.id.bytes().all(|b| b.is_ascii_digit()) {
+    if !is_numeric_id(&value.id) {
         bail!("account id is not numeric: {}", value.id);
     }
 
