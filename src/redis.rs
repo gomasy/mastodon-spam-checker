@@ -20,6 +20,8 @@ const RUN_LEASE_KEY: &str = "mastodon_spam_checker:run_lease";
 const RUN_LEASE_SECS: u64 = 180;
 const CAMPAIGN_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
 const CAMPAIGN_MEMBERS_PER_SIGNAL: i64 = 1_000;
+/// How many matching accounts a campaign lookup keeps, per signal and in total.
+const CAMPAIGN_MATCHES_REPORTED: usize = 20;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -505,6 +507,14 @@ impl StateStore {
             .context("failed to remove account from retry queue")
     }
 
+    /// Records this account against its campaign signals and reports which other recently seen
+    /// accounts share one.
+    ///
+    /// An account can carry a bio fingerprint plus a domain per extracted link, so this runs over
+    /// tens of keys. Every command for every key goes out in one pipeline: issued serially they
+    /// cost four to five round trips per key, which dominated the time spent checking an account.
+    /// The pipeline is deliberately not `atomic()` — these are independent per-key housekeeping
+    /// commands, and wrapping them in MULTI/EXEC would only add contention.
     pub async fn campaign_context(
         &self,
         account_id: &str,
@@ -512,8 +522,8 @@ impl StateStore {
         link_domains: &[String],
         record: bool,
     ) -> Result<CampaignContext> {
-        let mut conn = self.conn.clone();
-        let mut keys = Vec::new();
+        let mut keys =
+            Vec::with_capacity(usize::from(bio_fingerprint.is_some()) + link_domains.len());
         if let Some(fingerprint) = bio_fingerprint {
             keys.push(format!("{KEY_PREFIX}:campaign:bio:{fingerprint}"));
         }
@@ -522,42 +532,52 @@ impl StateStore {
                 .iter()
                 .map(|domain| format!("{KEY_PREFIX}:campaign:domain:{}", digest(domain))),
         );
+        if keys.is_empty() {
+            return Ok(CampaignContext::default());
+        }
 
         let now = now_timestamp();
         let cutoff = now.saturating_sub(CAMPAIGN_WINDOW_SECS);
-        let mut matches = BTreeSet::new();
-        for key in keys {
-            redis::cmd("ZREMRANGEBYSCORE")
-                .arg(&key)
+        let mut pipeline = redis::pipe();
+        for key in &keys {
+            // Drop entries that fell out of the window before anything reads or caps the key.
+            pipeline
+                .cmd("ZREMRANGEBYSCORE")
+                .arg(key)
                 .arg("-inf")
                 .arg(cutoff)
-                .query_async::<i64>(&mut conn)
-                .await
-                .context("failed to prune campaign index")?;
+                .ignore();
             if record {
-                conn.zadd::<_, _, _, ()>(&key, account_id, now)
-                    .await
-                    .context("failed to update campaign index")?;
-                conn.expire::<_, ()>(&key, CAMPAIGN_WINDOW_SECS as i64)
-                    .await
-                    .context("failed to expire campaign index")?;
-                redis::cmd("ZREMRANGEBYRANK")
-                    .arg(&key)
+                pipeline
+                    .zadd(key, account_id, now)
+                    .ignore()
+                    .expire(key, CAMPAIGN_WINDOW_SECS as i64)
+                    .ignore()
+                    // Keep only the newest members, so one busy domain cannot grow without bound.
+                    .cmd("ZREMRANGEBYRANK")
+                    .arg(key)
                     .arg(0)
                     .arg(-(CAMPAIGN_MEMBERS_PER_SIGNAL + 1))
-                    .query_async::<i64>(&mut conn)
-                    .await
-                    .context("failed to cap campaign index")?;
+                    .ignore();
             }
-            let members: Vec<String> = conn
-                .zrevrange(&key, 0, 19)
-                .await
-                .context("failed to read campaign index")?;
-            matches.extend(members.into_iter().filter(|id| id != account_id));
+            // The only kept reply per key: newest members first.
+            pipeline.zrevrange(key, 0, CAMPAIGN_MATCHES_REPORTED as isize - 1);
         }
 
+        let mut conn = self.conn.clone();
+        let per_key: Vec<Vec<String>> = pipeline
+            .query_async(&mut conn)
+            .await
+            .context("failed to update and read campaign index")?;
+
+        let matches: BTreeSet<String> = per_key
+            .into_iter()
+            .flatten()
+            .filter(|id| id != account_id)
+            .collect();
+
         Ok(CampaignContext {
-            matching_accounts: matches.into_iter().take(20).collect(),
+            matching_accounts: most_recent_matches(matches),
         })
     }
 
@@ -593,6 +613,18 @@ fn is_terminal_feedback(value: Option<&str>) -> Result<bool> {
 /// Whether a raw job value shows the account has already reached a terminal status.
 fn is_completed_job(value: Option<&str>) -> Result<bool> {
     Ok(parse_job(value)?.is_some_and(|job| job.status.is_completed()))
+}
+
+/// Caps the merged per-signal matches at the newest [`CAMPAIGN_MATCHES_REPORTED`] accounts.
+///
+/// Each signal is read newest-first, but merging them for de-duplication loses that order, and
+/// taking the set's own order would keep whichever IDs sort first as text — `"1000"` ahead of
+/// `"999"`. Re-sorting numerically, descending, keeps the accounts the campaign report is about.
+fn most_recent_matches(matches: BTreeSet<String>) -> Vec<String> {
+    let mut matches: Vec<String> = matches.into_iter().collect();
+    matches.sort_by(|a, b| numeric_id_cmp(b, a));
+    matches.truncate(CAMPAIGN_MATCHES_REPORTED);
+    matches
 }
 
 fn job_key(account_id: &str) -> String {
@@ -636,6 +668,20 @@ mod tests {
         assert!(!JobStatus::Failed.is_completed());
         assert!(!JobStatus::Processing.is_completed());
         assert!(!JobStatus::NotificationPending.is_completed());
+    }
+
+    #[test]
+    fn campaign_matches_keep_the_most_recent_accounts() {
+        // IDs increase over time, so "most recent" is the numerically largest, and the cap must
+        // not fall back on lexicographic order (which would keep "1000" over "999").
+        let ids = (1..=CAMPAIGN_MATCHES_REPORTED as u64 + 5)
+            .map(|id| (id * 100).to_string())
+            .collect::<BTreeSet<_>>();
+        let kept = most_recent_matches(ids);
+
+        assert_eq!(kept.len(), CAMPAIGN_MATCHES_REPORTED);
+        assert_eq!(kept[0], "2500");
+        assert_eq!(kept[kept.len() - 1], "600");
     }
 
     #[test]
