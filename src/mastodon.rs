@@ -152,13 +152,16 @@ impl MastodonClient {
                 .json()
                 .await
                 .context("failed to parse admin accounts response")?;
+            // Whether the page was full decides if another one exists, so measure it before
+            // de-duplication: a repeated ID within a page would otherwise end pagination early
+            // and silently leave the remaining accounts unchecked.
+            let page_was_full = page.len() >= limit;
             page.sort_by(|a, b| numeric_id_cmp(&a.id, &b.id));
             page.dedup_by(|a, b| a.id == b.id);
-            let page_len = page.len();
             let next_min_id = page.last().map(|account| account.id.clone());
             let next_max_id = page.first().map(|account| account.id.clone());
             accounts.extend(page);
-            if page_len < limit || accounts.len() >= max_accounts {
+            if !page_was_full || accounts.len() >= max_accounts {
                 break;
             }
             if forward {
