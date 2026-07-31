@@ -12,7 +12,7 @@ use std::fmt::Write;
 use crate::http;
 use crate::mastodon::{AdminAccount, Status};
 use crate::redis::CampaignContext;
-use crate::signals::{analyze, html_to_plain};
+use crate::signals::{AccountSignals, html_to_plain};
 use crate::text::truncate_chars;
 
 // Caps on the untrusted account text copied into the prompt. Without them a single account with
@@ -168,13 +168,17 @@ impl LlmClient {
         })
     }
 
+    /// `signals` is the caller's already-computed [`AccountSignals`] for this account. It is
+    /// threaded in rather than recomputed here: the campaign lookup needs it first, and analysing
+    /// an account hashes its bio and parses every link it carries.
     pub async fn check_spam(
         &self,
         account: &AdminAccount,
         statuses: &[Status],
+        signals: &AccountSignals,
         campaign: &CampaignContext,
     ) -> Result<SpamVerdict> {
-        let user_prompt = build_user_prompt(account, statuses, campaign);
+        let user_prompt = build_user_prompt(account, statuses, signals, campaign);
 
         let request = ChatRequest {
             model: self.model.clone(),
@@ -266,10 +270,10 @@ fn normalize_confidence(confidence: f64) -> f64 {
 fn build_user_prompt(
     account: &AdminAccount,
     statuses: &[Status],
+    signals: &AccountSignals,
     campaign: &CampaignContext,
 ) -> String {
     let note_plain = html_to_plain(&account.account.note);
-    let signals = analyze(account, statuses);
     // Mastodon serves /avatars/original/missing.png when no avatar is set
     let avatar_state =
         if account.account.avatar.is_empty() || account.account.avatar.contains("missing.png") {
@@ -469,13 +473,15 @@ mod tests {
         )));
     }
 
+    /// Builds a prompt the way [`LlmClient::check_spam`] does, deriving the signals from the input.
+    fn prompt_for(account: &AdminAccount, statuses: &[Status]) -> String {
+        let signals = crate::signals::analyze(account, statuses);
+        build_user_prompt(account, statuses, &signals, &CampaignContext::default())
+    }
+
     #[test]
     fn long_profile_fields_are_capped() {
-        let prompt = build_user_prompt(
-            &account(&"あ".repeat(BIO_MAX_CHARS * 3)),
-            &[],
-            &CampaignContext::default(),
-        );
+        let prompt = prompt_for(&account(&"あ".repeat(BIO_MAX_CHARS * 3)), &[]);
         assert!(
             prompt.chars().count() < BIO_MAX_CHARS + 500,
             "bio was not capped"
@@ -497,7 +503,7 @@ mod tests {
         let statuses: Vec<Status> = (0..10)
             .map(|_| status(&"x".repeat(POST_MAX_CHARS * 2)))
             .collect();
-        let prompt = build_user_prompt(&account(""), &statuses, &CampaignContext::default());
+        let prompt = prompt_for(&account(""), &statuses);
 
         // Each post is capped, and the shared budget stops the list well before all ten fit.
         let posts: Vec<&str> = prompt
@@ -516,7 +522,7 @@ mod tests {
     #[test]
     fn short_posts_are_all_included_verbatim() {
         let statuses = vec![status("<p>hello</p>"), status("<p>world</p>")];
-        let prompt = build_user_prompt(&account(""), &statuses, &CampaignContext::default());
+        let prompt = prompt_for(&account(""), &statuses);
         assert!(prompt.contains("[unknown; lang=unknown; source=unknown] hello"));
         assert!(prompt.contains("[unknown; lang=unknown; source=unknown] world"));
         assert!(!prompt.contains("omitted"));

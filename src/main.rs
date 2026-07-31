@@ -412,7 +412,11 @@ async fn check_one_inner(
         None => CampaignContext::default(),
     };
 
-    let verdict = match services.llm.check_spam(account, &statuses, &campaign).await {
+    let verdict = match services
+        .llm
+        .check_spam(account, &statuses, &signals, &campaign)
+        .await
+    {
         Ok(verdict) => verdict,
         Err(error) if llm::is_unparseable_verdict(&error) => {
             warn!(
@@ -626,8 +630,10 @@ async fn check_account_command(args: &[String]) -> Result<()> {
     )?;
     let account = mastodon.fetch_admin_account(account_id).await?;
     let statuses = mastodon.fetch_statuses(account_id).await?;
+    let signals = signals::analyze(&account, &statuses);
+    // A one-off inspection touches no state, so it carries no campaign history.
     let verdict = llm
-        .check_spam(&account, &statuses, &CampaignContext::default())
+        .check_spam(&account, &statuses, &signals, &CampaignContext::default())
         .await?;
     println!(
         "{}",
