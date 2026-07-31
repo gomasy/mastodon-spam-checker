@@ -486,7 +486,20 @@ async fn check_one_inner(
         campaign_matches = campaign.match_count(),
         "spam detected"
     );
+    report_spam(account, services, verdict, campaign).await
+}
 
+/// Notifies moderators about a spam verdict that cleared the threshold, and records it.
+///
+/// The classification is written before the notification goes out, marked as pending whenever a
+/// notification is owed, so a crash mid-delivery leaves the account in the retry queue rather than
+/// looking finished.
+async fn report_spam(
+    account: &mastodon::AdminAccount,
+    services: &CheckServices,
+    verdict: llm::SpamVerdict,
+    campaign: CampaignContext,
+) -> Result<CheckedAccount> {
     let pending_status = if services.slack.is_some() {
         JobStatus::NotificationPending
     } else {
@@ -502,6 +515,7 @@ async fn check_one_inner(
                 confidence = format!("{:.0}", verdict.confidence * 100.0),
                 reason = &verdict.reason,
             );
+            // A missing note must not undo a delivered notification, so this is logged, not raised.
             if let Err(error) = writer.add_note(&account.id, &note).await {
                 error!(error = %error, "failed to add moderation note");
             }
