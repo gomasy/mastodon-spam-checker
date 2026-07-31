@@ -758,32 +758,24 @@ impl BackfillOptions {
         let mut to = None;
         let mut max = 1_000;
         let mut notify = false;
-        let mut index = 0;
-        while index < args.len() {
-            match args[index].as_str() {
-                "--from" | "--to" | "--max" => {
-                    let flag = args[index].as_str();
-                    let value = args
-                        .get(index + 1)
-                        .with_context(|| format!("{flag} needs a value"))?;
-                    match flag {
-                        "--from" => {
-                            validate_account_id(value)?;
-                            from = Some(value.clone());
-                        }
-                        "--to" => {
-                            validate_account_id(value)?;
-                            to = Some(value.clone());
-                        }
-                        "--max" => max = parse_positive_usize(value, "--max")?,
-                        _ => unreachable!(),
-                    }
-                    index += 2;
+        // Each flag takes its value in the same arm that matched it, so there is no second match on
+        // an already-decided flag and no arm that the first match has to promise cannot be reached.
+        let mut args = args.iter();
+        while let Some(flag) = args.next() {
+            let mut value = || args.next().with_context(|| format!("{flag} needs a value"));
+            match flag.as_str() {
+                "--from" => {
+                    let id = value()?;
+                    validate_account_id(id)?;
+                    from = Some(id.clone());
                 }
-                "--notify" => {
-                    notify = true;
-                    index += 1;
+                "--to" => {
+                    let id = value()?;
+                    validate_account_id(id)?;
+                    to = Some(id.clone());
                 }
+                "--max" => max = parse_positive_usize(value()?, "--max")?,
+                "--notify" => notify = true,
                 unknown => bail!("unknown backfill option: {unknown}"),
             }
         }
@@ -871,8 +863,18 @@ mod tests {
     }
 
     #[test]
-    fn account_ids_are_numeric() {
-        assert!(validate_account_id("123").is_ok());
-        assert!(validate_account_id("12/action").is_err());
+    fn backfill_rejects_malformed_options() {
+        let parse = |args: &[&str]| {
+            BackfillOptions::parse(&args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>())
+        };
+        assert!(parse(&["--from"]).is_err(), "--from without a value");
+        assert!(parse(&["--to", "10"]).is_err(), "--to without --from");
+        assert!(parse(&["--from", "abc"]).is_err(), "non-numeric ID");
+        assert!(parse(&["--from", "1", "--max", "0"]).is_err(), "--max 0");
+        assert!(parse(&["--wat"]).is_err(), "unknown flag");
+        // --notify takes no value, so it must not swallow the flag that follows it.
+        let options = parse(&["--notify", "--from", "10"]).unwrap();
+        assert!(options.notify);
+        assert_eq!(options.from, "10");
     }
 }
