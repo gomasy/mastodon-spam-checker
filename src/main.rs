@@ -104,16 +104,29 @@ fn usage() -> &'static str {
     "usage: mastodon-spam-checker [serve|dry-run|check-account <ID>|cursor|retry-failed [--max N]|backfill --from ID [--to ID] [--max N] [--notify]]"
 }
 
-#[derive(Clone)]
 struct CheckServices {
     mastodon: mastodon::MastodonClient,
     llm: llm::LlmClient,
     slack: Option<slack::SlackNotifier>,
+    /// Present for every run. Dry runs still read campaign context through it; `persist` is what
+    /// decides whether anything is written back.
     store: Option<StateStore>,
-    note_writer: Option<Arc<postgres::ModerationNoteWriter>>,
+    note_writer: Option<postgres::ModerationNoteWriter>,
     threshold: f64,
     persist: bool,
     retry_pending: bool,
+}
+
+impl CheckServices {
+    /// The state store, for the write paths that only run when `persist` is set.
+    ///
+    /// Every caller is already inside a `persist` branch, where the store is always present, so
+    /// this collapses what would otherwise be the same `Option` handling repeated at each one.
+    fn persist_store(&self) -> Result<&StateStore> {
+        self.store
+            .as_ref()
+            .context("persistent check has no state store")
+    }
 }
 
 #[derive(Debug)]
@@ -220,10 +233,10 @@ async fn build_services(
         None
     };
     let note_writer = match config.postgres {
-        Some(ref pg) if notify => Some(Arc::new(
+        Some(ref pg) if notify => Some(
             postgres::ModerationNoteWriter::connect(&pg.database_url, pg.moderator_account_id)
                 .await?,
-        )),
+        ),
         _ => None,
     };
     Ok(CheckServices {
@@ -243,12 +256,15 @@ async fn process_accounts(
     services: CheckServices,
     concurrency: usize,
 ) -> ProcessSummary {
+    // One shared handle rather than a per-account copy: cloning the struct duplicated every
+    // client's URLs, tokens, and model name for each of potentially thousands of accounts.
+    let services = Arc::new(services);
     let mut summary = ProcessSummary::default();
 
     for chunk in accounts.chunks(concurrency) {
         let mut tasks = tokio::task::JoinSet::new();
         for account in chunk.iter().cloned() {
-            let services = services.clone();
+            let services = Arc::clone(&services);
             tasks.spawn(async move {
                 let id = account.id.clone();
                 (id, check_one(account, services, false).await)
@@ -310,7 +326,7 @@ async fn process_accounts(
 
 async fn check_one(
     account: mastodon::AdminAccount,
-    services: CheckServices,
+    services: Arc<CheckServices>,
     force: bool,
 ) -> Result<AccountCheckOutcome> {
     let domain = account.domain.as_deref().unwrap_or("?");
@@ -320,10 +336,7 @@ async fn check_one(
     }
 
     if services.persist && !force {
-        let store = services
-            .store
-            .as_ref()
-            .context("persistent check has no state store")?;
+        let store = services.persist_store()?;
         if store.has_terminal_feedback(&account.id).await? {
             info!(account_id = %account.id, "account has terminal moderator feedback");
             return Ok(AccountCheckOutcome::Existing);
@@ -331,7 +344,7 @@ async fn check_one(
         if let Some(job) = store.get_job(&account.id).await? {
             if job.status == JobStatus::NotificationPending {
                 if services.retry_pending {
-                    return retry_pending_notification(account, services, job).await;
+                    return retry_pending_notification(account, &services, job).await;
                 }
                 warn!(account_id = %account.id, "notification delivery is uncertain; use retry-failed to retry explicitly");
                 return Ok(AccountCheckOutcome::Existing);
@@ -344,13 +357,10 @@ async fn check_one(
     }
 
     info!(username = %account.username, %domain, id = %account.id, "checking");
-    let mut job = None;
-    if services.persist {
-        job = Some(
+    let job = if services.persist {
+        Some(
             services
-                .store
-                .as_ref()
-                .context("persistent check has no state store")?
+                .persist_store()?
                 .begin_job(
                     &account.id,
                     &account.acct(),
@@ -358,11 +368,12 @@ async fn check_one(
                     llm::PROMPT_VERSION,
                 )
                 .await?,
-        );
-    }
+        )
+    } else {
+        None
+    };
 
-    let result = check_one_inner(&account, &services).await;
-    match result {
+    match check_one_inner(&account, &services).await {
         Ok(checked) => {
             if let (Some(store), Some(job)) = (&services.store, job) {
                 store
@@ -510,7 +521,7 @@ async fn check_one_inner(
 
 async fn retry_pending_notification(
     account: mastodon::AdminAccount,
-    services: CheckServices,
+    services: &CheckServices,
     job: JobRecord,
 ) -> Result<AccountCheckOutcome> {
     let stored = job
@@ -525,13 +536,10 @@ async fn retry_pending_notification(
     let campaign = CampaignContext {
         matching_accounts: job.campaign_accounts.clone(),
     };
-    let result = notify_with_claim(&services, &account, &verdict).await;
-    match result {
+    match notify_with_claim(services, &account, &verdict).await {
         Ok(notified) => {
             services
-                .store
-                .as_ref()
-                .context("pending notification retry has no state store")?
+                .persist_store()?
                 .complete_job(
                     job,
                     JobStatus::Spam,
@@ -561,10 +569,7 @@ async fn notify_with_claim(
     let Some(slack) = &services.slack else {
         return Ok(false);
     };
-    let store = services
-        .store
-        .as_ref()
-        .context("Slack notification has no state store")?;
+    let store = services.persist_store()?;
     let Some(token) = store.claim_notification(&account.id).await? else {
         if store.has_terminal_feedback(&account.id).await? {
             info!(account_id = %account.id, "notification suppressed by moderator feedback");
@@ -594,9 +599,7 @@ async fn persist_classification(
 ) -> Result<()> {
     if services.persist {
         services
-            .store
-            .as_ref()
-            .context("persistent check has no state store")?
+            .persist_store()?
             .record_classification(&account.id, status, stored_verdict(verdict), campaign)
             .await?;
     }
