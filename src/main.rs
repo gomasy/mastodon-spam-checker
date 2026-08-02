@@ -393,6 +393,12 @@ async fn check_one(
                     )
                     .await?;
             }
+            // After the job is completed, never before: see `add_spam_note`.
+            if checked.notified()
+                && let Some(verdict) = &checked.verdict
+            {
+                add_spam_note(&services, &account.id, verdict).await;
+            }
             Ok(checked.outcome)
         }
         Err(error) => {
@@ -452,9 +458,10 @@ async fn check_one_inner(
         Err(error) => return Err(error).context("LLM check failed"),
     };
 
+    // Neither of the two outcomes below owes anything to Slack, so nothing has to be written
+    // ahead of time: the caller completes the job with this verdict as the next step.
     let domain = account.domain.as_deref().unwrap_or("?");
     if !verdict.spam {
-        persist_classification(services, account, JobStatus::NotSpam, &verdict, &campaign).await?;
         info!(username = %account.username, %domain, "not spam");
         return Ok(CheckedAccount {
             outcome: AccountCheckOutcome::NotSpam,
@@ -465,7 +472,6 @@ async fn check_one_inner(
     }
 
     if verdict.confidence < services.threshold {
-        persist_classification(services, account, JobStatus::Spam, &verdict, &campaign).await?;
         info!(
             username = %account.username,
             %domain,
@@ -495,36 +501,29 @@ async fn check_one_inner(
 
 /// Notifies moderators about a spam verdict that cleared the threshold, and records it.
 ///
-/// The classification is written before the notification goes out, marked as pending whenever a
-/// notification is owed, so a crash mid-delivery leaves the account in the retry queue rather than
-/// looking finished.
+/// The classification is written as pending before the notification goes out, so a crash
+/// mid-delivery leaves the account in the retry queue rather than looking finished. With no Slack
+/// configured nothing is owed, and the caller's `complete_job` records the verdict on its own.
 async fn report_spam(
     account: &mastodon::AdminAccount,
     services: &CheckServices,
     verdict: llm::SpamVerdict,
     campaign: CampaignContext,
 ) -> Result<CheckedAccount> {
-    let pending_status = if services.slack.is_some() {
-        JobStatus::NotificationPending
-    } else {
-        JobStatus::Spam
-    };
-    persist_classification(services, account, pending_status, &verdict, &campaign).await?;
+    if services.slack.is_some() {
+        services
+            .persist_store()?
+            .record_classification(
+                &account.id,
+                JobStatus::NotificationPending,
+                stored_verdict(&verdict),
+                &campaign,
+            )
+            .await?;
+    }
 
     let notified = notify_with_claim(services, account, &verdict).await?;
-    if notified {
-        if let Some(writer) = &services.note_writer {
-            let note = t!(
-                "note_spam",
-                confidence = format!("{:.0}", verdict.confidence * 100.0),
-                reason = &verdict.reason,
-            );
-            // A missing note must not undo a delivered notification, so this is logged, not raised.
-            if let Err(error) = writer.add_note(&account.id, &note).await {
-                error!(error = %error, "failed to add moderation note");
-            }
-        }
-    } else {
+    if !notified {
         info!(account_id = %account.id, "notification disabled");
     }
 
@@ -565,6 +564,9 @@ async fn retry_pending_notification(
                     &campaign,
                 )
                 .await?;
+            if notified {
+                add_spam_note(services, &account.id, &verdict).await;
+            }
             Ok(AccountCheckOutcome::Spam { notified })
         }
         Err(error) => {
@@ -607,20 +609,24 @@ async fn notify_with_claim(
     result.map(|()| true)
 }
 
-async fn persist_classification(
-    services: &CheckServices,
-    account: &mastodon::AdminAccount,
-    status: JobStatus,
-    verdict: &llm::SpamVerdict,
-    campaign: &CampaignContext,
-) -> Result<()> {
-    if services.persist {
-        services
-            .persist_store()?
-            .record_classification(&account.id, status, stored_verdict(verdict), campaign)
-            .await?;
+/// Records a delivered spam verdict as a Mastodon moderation note, when one is configured.
+///
+/// Called only after the job has been completed: the notification this documents is already out,
+/// and a database timeout or process exit must not leave it pending for retry. For the same reason
+/// a failure here is logged rather than raised — a missing note must not undo a delivered
+/// notification.
+async fn add_spam_note(services: &CheckServices, account_id: &str, verdict: &llm::SpamVerdict) {
+    let Some(writer) = &services.note_writer else {
+        return;
+    };
+    let note = t!(
+        "note_spam",
+        confidence = format!("{:.0}", verdict.confidence * 100.0),
+        reason = &verdict.reason,
+    );
+    if let Err(error) = writer.add_note(account_id, &note).await {
+        error!(account_id = %account_id, error = %error, "failed to add moderation note");
     }
-    Ok(())
 }
 
 fn stored_verdict(verdict: &llm::SpamVerdict) -> StoredVerdict {
