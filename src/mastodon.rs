@@ -281,7 +281,9 @@ impl MastodonClient {
         info!(account_id = %account_id, "fetching statuses");
 
         let resp = http::send_with_retry_raw(
-            || self.client.get(&url).bearer_auth(&self.access_token),
+            // Keep this request anonymous. Supplying a user token expands the response to private
+            // statuses that user can see, while an admin-only token fails the endpoint's scope check.
+            || self.client.get(&url),
             "Statuses API",
             self.retry,
         )
