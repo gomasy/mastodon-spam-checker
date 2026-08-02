@@ -515,6 +515,9 @@ impl StateStore {
     /// cost four to five round trips per key, which dominated the time spent checking an account.
     /// The pipeline is deliberately not `atomic()` — these are independent per-key housekeeping
     /// commands, and wrapping them in MULTI/EXEC would only add contention.
+    ///
+    /// With `record` unset nothing is written at all, so a dry run reports the same matches
+    /// without leaving a trace.
     pub async fn campaign_context(
         &self,
         account_id: &str,
@@ -537,35 +540,8 @@ impl StateStore {
         }
 
         let now = now_timestamp();
-        let cutoff = now.saturating_sub(CAMPAIGN_WINDOW_SECS);
-        let mut pipeline = redis::pipe();
-        for key in &keys {
-            // Drop entries that fell out of the window before anything reads or caps the key.
-            pipeline
-                .cmd("ZREMRANGEBYSCORE")
-                .arg(key)
-                .arg("-inf")
-                .arg(cutoff)
-                .ignore();
-            if record {
-                pipeline
-                    .zadd(key, account_id, now)
-                    .ignore()
-                    .expire(key, CAMPAIGN_WINDOW_SECS as i64)
-                    .ignore()
-                    // Keep only the newest members, so one busy domain cannot grow without bound.
-                    .cmd("ZREMRANGEBYRANK")
-                    .arg(key)
-                    .arg(0)
-                    .arg(-(CAMPAIGN_MEMBERS_PER_SIGNAL + 1))
-                    .ignore();
-            }
-            // The only kept reply per key: newest members first.
-            pipeline.zrevrange(key, 0, CAMPAIGN_MATCHES_REPORTED as isize - 1);
-        }
-
         let mut conn = self.conn.clone();
-        let per_key: Vec<Vec<String>> = pipeline
+        let per_key: Vec<Vec<String>> = campaign_pipeline(&keys, account_id, now, record)
             .query_async(&mut conn)
             .await
             .context("failed to update and read campaign index")?;
@@ -588,6 +564,48 @@ impl StateStore {
             .await
             .context("failed to save account job to Redis")
     }
+}
+
+/// Builds the per-key campaign commands for [`StateStore::campaign_context`].
+///
+/// Exactly one reply is kept per key — the newest members still inside the window — so the caller
+/// can read the result back as one list per key regardless of `record`.
+fn campaign_pipeline(keys: &[String], account_id: &str, now: u64, record: bool) -> redis::Pipeline {
+    let cutoff = now.saturating_sub(CAMPAIGN_WINDOW_SECS);
+    let mut pipeline = redis::pipe();
+    for key in keys {
+        if record {
+            pipeline
+                // Drop entries that fell out of the window before the key is added to or capped.
+                .cmd("ZREMRANGEBYSCORE")
+                .arg(key)
+                .arg("-inf")
+                .arg(cutoff)
+                .ignore()
+                .zadd(key, account_id, now)
+                .ignore()
+                .expire(key, CAMPAIGN_WINDOW_SECS as i64)
+                .ignore()
+                // Keep only the newest members, so one busy domain cannot grow without bound.
+                .cmd("ZREMRANGEBYRANK")
+                .arg(key)
+                .arg(0)
+                .arg(-(CAMPAIGN_MEMBERS_PER_SIGNAL + 1))
+                .ignore();
+        }
+        // Selecting by score rather than by rank is what lets a dry run skip the trim above and
+        // stay purely read-only, without reporting accounts that have since aged out. The bound is
+        // exclusive, matching what the trim removes.
+        pipeline
+            .cmd("ZREVRANGEBYSCORE")
+            .arg(key)
+            .arg("+inf")
+            .arg(format!("({cutoff}"))
+            .arg("LIMIT")
+            .arg(0)
+            .arg(CAMPAIGN_MATCHES_REPORTED);
+    }
+    pipeline
 }
 
 fn parse_feedback(value: Option<&str>) -> Result<Option<FeedbackRecord>> {
@@ -682,6 +700,57 @@ mod tests {
         assert_eq!(kept.len(), CAMPAIGN_MATCHES_REPORTED);
         assert_eq!(kept[0], "2500");
         assert_eq!(kept[kept.len() - 1], "600");
+    }
+
+    /// A timestamp far enough past the epoch that the campaign window does not clamp to zero.
+    const CAMPAIGN_NOW: u64 = 1_800_000_000;
+
+    /// The arguments a campaign pipeline would send, one entry per RESP token.
+    fn campaign_tokens(record: bool) -> Vec<String> {
+        let packed =
+            campaign_pipeline(&["k".to_string()], "42", CAMPAIGN_NOW, record).get_packed_pipeline();
+        String::from_utf8_lossy(&packed)
+            .split("\r\n")
+            // Drop the array and bulk-string length prefixes, keeping the payload tokens.
+            .filter(|part| !part.is_empty() && !part.starts_with('*') && !part.starts_with('$'))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_dry_run_reads_the_campaign_index_without_writing_to_it() {
+        // `dry-run` promises to leave no trace, so the read must not depend on trimming the key
+        // first. One reply per key either way, so the caller parses the same shape.
+        let commands = |record| {
+            campaign_tokens(record)
+                .into_iter()
+                .filter(|token| token.chars().all(|ch| ch.is_ascii_uppercase()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(commands(false), ["ZREVRANGEBYSCORE", "LIMIT"]);
+        assert_eq!(
+            commands(true),
+            [
+                "ZREMRANGEBYSCORE",
+                "ZADD",
+                "EXPIRE",
+                "ZREMRANGEBYRANK",
+                "ZREVRANGEBYSCORE",
+                "LIMIT",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_campaign_window_bound_excludes_what_the_trim_removes() {
+        // ZREMRANGEBYSCORE's max is inclusive, so the read's min must be exclusive or a dry run
+        // would report an account the recording path had already dropped.
+        let cutoff = CAMPAIGN_NOW - CAMPAIGN_WINDOW_SECS;
+        let tokens = campaign_tokens(true);
+        assert!(tokens.contains(&cutoff.to_string()), "{tokens:?}");
+        assert!(tokens.contains(&format!("({cutoff}")), "{tokens:?}");
+        // The account is scored with the current time, so it lands inside its own window.
+        assert!(tokens.contains(&CAMPAIGN_NOW.to_string()), "{tokens:?}");
     }
 
     #[test]
