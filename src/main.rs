@@ -143,7 +143,14 @@ struct CheckedAccount {
     status: JobStatus,
     verdict: Option<llm::SpamVerdict>,
     campaign: CampaignContext,
-    notified: bool,
+}
+
+impl CheckedAccount {
+    /// Whether moderators were notified. Read back off the outcome rather than carried alongside
+    /// it, so the two cannot disagree about what happened.
+    fn notified(&self) -> bool {
+        matches!(self.outcome, AccountCheckOutcome::Spam { notified: true })
+    }
 }
 
 #[derive(Default)]
@@ -381,7 +388,7 @@ async fn check_one(
                         job,
                         checked.status,
                         checked.verdict.as_ref().map(stored_verdict),
-                        checked.notified,
+                        checked.notified(),
                         &checked.campaign,
                     )
                     .await?;
@@ -440,7 +447,6 @@ async fn check_one_inner(
                 status: JobStatus::Undetermined,
                 verdict: None,
                 campaign,
-                notified: false,
             });
         }
         Err(error) => return Err(error).context("LLM check failed"),
@@ -455,7 +461,6 @@ async fn check_one_inner(
             status: JobStatus::NotSpam,
             verdict: Some(verdict),
             campaign,
-            notified: false,
         });
     }
 
@@ -474,7 +479,6 @@ async fn check_one_inner(
             status: JobStatus::Spam,
             verdict: Some(verdict),
             campaign,
-            notified: false,
         });
     }
 
@@ -529,7 +533,6 @@ async fn report_spam(
         status: JobStatus::Spam,
         verdict: Some(verdict),
         campaign,
-        notified,
     })
 }
 
