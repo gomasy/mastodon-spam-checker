@@ -355,60 +355,70 @@ fn build_user_prompt(
         campaign.match_count()
     );
 
-    if statuses.is_empty() {
-        prompt.push_str("\n## Recent Posts\n(No posts found)\n");
-    } else {
-        prompt.push_str("\n## Recent Posts\n");
-        // Spend a shared character budget across the posts so a few very long ones cannot crowd out
-        // the rest of the prompt. A trailing ellipsis tells the model the text was cut.
-        let mut budget = POSTS_TOTAL_MAX_CHARS;
-        let mut remaining = statuses.iter();
-        for status in remaining.by_ref() {
-            let mut content_plain = html_to_plain(&status.content);
-            if !status.spoiler_text.is_empty() {
-                content_plain = format!(
-                    "CW: {} | {}",
-                    html_to_plain(&status.spoiler_text),
-                    content_plain
-                );
-            }
-            let descriptions = status
-                .media_attachments
-                .iter()
-                .filter_map(|media| media.description.as_deref())
-                .map(html_to_plain)
-                .collect::<Vec<_>>()
-                .join("; ");
-            if !descriptions.is_empty() {
-                content_plain.push_str(" | Media descriptions: ");
-                content_plain.push_str(&descriptions);
-            }
-            let post = truncate_chars(&content_plain, POST_MAX_CHARS.min(budget));
-            budget -= post.chars().count();
-            let language = status.language.as_deref().unwrap_or("unknown");
-            let created = if status.created_at.is_empty() {
-                "unknown"
-            } else {
-                &status.created_at
-            };
-            let source_url = status.url.as_deref().unwrap_or("unknown");
-            let _ = writeln!(
-                prompt,
-                "- [{created}; lang={language}; source={}] {post}",
-                truncate_chars(source_url, FIELD_MAX_CHARS)
-            );
-            if budget == 0 {
-                break;
-            }
-        }
-        // Whatever the loop did not reach; zero when the budget outlasted the posts.
-        let omitted = remaining.count();
-        if omitted > 0 {
-            let _ = writeln!(prompt, "({omitted} further post(s) omitted)");
-        }
-    }
+    append_recent_posts(&mut prompt, statuses);
 
     prompt
+}
+
+/// Appends the recent posts section, spending a shared character budget across the posts so a few
+/// very long ones cannot crowd out the rest of the prompt.
+fn append_recent_posts(prompt: &mut String, statuses: &[Status]) {
+    if statuses.is_empty() {
+        prompt.push_str("\n## Recent Posts\n(No posts found)\n");
+        return;
+    }
+
+    prompt.push_str("\n## Recent Posts\n");
+    let mut budget = POSTS_TOTAL_MAX_CHARS;
+    let mut remaining = statuses.iter();
+    for status in remaining.by_ref() {
+        // A trailing ellipsis tells the model the text was cut.
+        let post = truncate_chars(&post_text(status), POST_MAX_CHARS.min(budget));
+        budget -= post.chars().count();
+        let language = status.language.as_deref().unwrap_or("unknown");
+        let created = if status.created_at.is_empty() {
+            "unknown"
+        } else {
+            &status.created_at
+        };
+        let source_url = status.url.as_deref().unwrap_or("unknown");
+        let _ = writeln!(
+            prompt,
+            "- [{created}; lang={language}; source={}] {post}",
+            truncate_chars(source_url, FIELD_MAX_CHARS)
+        );
+        if budget == 0 {
+            break;
+        }
+    }
+    // Whatever the loop did not reach; zero when the budget outlasted the posts.
+    let omitted = remaining.count();
+    if omitted > 0 {
+        let _ = writeln!(prompt, "({omitted} further post(s) omitted)");
+    }
+}
+
+/// One post as plain text, with its content warning and media descriptions folded in.
+///
+/// The three parts share the post's character budget rather than each getting their own: a spam
+/// link is as likely to sit in an image description as in the post body.
+fn post_text(status: &Status) -> String {
+    let mut text = html_to_plain(&status.content);
+    if !status.spoiler_text.is_empty() {
+        text = format!("CW: {} | {}", html_to_plain(&status.spoiler_text), text);
+    }
+    let descriptions = status
+        .media_attachments
+        .iter()
+        .filter_map(|media| media.description.as_deref())
+        .map(html_to_plain)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if !descriptions.is_empty() {
+        text.push_str(" | Media descriptions: ");
+        text.push_str(&descriptions);
+    }
+    text
 }
 
 #[cfg(test)]
