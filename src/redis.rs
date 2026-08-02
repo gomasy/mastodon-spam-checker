@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use redis::AsyncCommands;
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::numeric_id_cmp;
@@ -111,14 +111,14 @@ impl CampaignContext {
 
 #[derive(Clone)]
 pub struct StateStore {
-    conn: MultiplexedConnection,
+    conn: ConnectionManager,
 }
 
 impl StateStore {
     pub async fn new(redis_url: &str) -> Result<Self> {
         let client = redis::Client::open(redis_url).context("failed to create Redis client")?;
         let conn = client
-            .get_multiplexed_async_connection()
+            .get_connection_manager()
             .await
             .context("failed to connect to Redis")?;
         Ok(Self { conn })
