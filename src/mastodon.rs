@@ -232,11 +232,9 @@ impl MastodonClient {
             suspended: Option<bool>,
         }
 
+        let url = self.admin_account_url(account_id);
         let resp = self
-            .send_retry(
-                || self.client.get(self.admin_account_url(account_id)),
-                "Admin account API",
-            )
+            .send_retry(|| self.client.get(&url), "Admin account API")
             .await?;
         let account: SuspensionState = resp
             .json()

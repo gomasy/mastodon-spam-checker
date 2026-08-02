@@ -296,6 +296,34 @@ impl ActionContext<'_> {
         self.blocks.retain(|block| block["type"] != "actions");
     }
 
+    /// Stops a destructive action on an account a moderator has already cleared.
+    ///
+    /// Returns the message to show, or `None` when the action may proceed. A message that is still
+    /// sitting in Slack keeps its buttons after the verdict was overturned, so both destructive
+    /// handlers re-check the feedback here rather than trusting the click. A check that cannot be
+    /// made is treated as a refusal: acting on an unknown verdict is what this guards against.
+    ///
+    /// `refused_key` names the locale string for a cleared account, `check_failed_key` the one for
+    /// an unreadable verdict; each handler passes its own wording for the action it aborted.
+    async fn refuse_if_cleared(
+        &mut self,
+        refused_key: &str,
+        check_failed_key: &str,
+    ) -> Option<String> {
+        match self.state.store.is_false_positive(&self.value.id).await {
+            Ok(false) => None,
+            Ok(true) => {
+                warn!(account_id = %self.value.id, refusal = refused_key, "refusing to act on an account marked as a false positive");
+                self.remove_actions();
+                Some(t!(refused_key, acct = self.safe_acct).to_string())
+            }
+            Err(e) => {
+                error!(account_id = %self.value.id, error = %e, "failed to check moderator feedback");
+                Some(failure_message(check_failed_key, self.safe_acct, &e))
+            }
+        }
+    }
+
     /// Records the moderation action taken. A state write that fails is logged rather than
     /// surfaced: the Mastodon side already happened, and the moderator needs to see that.
     async fn record_action(&self, status: JobStatus) {
@@ -349,17 +377,11 @@ async fn process_action(state: Arc<AppState>, interaction: Interaction, _guard: 
 }
 
 async fn handle_suspend(ctx: &mut ActionContext<'_>) -> String {
-    match ctx.state.store.is_false_positive(&ctx.value.id).await {
-        Ok(true) => {
-            warn!(account_id = %ctx.value.id, "refusing to suspend an account marked as a false positive");
-            ctx.remove_actions();
-            return t!("suspend_refused_false_positive", acct = ctx.safe_acct).to_string();
-        }
-        Err(e) => {
-            error!(account_id = %ctx.value.id, error = %e, "failed to check moderator feedback");
-            return failure_message("feedback_check_failed", ctx.safe_acct, &e);
-        }
-        Ok(false) => {}
+    if let Some(refusal) = ctx
+        .refuse_if_cleared("suspend_refused_false_positive", "feedback_check_failed")
+        .await
+    {
+        return refusal;
     }
 
     // If already suspended (e.g. via manual action or a button on another notification),
@@ -404,17 +426,14 @@ async fn handle_suspend(ctx: &mut ActionContext<'_>) -> String {
 /// message; verify server-side that the account is suspended before proceeding. This guards
 /// against a stale button being clicked after the suspension was manually lifted.
 async fn handle_delete(ctx: &mut ActionContext<'_>) -> String {
-    match ctx.state.store.is_false_positive(&ctx.value.id).await {
-        Ok(true) => {
-            warn!(account_id = %ctx.value.id, "refusing to delete an account marked as a false positive");
-            ctx.remove_actions();
-            return t!("delete_refused_false_positive", acct = ctx.safe_acct).to_string();
-        }
-        Err(e) => {
-            error!(account_id = %ctx.value.id, error = %e, "failed to check moderator feedback");
-            return failure_message("feedback_check_failed_delete", ctx.safe_acct, &e);
-        }
-        Ok(false) => {}
+    if let Some(refusal) = ctx
+        .refuse_if_cleared(
+            "delete_refused_false_positive",
+            "feedback_check_failed_delete",
+        )
+        .await
+    {
+        return refusal;
     }
 
     match ctx.state.mastodon.is_account_suspended(&ctx.value.id).await {
@@ -623,17 +642,23 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write;
+
     use super::*;
 
     fn sign(secret: &str, timestamp: &str, body: &[u8]) -> String {
         let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
         let mut base = format!("v0:{timestamp}:").into_bytes();
         base.extend_from_slice(body);
-        let hex: String = ring::hmac::sign(&key, &base)
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        // The inverse of hex_decode, which is what this exercises.
+        let hex =
+            ring::hmac::sign(&key, &base)
+                .as_ref()
+                .iter()
+                .fold(String::new(), |mut hex, byte| {
+                    let _ = write!(hex, "{byte:02x}");
+                    hex
+                });
         format!("v0={hex}")
     }
 
@@ -650,6 +675,31 @@ mod tests {
             .unwrap()
             .as_secs()
             .to_string()
+    }
+
+    #[test]
+    fn locale_keys_passed_as_variables_still_resolve() {
+        // These reach `t!` as variables rather than literals, so a typo compiles fine and renders
+        // the key name into Slack instead. Asserted through interpolation, which every locale
+        // shares, so this does not race the tests that switch locale.
+        for key in [
+            "feedback_confirmed",
+            "feedback_false_positive",
+            "suspend_refused_false_positive",
+            "delete_refused_false_positive",
+        ] {
+            let rendered = t!(key, user_id = "U1", acct = "alice@example.com").to_string();
+            assert!(rendered.contains("alice@example.com"), "{key}: {rendered}");
+        }
+        for key in [
+            "feedback_failed",
+            "feedback_check_failed",
+            "feedback_check_failed_delete",
+        ] {
+            let rendered = t!(key, acct = "alice@example.com", error = "boom").to_string();
+            assert!(rendered.contains("alice@example.com"), "{key}: {rendered}");
+            assert!(rendered.contains("boom"), "{key}: {rendered}");
+        }
     }
 
     #[test]
