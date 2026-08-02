@@ -1,9 +1,11 @@
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 use tracing::{error, info, warn};
+
+const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `created_at`/`updated_at` are bound as parameters rather than written with `NOW()`: Mastodon's
 /// columns are `timestamp without time zone` holding UTC, and Postgres would convert `now()` into
@@ -41,9 +43,13 @@ impl ModerationNoteWriter {
     }
 
     async fn open(database_url: &str) -> Result<Client> {
-        let (client, connection) = tokio_postgres::connect(database_url, NoTls)
-            .await
-            .context("failed to connect to PostgreSQL")?;
+        let (client, connection) = tokio::time::timeout(
+            DATABASE_TIMEOUT,
+            tokio_postgres::connect(database_url, NoTls),
+        )
+        .await
+        .context("timed out connecting to PostgreSQL")?
+        .context("failed to connect to PostgreSQL")?;
 
         tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -71,12 +77,26 @@ impl ModerationNoteWriter {
             }
         };
 
-        let result = client
-            .execute(
+        let Ok(result) = tokio::time::timeout(
+            DATABASE_TIMEOUT,
+            client.execute(
                 INSERT_NOTE,
                 &[&content, &self.moderator_account_id, &target_id, &now],
-            )
-            .await;
+            ),
+        )
+        .await
+        else {
+            // Dropping the query future does not stop PostgreSQL from executing it. Cancel it
+            // explicitly before discarding this client so lock waits cannot leak sessions.
+            match tokio::time::timeout(DATABASE_TIMEOUT, client.cancel_token().cancel_query(NoTls))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(%error, "failed to cancel timed-out moderation note"),
+                Err(_) => warn!("timed out cancelling moderation note"),
+            }
+            bail!("timed out inserting moderation note");
+        };
         // Keep the connection for the next note unless the query itself killed it. A connection that
         // dies mid-query costs this one note; the next call reconnects.
         if !client.is_closed() {
