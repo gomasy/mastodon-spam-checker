@@ -444,50 +444,60 @@ async fn handle_delete(ctx: &mut ActionContext<'_>) -> String {
 }
 
 async fn handle_confirm_spam(ctx: &mut ActionContext<'_>) -> String {
-    match ctx
-        .state
-        .store
-        .record_feedback(&ctx.value.id, JobStatus::ConfirmedSpam, ctx.user_id)
-        .await
-    {
-        Ok(()) => {
-            info!(account_id = %ctx.value.id, user_id = %ctx.user_id, "spam verdict confirmed");
-            // The suspend button stays: confirming the verdict does not act on the account.
-            remove_feedback_buttons(ctx.blocks);
-            t!(
-                "feedback_confirmed",
-                user_id = ctx.user_id,
-                acct = ctx.safe_acct
-            )
-            .to_string()
-        }
-        Err(e) => {
-            error!(account_id = %ctx.value.id, error = %e, "failed to record spam feedback");
-            failure_message("feedback_failed", ctx.safe_acct, &e)
-        }
-    }
+    apply_feedback(ctx, JobStatus::ConfirmedSpam, "feedback_confirmed", |ctx| {
+        // The suspend button stays: confirming the verdict does not act on the account.
+        remove_feedback_buttons(ctx.blocks);
+    })
+    .await
 }
 
 async fn handle_false_positive(ctx: &mut ActionContext<'_>) -> String {
+    apply_feedback(
+        ctx,
+        JobStatus::FalsePositive,
+        "feedback_false_positive",
+        |ctx| {
+            // Every button goes, including suspend: the account was cleared.
+            ctx.remove_actions();
+        },
+    )
+    .await
+}
+
+/// Records a moderator's verdict on a notification and reports what happened.
+///
+/// Unlike the suspend and delete buttons this touches no Mastodon state, so the whole action is
+/// the state write. `prune_buttons` drops the buttons the verdict has made meaningless — the two
+/// verdicts disagree about which those are, so each caller supplies its own.
+async fn apply_feedback(
+    ctx: &mut ActionContext<'_>,
+    status: JobStatus,
+    success_key: &str,
+    prune_buttons: impl FnOnce(&mut ActionContext<'_>),
+) -> String {
     match ctx
         .state
         .store
-        .record_feedback(&ctx.value.id, JobStatus::FalsePositive, ctx.user_id)
+        .record_feedback(&ctx.value.id, status, ctx.user_id)
         .await
     {
-        Ok(()) => {
-            info!(account_id = %ctx.value.id, user_id = %ctx.user_id, "false positive recorded");
-            // Every button goes, including suspend: the account was cleared.
-            ctx.remove_actions();
-            t!(
-                "feedback_false_positive",
-                user_id = ctx.user_id,
-                acct = ctx.safe_acct
-            )
-            .to_string()
+        Ok(replaced) => {
+            // Overturning an earlier verdict is allowed — correcting a mis-click is what these
+            // buttons are for — but it gets the louder line, as the only record that the account
+            // changed hands.
+            match replaced.filter(|replaced| *replaced != status) {
+                Some(replaced) => {
+                    warn!(account_id = %ctx.value.id, user_id = %ctx.user_id, verdict = status.as_str(), replaced = replaced.as_str(), "moderator feedback recorded, reversing an earlier verdict");
+                }
+                None => {
+                    info!(account_id = %ctx.value.id, user_id = %ctx.user_id, verdict = status.as_str(), "moderator feedback recorded");
+                }
+            }
+            prune_buttons(ctx);
+            t!(success_key, user_id = ctx.user_id, acct = ctx.safe_acct).to_string()
         }
         Err(e) => {
-            error!(account_id = %ctx.value.id, error = %e, "failed to record false-positive feedback");
+            error!(account_id = %ctx.value.id, error = %e, verdict = status.as_str(), "failed to record moderator feedback");
             failure_message("feedback_failed", ctx.safe_acct, &e)
         }
     }

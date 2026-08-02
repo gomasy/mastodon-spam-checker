@@ -337,12 +337,20 @@ impl StateStore {
             .context("failed to persist account failure")
     }
 
+    /// Records a moderator's verdict on an account, returning the verdict it replaced, if any.
+    ///
+    /// A later verdict overwrites an earlier one. Correcting a mis-click is exactly what these
+    /// buttons are for, and either order is reachable: confirming spam hides both feedback buttons
+    /// on that message, but an older notification for the same account still carries them. The
+    /// replaced verdict is handed back so the caller can log the reversal.
+    ///
+    /// The one refusal is a notification still being delivered, which would race the claim.
     pub async fn record_feedback(
         &self,
         account_id: &str,
         status: JobStatus,
         user_id: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<JobStatus>> {
         if self.get_job(account_id).await?.is_none() {
             bail!("no stored job for account {account_id}");
         }
@@ -353,12 +361,15 @@ impl StateStore {
         })
         .context("failed to serialize moderator feedback")?;
         let mut conn = self.conn.clone();
-        let saved = redis::Script::new(
-            "if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end \
+        // Nil while a notification is in flight; otherwise the replaced feedback, or an empty
+        // string when there was none.
+        let previous: Option<String> = redis::Script::new(
+            "if redis.call('EXISTS', KEYS[2]) == 1 then return nil end \
+             local existing = redis.call('GET', KEYS[1]) \
              redis.call('SET', KEYS[1], ARGV[1]) \
              redis.call('SREM', KEYS[3], ARGV[2]) \
              redis.call('SREM', KEYS[4], ARGV[2]) \
-             return 1",
+             return existing or ''",
         )
         .key(feedback_key(account_id))
         .key(notification_claim_key(account_id))
@@ -366,13 +377,19 @@ impl StateStore {
         .key(PENDING_NOTIFICATION_KEY)
         .arg(value)
         .arg(account_id)
-        .invoke_async::<i32>(&mut conn)
+        .invoke_async::<Option<String>>(&mut conn)
         .await
         .context("failed to save moderator feedback")?;
-        if saved == 0 {
+        let Some(previous) = previous else {
             bail!("notification delivery is in progress; retry feedback shortly");
-        }
-        Ok(())
+        };
+        // Empty means there was nothing to replace. A value that is present but no longer parses
+        // reads the same way rather than failing: the verdict the moderator just recorded is
+        // already written, and this return only feeds a log line.
+        Ok(parse_feedback(Some(previous.as_str()))
+            .ok()
+            .flatten()
+            .map(|feedback| feedback.status))
     }
 
     pub async fn claim_notification(&self, account_id: &str) -> Result<Option<String>> {
@@ -751,6 +768,29 @@ mod tests {
         assert!(tokens.contains(&format!("({cutoff}")), "{tokens:?}");
         // The account is scored with the current time, so it lands inside its own window.
         assert!(tokens.contains(&CAMPAIGN_NOW.to_string()), "{tokens:?}");
+    }
+
+    #[test]
+    fn the_verdict_a_moderator_replaced_is_reported_back() {
+        // `record_feedback` maps the script's reply through this: the empty string means there was
+        // nothing to replace, and a stored value that no longer parses must not fail the verdict
+        // that has already been written.
+        let replaced = |raw: &str| {
+            parse_feedback(Some(raw))
+                .ok()
+                .flatten()
+                .map(|feedback| feedback.status)
+        };
+        let stored = serde_json::to_string(&FeedbackRecord {
+            status: JobStatus::ConfirmedSpam,
+            user_id: "U1".to_string(),
+            updated_at: 1,
+        })
+        .unwrap();
+
+        assert_eq!(replaced(&stored), Some(JobStatus::ConfirmedSpam));
+        assert_eq!(replaced(""), None);
+        assert_eq!(replaced("{corrupt"), None);
     }
 
     #[test]
