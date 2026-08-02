@@ -191,16 +191,14 @@ async fn check(dry_run: bool) -> Result<()> {
     }
 
     let summary = process_accounts(accounts, services, config.check_concurrency).await;
-    if !dry_run {
-        if let Some(id) = &summary.last_contiguous_id {
-            store
-                .set_cursor(id)
-                .await
-                .context("failed to save cursor")?;
-            info!(cursor = %id, "cursor saved");
-        }
-    } else {
+    if dry_run {
         info!("dry-run: cursor and account jobs not updated");
+    } else if let Some(id) = &summary.last_contiguous_id {
+        store
+            .set_cursor(id)
+            .await
+            .context("failed to save cursor")?;
+        info!(cursor = %id, "cursor saved");
     }
 
     if let Some(error) = summary.first_failure {
@@ -216,17 +214,7 @@ async fn build_services(
     notify: bool,
 ) -> Result<CheckServices> {
     let detection = &config.detection;
-    let mastodon = mastodon::MastodonClient::new(
-        &detection.mastodon_base_url,
-        &detection.mastodon_access_token,
-    )?;
-    let llm = llm::LlmClient::new(
-        &detection.openai_api_base,
-        &detection.openai_api_key,
-        &detection.openai_model,
-        detection.openai_json_mode,
-        http::RetryConfig::default(),
-    )?;
+    let (mastodon, llm) = detection_clients(detection)?;
     let slack = if notify {
         Some(slack::SlackNotifier::new(
             config
@@ -256,6 +244,27 @@ async fn build_services(
         persist: notify,
         retry_pending: false,
     })
+}
+
+/// The two clients a spam check always needs, built from one detection config.
+///
+/// `check-account` builds them without the rest of [`CheckServices`], so the construction lives
+/// here rather than inline in [`build_services`].
+fn detection_clients(
+    detection: &config::DetectionConfig,
+) -> Result<(mastodon::MastodonClient, llm::LlmClient)> {
+    let mastodon = mastodon::MastodonClient::new(
+        &detection.mastodon_base_url,
+        &detection.mastodon_access_token,
+    )?;
+    let llm = llm::LlmClient::new(
+        &detection.openai_api_base,
+        &detection.openai_api_key,
+        &detection.openai_model,
+        detection.openai_json_mode,
+        http::RetryConfig::default(),
+    )?;
+    Ok((mastodon, llm))
 }
 
 async fn process_accounts(
@@ -642,18 +651,7 @@ async fn check_account_command(args: &[String]) -> Result<()> {
         bail!("usage: mastodon-spam-checker check-account <ID>");
     };
     validate_account_id(account_id)?;
-    let detection = config::DetectionConfig::from_env()?;
-    let mastodon = mastodon::MastodonClient::new(
-        &detection.mastodon_base_url,
-        &detection.mastodon_access_token,
-    )?;
-    let llm = llm::LlmClient::new(
-        &detection.openai_api_base,
-        &detection.openai_api_key,
-        &detection.openai_model,
-        detection.openai_json_mode,
-        http::RetryConfig::default(),
-    )?;
+    let (mastodon, llm) = detection_clients(&config::DetectionConfig::from_env()?)?;
     let account = mastodon.fetch_admin_account(account_id).await?;
     let statuses = mastodon.fetch_statuses(account_id).await?;
     let signals = signals::analyze(&account, &statuses);
