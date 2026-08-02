@@ -104,7 +104,24 @@ struct Choice {
 
 #[derive(Deserialize)]
 struct ResponseMessage {
-    content: String,
+    content: Option<String>,
+    #[serde(default)]
+    refusal: Option<String>,
+}
+
+fn response_content(response: &ChatResponse) -> Result<&str> {
+    let message = &response
+        .choices
+        .first()
+        .ok_or_else(|| UnparseableVerdict::new("response has no choices", ""))?
+        .message;
+    message.content.as_deref().ok_or_else(|| {
+        UnparseableVerdict::new(
+            "response has no text content",
+            message.refusal.as_deref().unwrap_or(""),
+        )
+        .into()
+    })
 }
 
 fn system_prompt() -> String {
@@ -214,26 +231,26 @@ impl LlmClient {
 
         let resp: ChatResponse = resp.json().await.context("failed to parse LLM response")?;
 
-        let content = &resp
-            .choices
-            .first()
-            .ok_or_else(|| UnparseableVerdict::new("response has no choices", ""))?
-            .message
-            .content;
-
-        let content = content
-            .trim()
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim();
-
-        parse_verdict(content)
+        parse_verdict(strip_code_fence(response_content(&resp)?))
     }
 
     pub fn model(&self) -> &str {
         &self.model
     }
+}
+
+/// Unwraps the markdown code fence models wrap JSON in despite being told not to.
+///
+/// The system prompt asks for bare JSON and `json_mode` enforces it where the endpoint supports
+/// it, but neither is guaranteed, and a fence is the one deviation common enough to absorb rather
+/// than fail the account over.
+fn strip_code_fence(content: &str) -> &str {
+    content
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
 }
 
 fn parse_verdict(content: &str) -> Result<SpamVerdict> {
@@ -473,6 +490,23 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn a_null_message_content_is_flagged_as_skippable() {
+        let response: ChatResponse = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "refusal": "blocked by content filter"
+                }
+            }]
+        }))
+        .unwrap();
+
+        let error = response_content(&response).unwrap_err();
+        assert!(is_unparseable_verdict(&error));
+        assert!(error.to_string().contains("blocked by content filter"));
+    }
+
     /// Builds a prompt the way [`LlmClient::check_spam`] does, deriving the signals from the input.
     fn prompt_for(account: &AdminAccount, statuses: &[Status]) -> String {
         let signals = crate::signals::analyze(account, statuses);
@@ -526,6 +560,16 @@ mod tests {
         assert!(prompt.contains("[unknown; lang=unknown; source=unknown] hello"));
         assert!(prompt.contains("[unknown; lang=unknown; source=unknown] world"));
         assert!(!prompt.contains("omitted"));
+    }
+
+    #[test]
+    fn fenced_json_is_unwrapped() {
+        let json = r#"{"spam":false,"reason":"ok","confidence":0.1}"#;
+        assert_eq!(strip_code_fence(&format!("```json\n{json}\n```")), json);
+        assert_eq!(strip_code_fence(&format!("```\n{json}\n```")), json);
+        // Bare JSON, which is what the prompt asks for, is passed through untouched.
+        assert_eq!(strip_code_fence(json), json);
+        assert!(parse_verdict(strip_code_fence(&format!("```json\n{json}\n```"))).is_ok());
     }
 
     #[test]
