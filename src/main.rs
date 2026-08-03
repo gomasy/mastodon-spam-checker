@@ -420,8 +420,12 @@ async fn check_one(
 
     match check_one_inner(&account, &services).await {
         Ok(checked) => {
-            if let (Some(store), Some(job)) = (&services.store, job) {
-                store
+            // Keyed off the job rather than off the store: a job exists only on a persistent run,
+            // where the store is guaranteed, so a missing store here is a bug to surface and not a
+            // reason to silently drop the result of a check that has already been paid for.
+            if let Some(job) = job {
+                services
+                    .persist_store()?
                     .complete_job(
                         job,
                         checked.status,
