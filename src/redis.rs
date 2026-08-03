@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, FromRedisValue, Pipeline, RedisError};
+use redis::{AsyncCommands, FromRedisValue, Pipeline, RedisError, RedisResult};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -125,7 +125,7 @@ impl StateStore {
         Ok(Self { conn })
     }
 
-    /// Reads a key, reissuing the GET once if the connection had gone away underneath it.
+    /// Runs a read, reissuing it once if the connection had gone away underneath it.
     ///
     /// [`ConnectionManager`] replaces a dropped connection in the background but still fails the
     /// command that discovered the dead socket. A server that sits idle between moderator clicks
@@ -135,33 +135,28 @@ impl StateStore {
     ///
     /// Reads only. A write that fails this way may still have reached Redis, and nothing in the
     /// error says whether it did, so re-sending one could apply it twice.
-    async fn read_key<T: FromRedisValue>(
+    async fn read<T: FromRedisValue>(
         &self,
-        key: impl redis::ToRedisArgs,
+        query: &impl RedisRead,
         what: &'static str,
     ) -> Result<T> {
-        let mut get = redis::cmd("GET");
-        get.arg(key);
         let mut conn = self.conn.clone();
-        match get.query_async(&mut conn).await {
+        match query.run(&mut conn).await {
             Err(e) if e.is_unrecoverable_error() => {
                 note_reconnect(&e, what);
-                get.query_async(&mut conn).await.context(what)
+                query.run(&mut conn).await.context(what)
             }
             result => result.context(what),
         }
     }
 
-    /// [`Self::read_key`] for a pipeline of reads; the same one retry, on the same terms.
-    async fn read_pipe<T: FromRedisValue>(&self, pipe: &Pipeline, what: &'static str) -> Result<T> {
-        let mut conn = self.conn.clone();
-        match pipe.query_async(&mut conn).await {
-            Err(e) if e.is_unrecoverable_error() => {
-                note_reconnect(&e, what);
-                pipe.query_async(&mut conn).await.context(what)
-            }
-            result => result.context(what),
-        }
+    /// [`Self::read`] for the single-key GET most callers want.
+    async fn read_key<T: FromRedisValue>(
+        &self,
+        key: impl redis::ToRedisArgs,
+        what: &'static str,
+    ) -> Result<T> {
+        self.read(redis::cmd("GET").arg(key), what).await
     }
 
     pub async fn get_cursor(&self) -> Result<Option<String>> {
@@ -478,7 +473,7 @@ impl StateStore {
             .smembers(FAILED_KEY)
             .smembers(PENDING_NOTIFICATION_KEY);
         let (mut ids, pending): (Vec<String>, Vec<String>) =
-            self.read_pipe(&queue, "failed to read retry queue").await?;
+            self.read(&queue, "failed to read retry queue").await?;
         ids.extend(pending);
         ids.sort_by(|a, b| numeric_id_cmp(a, b));
         ids.dedup();
@@ -490,7 +485,7 @@ impl StateStore {
             let mut state = redis::pipe();
             state.get(feedback_key(&id)).get(job_key(&id));
             let (feedback, job): (Option<String>, Option<String>) = self
-                .read_pipe(&state, "failed to read queued account state")
+                .read(&state, "failed to read queued account state")
                 .await?;
             if is_terminal_feedback(feedback.as_deref())? || is_completed_job(job.as_deref())? {
                 self.remove_failed(&id).await?;
@@ -661,9 +656,29 @@ fn campaign_pipeline(keys: &[String], account_id: &str, now: u64, record: bool) 
     pipeline
 }
 
-/// Reports the connection loss the read helpers are about to retry through.
+/// A read [`StateStore::read`] can reissue against a replacement connection.
 ///
-/// They guard on `is_unrecoverable_error`, the same condition [`ConnectionManager`] uses to decide
+/// `Cmd` and `Pipeline` carry the same `query_async`, but share no trait that names it, so the one
+/// retry would otherwise be written out once per shape of read.
+trait RedisRead {
+    async fn run<T: FromRedisValue>(&self, conn: &mut ConnectionManager) -> RedisResult<T>;
+}
+
+impl RedisRead for redis::Cmd {
+    async fn run<T: FromRedisValue>(&self, conn: &mut ConnectionManager) -> RedisResult<T> {
+        self.query_async(conn).await
+    }
+}
+
+impl RedisRead for Pipeline {
+    async fn run<T: FromRedisValue>(&self, conn: &mut ConnectionManager) -> RedisResult<T> {
+        self.query_async(conn).await
+    }
+}
+
+/// Reports the connection loss [`StateStore::read`] is about to retry through.
+///
+/// It guards on `is_unrecoverable_error`, the same condition [`ConnectionManager`] uses to decide
 /// the connection must be replaced — so it is exactly the set of failures a second attempt reaches
 /// a live socket for.
 fn note_reconnect(error: &RedisError, what: &'static str) {
