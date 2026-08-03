@@ -133,16 +133,53 @@ pub fn digest(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn links_in(html: &str) -> Vec<String> {
+        let mut links = BTreeSet::new();
+        collect_links(html, &mut links);
+        links.into_iter().collect()
+    }
+
     #[test]
     fn extracts_hidden_link_destinations() {
-        let mut links = BTreeSet::new();
-        collect_links(
-            r#"<p>click <a href="https://Spam.Example/path?a=1&amp;b=2">here</a></p>"#,
-            &mut links,
-        );
         assert_eq!(
-            links.into_iter().next().as_deref(),
-            Some("https://spam.example/path?a=1&b=2")
+            links_in(r#"<p>click <a href="https://Spam.Example/path?a=1&amp;b=2">here</a></p>"#),
+            ["https://spam.example/path?a=1&b=2"]
+        );
+    }
+
+    #[test]
+    fn federation_links_are_not_campaign_destinations() {
+        // Mastodon renders every mention and hashtag as a link. Counting them would make each
+        // instance a shared "destination domain" and match unrelated accounts as one campaign.
+        assert_eq!(
+            links_in(
+                r#"<a href="https://mstdn.example/@bob">@bob</a>
+                   <a href="https://mstdn.example/users/bob">bob</a>
+                   <a href="https://mstdn.example/tags/art">#art</a>
+                   <a href="https://shop.example/deal">deal</a>"#
+            ),
+            ["https://shop.example/deal"]
+        );
+    }
+
+    #[test]
+    fn a_fragment_does_not_split_one_destination_into_many() {
+        // Same page, different anchors: kept apart these would dilute a campaign's match count.
+        assert_eq!(
+            links_in(
+                r#"<a href="https://spam.example/x#a">1</a><a href="https://spam.example/x#b">2</a>"#
+            ),
+            ["https://spam.example/x"]
+        );
+    }
+
+    #[test]
+    fn bare_and_non_http_urls_are_handled() {
+        // Plain-text URLs are picked up with their surrounding punctuation trimmed, while schemes
+        // that cannot be a campaign destination are left out.
+        assert_eq!(
+            links_in("see (https://plain.example/a), javascript:alert(1) mailto:x@example.com"),
+            ["https://plain.example/a"]
         );
     }
 
