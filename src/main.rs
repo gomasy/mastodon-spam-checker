@@ -173,6 +173,29 @@ struct ProcessSummary {
     first_failure: Option<anyhow::Error>,
 }
 
+impl ProcessSummary {
+    /// Reports what the run did, then hands back the failure that stopped it, if any.
+    ///
+    /// The counts are logged before the error is returned rather than after a successful finish, so
+    /// a run that stopped part-way still says how far it got: how many accounts were already
+    /// notified is what tells an operator whether `retry-failed` has anything left to do.
+    fn finish(self, dry_run: bool) -> Result<()> {
+        info!(
+            spam_detected = self.spam_detected,
+            spam_notified = self.spam_notified,
+            undetermined = self.undetermined,
+            skipped_existing = self.skipped_existing,
+            dry_run,
+            failed = self.first_failure.is_some(),
+            "check finished"
+        );
+        match self.first_failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
 async fn check(dry_run: bool) -> Result<()> {
     let config = config::Config::from_env(!dry_run)?;
     info!(
@@ -211,11 +234,7 @@ async fn check(dry_run: bool) -> Result<()> {
         info!(cursor = %id, "cursor saved");
     }
 
-    if let Some(error) = summary.first_failure {
-        return Err(error);
-    }
-    log_summary(&summary, dry_run);
-    Ok(())
+    summary.finish(dry_run)
 }
 
 async fn build_services(
@@ -735,12 +754,9 @@ async fn retry_failed_command(args: &[String]) -> Result<()> {
         );
         return Ok(());
     }
-    let summary = process_accounts(accounts, services, config.check_concurrency).await;
-    if let Some(error) = summary.first_failure {
-        return Err(error);
-    }
-    log_summary(&summary, false);
-    Ok(())
+    process_accounts(accounts, services, config.check_concurrency)
+        .await
+        .finish(false)
 }
 
 async fn backfill_command(args: &[String]) -> Result<()> {
@@ -754,12 +770,9 @@ async fn backfill_command(args: &[String]) -> Result<()> {
         .mastodon
         .fetch_remote_accounts(Some(&options.from), options.to.as_deref(), options.max)
         .await?;
-    let summary = process_accounts(accounts, services, config.check_concurrency).await;
-    if let Some(error) = summary.first_failure {
-        return Err(error);
-    }
-    log_summary(&summary, false);
-    Ok(())
+    process_accounts(accounts, services, config.check_concurrency)
+        .await
+        .finish(false)
 }
 
 struct BackfillOptions {
@@ -817,17 +830,6 @@ fn parse_optional_max(args: &[String], default: usize) -> Result<usize> {
         [flag, value] if flag == "--max" => parse_positive_usize(value, "--max"),
         _ => bail!("usage: mastodon-spam-checker retry-failed [--max N]"),
     }
-}
-
-fn log_summary(summary: &ProcessSummary, dry_run: bool) {
-    info!(
-        spam_detected = summary.spam_detected,
-        spam_notified = summary.spam_notified,
-        undetermined = summary.undetermined,
-        skipped_existing = summary.skipped_existing,
-        dry_run,
-        "check finished"
-    );
 }
 
 const SYSTEM_USERNAMES: &[&str] = &["mastodon.internal", "internal.fetch", "system.actor"];
