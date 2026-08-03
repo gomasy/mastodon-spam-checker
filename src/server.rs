@@ -136,21 +136,28 @@ pub async fn run(config: ServeConfig) -> Result<()> {
         .with_context(|| format!("failed to bind to {}", config.listen_addr))?;
     info!(addr = %config.listen_addr, "Slack interaction server listening");
 
-    axum::serve(listener, app)
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
 
-    // Wait for in-flight suspend tasks to finish before exiting, so we don't terminate
-    // while Mastodon is suspended but the Slack message is not yet updated.
+    // Drained whichever way the server ended. A serve error is the case this most needs to cover:
+    // the actions still running are the ones that suspended an account without yet saying so in
+    // Slack, and returning early would drop them precisely when something has already gone wrong.
+    drain_in_flight(&state.in_flight).await;
+    served.context("Slack interaction server failed")
+}
+
+/// Waits out the actions still in progress, so the process does not exit between suspending an
+/// account in Mastodon and updating the Slack message that says it happened.
+async fn drain_in_flight(in_flight: &InFlight) {
     let deadline = Instant::now() + SHUTDOWN_GRACE;
-    while !state.in_flight.is_empty() {
+    while !in_flight.is_empty() {
         if Instant::now() >= deadline {
             warn!("shutting down with suspend tasks still in flight");
-            break;
+            return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Ok(())
 }
 
 async fn shutdown_signal() {
