@@ -304,19 +304,8 @@ impl StateStore {
         job.error = None;
         job.campaign_match_count = campaign.match_count() as u64;
         job.campaign_accounts = campaign.matching_accounts.clone();
-        let value = serde_json::to_string(&job).context("failed to serialize account job")?;
-        let mut conn = self.conn.clone();
-        redis::pipe()
-            .atomic()
-            .set(job_key(&job.account_id), value)
-            .ignore()
-            .srem(FAILED_KEY, &job.account_id)
-            .ignore()
-            .srem(PENDING_NOTIFICATION_KEY, &job.account_id)
-            .ignore()
-            .query_async::<()>(&mut conn)
+        self.write_job(&job, Retry::Clear, "failed to complete account job")
             .await
-            .context("failed to complete account job")
     }
 
     pub async fn record_classification(
@@ -336,9 +325,11 @@ impl StateStore {
         job.error = None;
         job.campaign_match_count = campaign.match_count() as u64;
         job.campaign_accounts = campaign.matching_accounts.clone();
-        let value = serde_json::to_string(&job).context("failed to serialize account job")?;
         let mut pipeline = redis::pipe();
-        pipeline.atomic().set(job_key(account_id), value).ignore();
+        pipeline
+            .atomic()
+            .set(job_key(account_id), serialize_job(&job)?)
+            .ignore();
         if job.status == JobStatus::NotificationPending {
             pipeline.sadd(PENDING_NOTIFICATION_KEY, account_id).ignore();
         }
@@ -358,19 +349,8 @@ impl StateStore {
         job.status = JobStatus::Failed;
         job.updated_at = now_timestamp();
         job.error = Some(format!("{error:#}"));
-        let value = serde_json::to_string(&job).context("failed to serialize account job")?;
-        let mut conn = self.conn.clone();
-        redis::pipe()
-            .atomic()
-            .set(job_key(&job.account_id), value)
-            .ignore()
-            .sadd(FAILED_KEY, &job.account_id)
-            .ignore()
-            .srem(PENDING_NOTIFICATION_KEY, &job.account_id)
-            .ignore()
-            .query_async::<()>(&mut conn)
+        self.write_job(&job, Retry::Queue, "failed to persist account failure")
             .await
-            .context("failed to persist account failure")
     }
 
     /// Records a moderator's verdict on an account, returning the verdict it replaced, if any.
@@ -531,19 +511,8 @@ impl StateStore {
         job.status = JobStatus::Unavailable;
         job.updated_at = now_timestamp();
         job.error = Some("account no longer exists in Mastodon".to_string());
-        let value = serde_json::to_string(&job).context("failed to serialize account job")?;
-        let mut conn = self.conn.clone();
-        redis::pipe()
-            .atomic()
-            .set(job_key(account_id), value)
-            .ignore()
-            .srem(FAILED_KEY, account_id)
-            .ignore()
-            .srem(PENDING_NOTIFICATION_KEY, account_id)
-            .ignore()
-            .query_async::<()>(&mut conn)
+        self.write_job(&job, Retry::Clear, "failed to mark unavailable account")
             .await
-            .context("failed to mark unavailable account")
     }
 
     async fn remove_failed(&self, account_id: &str) -> Result<()> {
@@ -610,12 +579,44 @@ impl StateStore {
     }
 
     async fn save_job(&self, job: &JobRecord) -> Result<()> {
-        let value = serde_json::to_string(job).context("failed to serialize account job")?;
         let mut conn = self.conn.clone();
-        conn.set::<_, _, ()>(job_key(&job.account_id), value)
+        conn.set::<_, _, ()>(job_key(&job.account_id), serialize_job(job)?)
             .await
             .context("failed to save account job to Redis")
     }
+
+    /// Persists a job that has reached an outcome, and moves the account in or out of the retry
+    /// queue to match, in one transaction.
+    ///
+    /// Splitting the two would let a crash in between leave a completed account queued for retry,
+    /// or a failed one with nothing to pick it up. The pending-notification set is cleared either
+    /// way: the delivery it tracked is no longer in doubt once the job says what happened.
+    async fn write_job(&self, job: &JobRecord, retry: Retry, what: &'static str) -> Result<()> {
+        let value = serialize_job(job)?;
+        let account_id = &job.account_id;
+        let mut pipeline = redis::pipe();
+        pipeline.atomic().set(job_key(account_id), value).ignore();
+        match retry {
+            Retry::Queue => pipeline.sadd(FAILED_KEY, account_id).ignore(),
+            Retry::Clear => pipeline.srem(FAILED_KEY, account_id).ignore(),
+        };
+        pipeline.srem(PENDING_NOTIFICATION_KEY, account_id).ignore();
+        let mut conn = self.conn.clone();
+        pipeline.query_async::<()>(&mut conn).await.context(what)
+    }
+}
+
+/// What [`StateStore::write_job`] does with the account's place in the retry queue.
+#[derive(Clone, Copy)]
+enum Retry {
+    /// The check failed; `retry-failed` should pick the account up again.
+    Queue,
+    /// The account reached a terminal status and has nothing left to retry.
+    Clear,
+}
+
+fn serialize_job(job: &JobRecord) -> Result<String> {
+    serde_json::to_string(job).context("failed to serialize account job")
 }
 
 /// Builds the per-key campaign commands for [`StateStore::campaign_context`].
