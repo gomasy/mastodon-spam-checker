@@ -539,9 +539,13 @@ fn replace_buttons_with_delete(blocks: &mut Vec<Value>, value_json: &str, safe_a
 }
 
 fn remove_feedback_buttons(blocks: &mut Vec<Value>) {
-    for block in blocks {
-        let Some(elements) = block["elements"].as_array_mut() else {
-            continue;
+    blocks.retain_mut(|block| {
+        let is_actions = block["type"] == "actions";
+        // Look the key up rather than indexing: indexing a Value mutably *inserts* a null at a
+        // missing key, so `block["elements"]` would grow an `"elements": null` on the section
+        // block carrying the notification, and Slack rejects the whole update as invalid_blocks.
+        let Some(elements) = block.get_mut("elements").and_then(Value::as_array_mut) else {
+            return true;
         };
         elements.retain(|element| {
             !matches!(
@@ -549,7 +553,10 @@ fn remove_feedback_buttons(blocks: &mut Vec<Value>) {
                 Some(CONFIRM_SPAM_ACTION_ID | FALSE_POSITIVE_ACTION_ID)
             )
         });
-    }
+        // Slack rejects a button-less actions block just as firmly, and just as silently — the
+        // moderator sees the click do nothing — so an emptied one goes rather than stays.
+        !is_actions || !elements.is_empty()
+    });
 }
 
 fn context_block(text: &str) -> Value {
@@ -868,6 +875,46 @@ mod tests {
             in_flight.is_empty(),
             "a panicking handler leaked its claim, permanently deadening the account's buttons"
         );
+    }
+
+    #[test]
+    fn removing_feedback_buttons_leaves_the_other_blocks_untouched() {
+        // Slack rejects the whole update with invalid_blocks if a section grows an "elements"
+        // key, which mutable indexing would have inserted while looking for buttons to drop.
+        let section = json!({ "type": "section", "text": { "type": "mrkdwn", "text": "spam" } });
+        let mut blocks = vec![
+            section.clone(),
+            json!({
+                "type": "actions",
+                "elements": [
+                    { "action_id": SUSPEND_ACTION_ID },
+                    { "action_id": CONFIRM_SPAM_ACTION_ID },
+                    { "action_id": FALSE_POSITIVE_ACTION_ID },
+                ]
+            }),
+        ];
+        remove_feedback_buttons(&mut blocks);
+
+        assert_eq!(blocks[0], section);
+        assert_eq!(
+            blocks[1]["elements"],
+            json!([{ "action_id": SUSPEND_ACTION_ID }])
+        );
+    }
+
+    #[test]
+    fn an_actions_block_left_without_buttons_is_dropped() {
+        // Slack rejects an empty actions block too, and the rejection is silent.
+        let mut blocks = vec![
+            json!({ "type": "section" }),
+            json!({
+                "type": "actions",
+                "elements": [{ "action_id": CONFIRM_SPAM_ACTION_ID }]
+            }),
+        ];
+        remove_feedback_buttons(&mut blocks);
+
+        assert_eq!(blocks, vec![json!({ "type": "section" })]);
     }
 
     #[test]
