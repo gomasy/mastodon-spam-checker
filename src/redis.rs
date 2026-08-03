@@ -2,9 +2,10 @@ use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
+use redis::{AsyncCommands, FromRedisValue, Pipeline, RedisError};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::ids::numeric_id_cmp;
 use crate::signals::digest;
@@ -124,11 +125,48 @@ impl StateStore {
         Ok(Self { conn })
     }
 
-    pub async fn get_cursor(&self) -> Result<Option<String>> {
+    /// Reads a key, reissuing the GET once if the connection had gone away underneath it.
+    ///
+    /// [`ConnectionManager`] replaces a dropped connection in the background but still fails the
+    /// command that discovered the dead socket. A server that sits idle between moderator clicks
+    /// hits this on the first click after the socket goes — the click fails with nothing the
+    /// moderator can act on, and the same click works seconds later. The reissue runs against the
+    /// replacement, which the manager has already swapped in by the time the error surfaces.
+    ///
+    /// Reads only. A write that fails this way may still have reached Redis, and nothing in the
+    /// error says whether it did, so re-sending one could apply it twice.
+    async fn read_key<T: FromRedisValue>(
+        &self,
+        key: impl redis::ToRedisArgs,
+        what: &'static str,
+    ) -> Result<T> {
+        let mut get = redis::cmd("GET");
+        get.arg(key);
         let mut conn = self.conn.clone();
-        conn.get(CURSOR_KEY)
+        match get.query_async(&mut conn).await {
+            Err(e) if e.is_unrecoverable_error() => {
+                note_reconnect(&e, what);
+                get.query_async(&mut conn).await.context(what)
+            }
+            result => result.context(what),
+        }
+    }
+
+    /// [`Self::read_key`] for a pipeline of reads; the same one retry, on the same terms.
+    async fn read_pipe<T: FromRedisValue>(&self, pipe: &Pipeline, what: &'static str) -> Result<T> {
+        let mut conn = self.conn.clone();
+        match pipe.query_async(&mut conn).await {
+            Err(e) if e.is_unrecoverable_error() => {
+                note_reconnect(&e, what);
+                pipe.query_async(&mut conn).await.context(what)
+            }
+            result => result.context(what),
+        }
+    }
+
+    pub async fn get_cursor(&self) -> Result<Option<String>> {
+        self.read_key(CURSOR_KEY, "failed to read cursor from Redis")
             .await
-            .context("failed to read cursor from Redis")
     }
 
     pub async fn set_cursor(&self, account_id: &str) -> Result<()> {
@@ -216,11 +254,9 @@ impl StateStore {
     }
 
     pub async fn get_job(&self, account_id: &str) -> Result<Option<JobRecord>> {
-        let mut conn = self.conn.clone();
-        let value: Option<String> = conn
-            .get(job_key(account_id))
-            .await
-            .context("failed to read account job from Redis")?;
+        let value: Option<String> = self
+            .read_key(job_key(account_id), "failed to read account job from Redis")
+            .await?;
         parse_job(value.as_deref())
     }
 
@@ -447,22 +483,22 @@ impl StateStore {
     }
 
     async fn feedback_status(&self, account_id: &str) -> Result<Option<JobStatus>> {
-        let mut conn = self.conn.clone();
-        let value: Option<String> = conn
-            .get(feedback_key(account_id))
-            .await
-            .context("failed to read moderator feedback")?;
+        let value: Option<String> = self
+            .read_key(
+                feedback_key(account_id),
+                "failed to read moderator feedback",
+            )
+            .await?;
         Ok(parse_feedback(value.as_deref())?.map(|feedback| feedback.status))
     }
 
     pub async fn failed_ids(&self, limit: usize) -> Result<Vec<String>> {
-        let mut conn = self.conn.clone();
-        let (mut ids, pending): (Vec<String>, Vec<String>) = redis::pipe()
+        let mut queue = redis::pipe();
+        queue
             .smembers(FAILED_KEY)
-            .smembers(PENDING_NOTIFICATION_KEY)
-            .query_async(&mut conn)
-            .await
-            .context("failed to read retry queue")?;
+            .smembers(PENDING_NOTIFICATION_KEY);
+        let (mut ids, pending): (Vec<String>, Vec<String>) =
+            self.read_pipe(&queue, "failed to read retry queue").await?;
         ids.extend(pending);
         ids.sort_by(|a, b| numeric_id_cmp(a, b));
         ids.dedup();
@@ -471,12 +507,11 @@ impl StateStore {
         for id in ids {
             // Both keys in one round trip: the queue can hold thousands of IDs, and this walks it
             // until `limit` live ones are found.
-            let (feedback, job): (Option<String>, Option<String>) = redis::pipe()
-                .get(feedback_key(&id))
-                .get(job_key(&id))
-                .query_async(&mut conn)
-                .await
-                .context("failed to read queued account state")?;
+            let mut state = redis::pipe();
+            state.get(feedback_key(&id)).get(job_key(&id));
+            let (feedback, job): (Option<String>, Option<String>) = self
+                .read_pipe(&state, "failed to read queued account state")
+                .await?;
             if is_terminal_feedback(feedback.as_deref())? || is_completed_job(job.as_deref())? {
                 self.remove_failed(&id).await?;
                 continue;
@@ -623,6 +658,15 @@ fn campaign_pipeline(keys: &[String], account_id: &str, now: u64, record: bool) 
             .arg(CAMPAIGN_MATCHES_REPORTED);
     }
     pipeline
+}
+
+/// Reports the connection loss the read helpers are about to retry through.
+///
+/// They guard on `is_unrecoverable_error`, the same condition [`ConnectionManager`] uses to decide
+/// the connection must be replaced — so it is exactly the set of failures a second attempt reaches
+/// a live socket for.
+fn note_reconnect(error: &RedisError, what: &'static str) {
+    warn!(error = %error, read = what, "Redis connection was replaced, retrying the read once");
 }
 
 fn parse_feedback(value: Option<&str>) -> Result<Option<FeedbackRecord>> {
