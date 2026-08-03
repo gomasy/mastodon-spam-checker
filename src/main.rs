@@ -82,7 +82,7 @@ async fn exclusive_run(operation: impl Future<Output = Result<()>>) -> Result<()
         if result.is_ok() {
             return Err(error);
         }
-        error!(error = %error, "failed to release run lease");
+        error!(error = %chain(&error), "failed to release run lease");
     }
     result
 }
@@ -98,6 +98,16 @@ fn init_logging() {
         .with(tracing_subscriber::fmt::layer())
         .with(filter)
         .init();
+}
+
+/// Renders an error together with the causes its context wraps.
+///
+/// `anyhow`'s plain `Display` — what `%error` in a log line reaches for — prints only the
+/// outermost context, so a failure arrives as "failed to read account job from Redis" with the
+/// Redis error that actually explains it dropped. Every logged failure goes through this instead.
+/// The errors that reach `main` need no help: returning them prints the chain already.
+pub fn chain(error: &anyhow::Error) -> String {
+    format!("{error:#}")
 }
 
 fn usage() -> &'static str {
@@ -414,7 +424,7 @@ async fn check_one(
             if let (Some(store), Some(job)) = (&services.store, job)
                 && let Err(store_error) = store.fail_job(job, &error).await
             {
-                error!(error = %store_error, "failed to persist account failure");
+                error!(error = %chain(&store_error), "failed to persist account failure");
             }
             Err(error)
         }
@@ -582,7 +592,7 @@ async fn retry_pending_notification(
             if let Some(store) = &services.store
                 && let Err(store_error) = store.fail_job(job, &error).await
             {
-                error!(error = %store_error, "failed to persist notification retry failure");
+                error!(error = %chain(&store_error), "failed to persist notification retry failure");
             }
             Err(error)
         }
@@ -613,7 +623,7 @@ async fn notify_with_claim(
         .await
         .context("failed to send Slack notification");
     if let Err(error) = store.release_notification_claim(&account.id, &token).await {
-        error!(account_id = %account.id, error = %error, "failed to release notification claim");
+        error!(account_id = %account.id, error = %chain(&error), "failed to release notification claim");
     }
     result.map(|()| true)
 }
@@ -634,7 +644,7 @@ async fn add_spam_note(services: &CheckServices, account_id: &str, verdict: &llm
         reason = &verdict.reason,
     );
     if let Err(error) = writer.add_note(account_id, &note).await {
-        error!(account_id = %account_id, error = %error, "failed to add moderation note");
+        error!(account_id = %account_id, error = %chain(&error), "failed to add moderation note");
     }
 }
 
@@ -707,7 +717,7 @@ async fn retry_failed_command(args: &[String]) -> Result<()> {
                 unavailable += 1;
             }
             Err(error) => {
-                warn!(account_id = %id, error = %error, "failed to fetch queued account, leaving it queued");
+                warn!(account_id = %id, error = %chain(&error), "failed to fetch queued account, leaving it queued");
                 fetch_failures += 1;
             }
         }

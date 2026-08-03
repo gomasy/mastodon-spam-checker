@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 
 use rust_i18n::t;
 
+use crate::chain;
 use crate::config::ServeConfig;
 use crate::ids::is_numeric_id;
 use crate::mastodon::MastodonClient;
@@ -175,7 +176,7 @@ async fn handle_interaction(
     body: Bytes,
 ) -> StatusCode {
     if let Err(e) = verify_signature(&state.signing_secret, &headers, &body) {
-        warn!(error = %e, "signature verification failed, rejecting request");
+        warn!(error = %chain(&e), "signature verification failed, rejecting request");
         return StatusCode::UNAUTHORIZED;
     }
 
@@ -184,7 +185,7 @@ async fn handle_interaction(
         // Acknowledge and ignore unrecognised events or buttons.
         Ok(None) => return StatusCode::OK,
         Err(e) => {
-            warn!(error = %e, "invalid interaction payload");
+            warn!(error = %chain(&e), "invalid interaction payload");
             return StatusCode::BAD_REQUEST;
         }
     };
@@ -318,7 +319,7 @@ impl ActionContext<'_> {
                 Some(t!(refused_key, acct = self.safe_acct).to_string())
             }
             Err(e) => {
-                error!(account_id = %self.value.id, error = %e, "failed to check moderator feedback");
+                error!(account_id = %self.value.id, error = %chain(&e), "failed to check moderator feedback");
                 Some(failure_message(check_failed_key, self.safe_acct, &e))
             }
         }
@@ -328,7 +329,7 @@ impl ActionContext<'_> {
     /// surfaced: the Mastodon side already happened, and the moderator needs to see that.
     async fn record_action(&self, status: JobStatus) {
         if let Err(e) = self.state.store.record_action(&self.value.id, status).await {
-            error!(account_id = %self.value.id, error = %e, status = status.as_str(), "failed to record moderation action");
+            error!(account_id = %self.value.id, error = %chain(&e), status = status.as_str(), "failed to record moderation action");
         }
     }
 }
@@ -390,7 +391,7 @@ async fn handle_suspend(ctx: &mut ActionContext<'_>) -> String {
     let already_suspended = match ctx.state.mastodon.is_account_suspended(&ctx.value.id).await {
         Ok(suspended) => suspended,
         Err(e) => {
-            warn!(account_id = %ctx.value.id, error = %e, "failed to check suspension state, proceeding to suspend");
+            warn!(account_id = %ctx.value.id, error = %chain(&e), "failed to check suspension state, proceeding to suspend");
             false
         }
     };
@@ -410,13 +411,13 @@ async fn handle_suspend(ctx: &mut ActionContext<'_>) -> String {
             if let Some(writer) = &ctx.state.note_writer {
                 let note = t!("note_suspended", user_id = ctx.user_id);
                 if let Err(e) = writer.add_note(&ctx.value.id, &note).await {
-                    error!(error = %e, "failed to add moderation note");
+                    error!(error = %chain(&e), "failed to add moderation note");
                 }
             }
             t!("suspended", user_id = ctx.user_id, acct = ctx.safe_acct).to_string()
         }
         Err(e) => {
-            error!(account_id = %ctx.value.id, error = %e, "failed to suspend account");
+            error!(account_id = %ctx.value.id, error = %chain(&e), "failed to suspend account");
             failure_message("suspend_failed", ctx.safe_acct, &e)
         }
     }
@@ -442,7 +443,7 @@ async fn handle_delete(ctx: &mut ActionContext<'_>) -> String {
             return t!("not_suspended", acct = ctx.safe_acct).to_string();
         }
         Err(e) => {
-            error!(account_id = %ctx.value.id, error = %e, "failed to check suspension state, aborting delete");
+            error!(account_id = %ctx.value.id, error = %chain(&e), "failed to check suspension state, aborting delete");
             return failure_message("check_failed", ctx.safe_acct, &e);
         }
         Ok(true) => {}
@@ -456,7 +457,7 @@ async fn handle_delete(ctx: &mut ActionContext<'_>) -> String {
             t!("deleted", user_id = ctx.user_id, acct = ctx.safe_acct).to_string()
         }
         Err(e) => {
-            error!(account_id = %ctx.value.id, error = %e, "failed to delete account");
+            error!(account_id = %ctx.value.id, error = %chain(&e), "failed to delete account");
             failure_message("delete_failed", ctx.safe_acct, &e)
         }
     }
@@ -516,7 +517,7 @@ async fn apply_feedback(
             t!(success_key, user_id = ctx.user_id, acct = ctx.safe_acct).to_string()
         }
         Err(e) => {
-            error!(account_id = %ctx.value.id, error = %e, verdict = status.as_str(), "failed to record moderator feedback");
+            error!(account_id = %ctx.value.id, error = %chain(&e), verdict = status.as_str(), "failed to record moderator feedback");
             failure_message("feedback_failed", ctx.safe_acct, &e)
         }
     }
@@ -528,7 +529,7 @@ fn failure_message(key: &str, safe_acct: &str, error: &anyhow::Error) -> String 
     t!(
         key,
         acct = safe_acct,
-        error = sanitize_mrkdwn(&error.to_string())
+        error = sanitize_mrkdwn(&chain(error))
     )
     .to_string()
 }
