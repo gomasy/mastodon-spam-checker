@@ -1,0 +1,4 @@
+# A failing test reports itself by panicking, so the unwrap_used / expect_used
+# gate declared in Cargo.toml applies to production code only.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

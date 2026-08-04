@@ -25,6 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # --all-targets so the tests are linted too; they are exempt from the
+      # unwrap/expect gate through clippy.toml rather than by going unchecked.
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
