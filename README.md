@@ -12,7 +12,9 @@ companion server (`serve` mode).
 Designed to run periodically (e.g. via cron or a systemd timer): each run
 picks up where the previous one left off. Redis stores both the cursor and a
 durable per-account record containing verdicts, attempts, campaign matches,
-moderator feedback, and failures.
+moderator feedback, and failures. Completed account records and moderation
+action logs expire after 90 days; unresolved retries, moderator feedback, and
+the resume cursor remain durable.
 
 ## How it works
 
@@ -36,6 +38,8 @@ moderator feedback, and failures.
    as spam. Notifications include the local moderation page, feedback actions,
    and a suspend button.
 7. Saves the last contiguous successfully processed account ID as the cursor.
+8. Redis automatically removes completed account records after 90 days. The
+   first normal run after upgrading applies the same policy to existing records.
 
 Transient HTTP failures (timeouts, connection errors, 429 and 5xx) are retried
 with exponential backoff against Mastodon, the LLM, and the Slack webhook. If a

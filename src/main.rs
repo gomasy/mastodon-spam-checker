@@ -207,6 +207,12 @@ async fn check(dry_run: bool) -> Result<()> {
     );
 
     let store = StateStore::new(&config.redis_url).await?;
+    if !dry_run {
+        let retention_applied = store.cleanup_expired_records().await?;
+        if retention_applied > 0 {
+            info!(retention_applied, "applied Redis state retention");
+        }
+    }
     let cursor = store.get_cursor().await?;
     info!(
         cursor = cursor.as_deref().unwrap_or("(none)"),
