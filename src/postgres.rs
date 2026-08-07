@@ -5,7 +5,22 @@ use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 use tracing::{error, info, warn};
 
+use crate::config::PostgresConfig;
+
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connects a note writer when moderation notes are configured, and nothing otherwise.
+///
+/// Both the checker and `serve` mode decide the same way from the same optional config, so the
+/// `Option` is unwrapped here rather than at each of them.
+pub async fn writer_for(config: Option<&PostgresConfig>) -> Result<Option<ModerationNoteWriter>> {
+    match config {
+        Some(pg) => ModerationNoteWriter::connect(&pg.database_url, pg.moderator_account_id)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
 
 /// `created_at`/`updated_at` are bound as parameters rather than written with `NOW()`: Mastodon's
 /// columns are `timestamp without time zone` holding UTC, and Postgres would convert `now()` into

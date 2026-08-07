@@ -20,6 +20,7 @@ use crate::chain;
 use crate::config::ServeConfig;
 use crate::ids::is_numeric_id;
 use crate::mastodon::MastodonClient;
+use crate::postgres::{self, ModerationNoteWriter};
 use crate::redis::{JobStatus, StateStore};
 use crate::slack::{
     ButtonValue, CONFIRM_SPAM_ACTION_ID, DELETE_ACTION_ID, FALSE_POSITIVE_ACTION_ID,
@@ -37,7 +38,7 @@ struct AppState {
     http: reqwest::Client,
     /// Accounts currently being processed (prevents double-clicks and allows graceful shutdown).
     in_flight: Arc<InFlight>,
-    note_writer: Option<crate::postgres::ModerationNoteWriter>,
+    note_writer: Option<ModerationNoteWriter>,
     store: StateStore,
 }
 
@@ -107,16 +108,7 @@ struct Interaction {
 pub async fn run(config: ServeConfig) -> Result<()> {
     let mastodon = MastodonClient::new(&config.mastodon_base_url, &config.mastodon_access_token)?;
 
-    let note_writer = match config.postgres {
-        Some(ref pg) => Some(
-            crate::postgres::ModerationNoteWriter::connect(
-                &pg.database_url,
-                pg.moderator_account_id,
-            )
-            .await?,
-        ),
-        None => None,
-    };
+    let note_writer = postgres::writer_for(config.postgres.as_ref()).await?;
 
     let state = Arc::new(AppState {
         http: mastodon.http_client(),
