@@ -77,6 +77,16 @@ pub struct MediaAttachment {
     pub description: Option<String>,
 }
 
+/// Puts accounts in ascending ID order and drops repeats.
+///
+/// `dedup_by` only collapses neighbours, so the sort has to come first. It is [`numeric_id_cmp`]
+/// rather than the derived string order: the IDs are unpadded decimals, where `"100"` sorts before
+/// `"20"` as text.
+fn sort_unique_by_id(accounts: &mut Vec<AdminAccount>) {
+    accounts.sort_by(|a, b| numeric_id_cmp(&a.id, &b.id));
+    accounts.dedup_by(|a, b| a.id == b.id);
+}
+
 #[derive(Clone)]
 pub struct MastodonClient {
     client: Client,
@@ -155,8 +165,7 @@ impl MastodonClient {
             // de-duplication: a repeated ID within a page would otherwise end pagination early
             // and silently leave the remaining accounts unchecked.
             let page_was_full = page.len() >= limit;
-            page.sort_by(|a, b| numeric_id_cmp(&a.id, &b.id));
-            page.dedup_by(|a, b| a.id == b.id);
+            sort_unique_by_id(&mut page);
             let next_min_id = page.last().map(|account| account.id.clone());
             let next_max_id = page.first().map(|account| account.id.clone());
             accounts.extend(page);
@@ -180,9 +189,9 @@ impl MastodonClient {
 
         info!(count = accounts.len(), "fetched accounts across pages");
 
-        // IDs are numeric strings; sort by length first, then lexicographically to get numeric order.
-        accounts.sort_by(|a, b| numeric_id_cmp(&a.id, &b.id));
-        accounts.dedup_by(|a, b| a.id == b.id);
+        // Pages can overlap at their bounds, so the merged result is ordered and de-duplicated
+        // again rather than trusting that per-page ordering carried across the seam.
+        sort_unique_by_id(&mut accounts);
         Ok(accounts)
     }
 
