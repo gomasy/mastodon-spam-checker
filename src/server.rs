@@ -47,8 +47,8 @@ struct AppState {
 struct InFlight(Mutex<HashSet<String>>);
 
 impl InFlight {
-    /// Acquires the lock. Even if it is poisoned (a panic while held), the set itself remains
-    /// consistent, so recover and continue rather than propagating the panic.
+    /// A poisoned lock (a panic while held) still leaves the set consistent, so recover and
+    /// continue rather than propagating the panic.
     fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
         self.0
             .lock()
@@ -61,10 +61,9 @@ impl InFlight {
 
     /// Claims `account_id`, or returns `None` if a click for it is already being handled.
     ///
-    /// The claim is released when the returned guard drops, including if the handling task panics.
-    /// Removing the ID by hand at the end of the happy path would leak it on a panic, and a leaked
-    /// ID is permanent: every later click on that account is silently dropped as a double-click,
-    /// and every shutdown waits out the full grace period.
+    /// The claim is released when the returned guard drops, including on a panic. A leaked ID would
+    /// be permanent: every later click on that account is silently dropped as a double-click, and
+    /// every shutdown waits out the full grace period.
     fn claim(self: &Arc<Self>, account_id: &str) -> Option<InFlightGuard> {
         self.lock()
             .insert(account_id.to_string())
@@ -97,11 +96,11 @@ enum ButtonAction {
 struct Interaction {
     kind: ButtonAction,
     value: ButtonValue,
-    /// Raw JSON string of the button value, passed through unchanged when replacing with the delete button.
+    /// The button value verbatim, passed through unchanged when replacing with the delete button.
     raw_value: String,
     user_id: String,
     response_url: String,
-    /// Blocks from the original message, used to insert the result and call replace_original.
+    /// Blocks from the original message, edited in place and sent back with `replace_original`.
     blocks: Vec<Value>,
 }
 
@@ -132,9 +131,9 @@ pub async fn run(config: ServeConfig) -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await;
 
-    // Drained whichever way the server ended. A serve error is the case this most needs to cover:
-    // the actions still running are the ones that suspended an account without yet saying so in
-    // Slack, and returning early would drop them precisely when something has already gone wrong.
+    // Drained whichever way the server ended, a serve error most of all: the actions still running
+    // may have suspended an account without yet saying so in Slack, and returning early would drop
+    // them precisely when something has already gone wrong.
     drain_in_flight(&state.in_flight).await;
     served.context("Slack interaction server failed")
 }
@@ -153,7 +152,7 @@ async fn drain_in_flight(in_flight: &InFlight) {
 }
 
 async fn shutdown_signal() {
-    // If SIGTERM handler registration fails, do not panic the server; fall back to Ctrl-C only.
+    // A SIGTERM handler that cannot be registered falls back to Ctrl-C rather than panicking.
     match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(mut sigterm) => {
             tokio::select! {
@@ -200,8 +199,8 @@ async fn handle_interaction(
     StatusCode::OK
 }
 
-/// Extracts the target button action from a block_actions payload.
-/// Returns Ok(None) for unrecognised events or buttons; Err for missing or malformed required fields.
+/// Extracts the target button action from a `block_actions` payload. `Ok(None)` for unrecognised
+/// events or buttons, `Err` for missing or malformed required fields.
 fn extract_interaction(mut payload: Value) -> Result<Option<Interaction>> {
     if payload["type"] != "block_actions" {
         return Ok(None);
@@ -228,8 +227,7 @@ fn extract_interaction(mut payload: Value) -> Result<Option<Interaction>> {
         .context("action has no value")?;
     let value: ButtonValue = serde_json::from_str(&raw_value).context("invalid button value")?;
 
-    // Mastodon account IDs are numeric only. Validate before embedding in URL paths
-    // to ensure a tampered value cannot be routed to a different endpoint.
+    // Validated before it reaches a URL path, so a tampered value cannot be routed elsewhere.
     if !is_numeric_id(&value.id) {
         bail!("account id is not numeric: {}", value.id);
     }
@@ -252,8 +250,7 @@ fn extract_interaction(mut payload: Value) -> Result<Option<Interaction>> {
             _ => None,
         })
         .unwrap_or_default();
-    // If blocks are missing, restore the original notification content from text
-    // so replace_original does not blank the entire message.
+    // Missing blocks are rebuilt from the message text, so `replace_original` does not blank it.
     if blocks.is_empty()
         && let Some(text) = payload["message"]["text"]
             .as_str()
@@ -275,10 +272,8 @@ fn extract_interaction(mut payload: Value) -> Result<Option<Interaction>> {
     }))
 }
 
-/// Everything an action handler may read or rewrite while deciding what the click did.
-///
-/// The handlers all take this rather than a longer parameter list because they need the same
-/// things: who clicked, which account, and the message blocks to edit in place.
+/// Everything an action handler may read or rewrite while deciding what the click did: who clicked,
+/// which account, and the message blocks to edit in place.
 struct ActionContext<'a> {
     state: &'a AppState,
     value: &'a ButtonValue,
@@ -296,15 +291,14 @@ impl ActionContext<'_> {
         self.blocks.retain(|block| block["type"] != "actions");
     }
 
-    /// Stops a destructive action on an account a moderator has already cleared.
+    /// Stops a destructive action on an account a moderator has already cleared, returning the
+    /// message to show or `None` when the action may proceed.
     ///
-    /// Returns the message to show, or `None` when the action may proceed. A message that is still
-    /// sitting in Slack keeps its buttons after the verdict was overturned, so both destructive
-    /// handlers re-check the feedback here rather than trusting the click. A check that cannot be
-    /// made is treated as a refusal: acting on an unknown verdict is what this guards against.
-    ///
-    /// `refused_key` names the locale string for a cleared account, `check_failed_key` the one for
-    /// an unreadable verdict; each handler passes its own wording for the action it aborted.
+    /// A message still sitting in Slack keeps its buttons after the verdict was overturned, so both
+    /// destructive handlers re-check the feedback here rather than trusting the click. A check that
+    /// cannot be made is a refusal too: acting on an unknown verdict is the thing being guarded
+    /// against. `refused_key` names the locale string for a cleared account, `check_failed_key` the
+    /// one for an unreadable verdict.
     async fn refuse_if_cleared(
         &mut self,
         refused_key: &str,
@@ -333,9 +327,8 @@ impl ActionContext<'_> {
     }
 }
 
-/// Calls the appropriate Mastodon API for the button action and updates the Slack message via response_url.
-///
-/// `_guard` is held for the whole call so the account's in-flight claim outlives it either way.
+/// Runs the button's action and rewrites the Slack message through its `response_url`. `_guard` is
+/// held for the whole call so the account's in-flight claim outlives it either way.
 async fn process_action(state: Arc<AppState>, interaction: Interaction, _guard: InFlightGuard) {
     let Interaction {
         kind,
@@ -347,8 +340,9 @@ async fn process_action(state: Arc<AppState>, interaction: Interaction, _guard: 
     } = interaction;
     let safe_acct = sanitize_mrkdwn(&value.acct);
 
-    // Remove any previous context blocks that would accumulate unboundedly on retries.
-    // On success, each branch also removes or replaces the button to prevent re-execution (left on failure to allow retry).
+    // Previous context blocks would otherwise accumulate on every retry. Each branch below also
+    // removes or replaces its button on success, leaving it in place on failure so it can be
+    // clicked again.
     blocks.retain(|b| b["type"] != "context");
 
     let mut ctx = ActionContext {
@@ -384,9 +378,9 @@ async fn handle_suspend(ctx: &mut ActionContext<'_>) -> String {
         return refusal;
     }
 
-    // If already suspended (e.g. via manual action or a button on another notification),
-    // skip the suspend API call, show a notice, and replace the button with the delete button.
-    // A failed check does not block suspension (the suspend API is idempotent).
+    // An account suspended elsewhere (manually, or from another notification) skips the API call
+    // and goes straight to the delete button. A failed check does not block the suspend call — the
+    // endpoint is idempotent.
     let already_suspended = match ctx.state.mastodon.is_account_suspended(&ctx.value.id).await {
         Ok(suspended) => suspended,
         Err(e) => {
@@ -422,9 +416,8 @@ async fn handle_suspend(ctx: &mut ActionContext<'_>) -> String {
     }
 }
 
-/// Deletion is irreversible, so do not rely solely on the button being present in the Slack
-/// message; verify server-side that the account is suspended before proceeding. This guards
-/// against a stale button being clicked after the suspension was manually lifted.
+/// Deletion is irreversible, so the button's presence in Slack is not enough: the suspension is
+/// re-checked server-side, in case it was lifted after the message was sent.
 async fn handle_delete(ctx: &mut ActionContext<'_>) -> String {
     if let Some(refusal) = ctx
         .refuse_if_cleared(
@@ -483,11 +476,9 @@ async fn handle_false_positive(ctx: &mut ActionContext<'_>) -> String {
     .await
 }
 
-/// Records a moderator's verdict on a notification and reports what happened.
-///
-/// Unlike the suspend and delete buttons this touches no Mastodon state, so the whole action is
-/// the state write. `prune_buttons` drops the buttons the verdict has made meaningless — the two
-/// verdicts disagree about which those are, so each caller supplies its own.
+/// Records a moderator's verdict on a notification and reports what happened. Unlike suspend and
+/// delete this touches no Mastodon state, so the state write is the whole action. `prune_buttons`
+/// drops the buttons the verdict made meaningless; the two verdicts disagree about which those are.
 async fn apply_feedback(
     ctx: &mut ActionContext<'_>,
     status: JobStatus,
@@ -501,9 +492,8 @@ async fn apply_feedback(
         .await
     {
         Ok(replaced) => {
-            // Overturning an earlier verdict is allowed — correcting a mis-click is what these
-            // buttons are for — but it gets the louder line, as the only record that the account
-            // changed hands.
+            // Overturning an earlier verdict is allowed, but gets the louder line: it is the only
+            // record that the account changed hands.
             match replaced.filter(|replaced| *replaced != status) {
                 Some(replaced) => {
                     warn!(account_id = %ctx.value.id, user_id = %ctx.user_id, verdict = status.as_str(), replaced = replaced.as_str(), "moderator feedback recorded, reversing an earlier verdict");
@@ -541,9 +531,9 @@ fn replace_buttons_with_delete(blocks: &mut Vec<Value>, value_json: &str, safe_a
 fn remove_feedback_buttons(blocks: &mut Vec<Value>) {
     blocks.retain_mut(|block| {
         let is_actions = block["type"] == "actions";
-        // Look the key up rather than indexing: indexing a Value mutably *inserts* a null at a
-        // missing key, so `block["elements"]` would grow an `"elements": null` on the section
-        // block carrying the notification, and Slack rejects the whole update as invalid_blocks.
+        // Looked up rather than indexed: mutable indexing *inserts* a null at a missing key, so
+        // `block["elements"]` would grow an `"elements": null` on the notification's section block,
+        // and Slack rejects the whole update as invalid_blocks.
         let Some(elements) = block.get_mut("elements").and_then(Value::as_array_mut) else {
             return true;
         };
@@ -553,8 +543,8 @@ fn remove_feedback_buttons(blocks: &mut Vec<Value>) {
                 Some(CONFIRM_SPAM_ACTION_ID | FALSE_POSITIVE_ACTION_ID)
             )
         });
-        // Slack rejects a button-less actions block just as firmly, and just as silently — the
-        // moderator sees the click do nothing — so an emptied one goes rather than stays.
+        // Slack rejects a button-less actions block just as firmly and just as silently — the
+        // moderator sees the click do nothing — so an emptied one is dropped.
         !is_actions || !elements.is_empty()
     });
 }
@@ -562,8 +552,8 @@ fn remove_feedback_buttons(blocks: &mut Vec<Value>) {
 fn context_block(text: &str) -> Value {
     json!({
         "type": "context",
-        // Truncate to avoid invalid_blocks errors when Mastodon error bodies or other content
-        // would exceed the limit and cause the entire update to be silently dropped.
+        // Truncated because an over-long Mastodon error body would fail the whole update as
+        // invalid_blocks, silently.
         "elements": [{ "type": "mrkdwn", "text": truncate_mrkdwn(text, TEXT_MAX_CHARS) }]
     })
 }
@@ -606,8 +596,8 @@ fn verify_signature(secret: &str, headers: &HeaderMap, body: &[u8]) -> Result<()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the UNIX epoch")?
         .as_secs() as i64;
-    // Saturating arithmetic: `ts` is attacker-supplied, and an extreme value would otherwise
-    // overflow the subtraction or `abs()`. Saturating keeps such a value far outside the window.
+    // `ts` is attacker-supplied, and an extreme value would overflow the subtraction or `abs()`.
+    // Saturating keeps such a value far outside the window.
     if now.saturating_sub(ts).saturating_abs() > MAX_TIMESTAMP_SKEW_SECS {
         bail!("timestamp outside allowed window (possible replay)");
     }
@@ -634,9 +624,8 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     }
-    // as_chunks splits into fixed-size pairs and hands back whatever did not divide evenly, so the
-    // even-length requirement and the decode share one expression instead of the decode depending
-    // on a length check made earlier.
+    // as_chunks hands back whatever did not divide evenly, so the even-length requirement and the
+    // decode share one expression rather than a separate length check.
     let (pairs, rest) = s.as_bytes().as_chunks::<2>();
     if pairs.is_empty() || !rest.is_empty() {
         return None;
@@ -687,8 +676,8 @@ mod tests {
     #[test]
     fn locale_keys_passed_as_variables_still_resolve() {
         // These reach `t!` as variables rather than literals, so a typo compiles fine and renders
-        // the key name into Slack instead. Asserted through interpolation, which every locale
-        // shares, so this does not race the tests that switch locale.
+        // the key name into Slack. Asserted through interpolation, which every locale shares, so
+        // this does not race the tests that switch locale.
         for key in [
             "feedback_confirmed",
             "feedback_false_positive",
@@ -879,8 +868,7 @@ mod tests {
 
     #[test]
     fn removing_feedback_buttons_leaves_the_other_blocks_untouched() {
-        // Slack rejects the whole update with invalid_blocks if a section grows an "elements"
-        // key, which mutable indexing would have inserted while looking for buttons to drop.
+        // A section that grew an "elements" key would fail the update as invalid_blocks.
         let section = json!({ "type": "section", "text": { "type": "mrkdwn", "text": "spam" } });
         let mut blocks = vec![
             section.clone(),

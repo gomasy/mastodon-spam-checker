@@ -1,8 +1,7 @@
 //! The spam-check pipeline, shared by the periodic run, `retry-failed`, and `backfill`.
 //!
-//! One account goes through [`check_one`]: statuses are fetched, campaign signals looked up, a
-//! verdict asked for, moderators notified, and the outcome recorded. [`process_accounts`] runs that
-//! over a list of accounts and reports how far it got.
+//! [`check_one`] takes one account through statuses, campaign signals, verdict, notification, and
+//! recording; [`process_accounts`] runs that over a list and reports how far it got.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,11 +20,7 @@ use crate::redis::{CampaignContext, JobRecord, JobStatus, StateStore};
 use crate::signals;
 use crate::slack::SlackNotifier;
 
-/// What a run may do beyond classifying the accounts it was given.
-///
-/// The three entry points differ only here: a dry run neither writes nor notifies, a backfill
-/// writes but notifies only when asked, and `retry-failed` additionally re-sends deliveries the
-/// periodic checker deliberately leaves alone.
+/// What a run may do beyond classifying accounts — the only thing the entry points differ in.
 #[derive(Clone, Copy)]
 pub struct ServiceOptions {
     /// Send Slack notifications, and write the moderation notes that document them.
@@ -40,8 +35,8 @@ pub struct CheckServices {
     mastodon: MastodonClient,
     llm: LlmClient,
     slack: Option<SlackNotifier>,
-    /// Present for every run. Dry runs still read campaign context through it; `persist` is what
-    /// decides whether anything is written back.
+    /// Present for every run: dry runs read campaign context through it, and `persist` decides
+    /// whether anything is written back.
     store: StateStore,
     note_writer: Option<ModerationNoteWriter>,
     threshold: f64,
@@ -83,17 +78,14 @@ impl CheckServices {
         })
     }
 
-    /// The Mastodon client, for the callers that select the accounts to check before handing them
-    /// to [`process_accounts`].
+    /// For callers that select the accounts to check before handing them to [`process_accounts`].
     pub fn mastodon(&self) -> &MastodonClient {
         &self.mastodon
     }
 }
 
-/// The two clients a spam check always needs, built from one detection config.
-///
-/// `check-account` builds them without the rest of [`CheckServices`], so the construction lives
-/// here rather than inline in [`CheckServices::build`].
+/// The two clients a spam check always needs. Shared with `check-account`, which builds them
+/// without the rest of [`CheckServices`].
 pub fn detection_clients(detection: &DetectionConfig) -> Result<(MastodonClient, LlmClient)> {
     let mastodon = MastodonClient::new(
         &detection.mastodon_base_url,
@@ -126,8 +118,7 @@ struct CheckedAccount {
 }
 
 impl CheckedAccount {
-    /// Whether moderators were notified. Read back off the outcome rather than carried alongside
-    /// it, so the two cannot disagree about what happened.
+    /// Read back off the outcome rather than carried alongside it, so the two cannot disagree.
     fn notified(&self) -> bool {
         matches!(self.outcome, AccountCheckOutcome::Spam { notified: true })
     }
@@ -144,23 +135,22 @@ pub struct ProcessSummary {
 }
 
 impl ProcessSummary {
-    /// The newest account every earlier account was also finished for, or `None` when the very
-    /// first one failed. Saving anything past a failure would skip the account that failed.
+    /// The newest account every earlier account also finished for, or `None` when the very first
+    /// one failed. Saving anything past a failure would skip the account that failed.
     pub fn last_contiguous_id(&self) -> Option<&str> {
         self.last_contiguous_id.as_deref()
     }
 
     /// Keeps the failure that stopped the run, which is the one that explains it. Later failures
-    /// are consequences of stopping, and the accounts behind them stay queued for retry regardless.
+    /// are consequences of stopping, and their accounts stay queued for retry regardless.
     fn record_failure(&mut self, error: anyhow::Error) {
         self.first_failure.get_or_insert(error);
     }
 
     /// Reports what the run did, then hands back the failure that stopped it, if any.
     ///
-    /// The counts are logged before the error is returned rather than after a successful finish, so
-    /// a run that stopped part-way still says how far it got: how many accounts were already
-    /// notified is what tells an operator whether `retry-failed` has anything left to do.
+    /// The counts are logged even on failure, so a run that stopped part-way still says how far it
+    /// got — the notified count is what tells an operator whether `retry-failed` has work left.
     pub fn finish(self, dry_run: bool) -> Result<()> {
         info!(
             spam_detected = self.spam_detected,
@@ -183,8 +173,8 @@ pub async fn process_accounts(
     services: CheckServices,
     concurrency: usize,
 ) -> ProcessSummary {
-    // One shared handle rather than a per-account copy: cloning the struct duplicated every
-    // client's URLs, tokens, and model name for each of potentially thousands of accounts.
+    // One shared handle: cloning the struct would duplicate every client's URLs, tokens, and model
+    // name for each of potentially thousands of accounts.
     let services = Arc::new(services);
     let mut summary = ProcessSummary::default();
 
@@ -208,8 +198,8 @@ pub async fn process_accounts(
             }
         }
 
-        // Walked in the original order, not the order the tasks finished in: the cursor may only
-        // advance across accounts whose predecessors all succeeded.
+        // Original order, not completion order: the cursor may only advance across accounts whose
+        // predecessors all succeeded.
         for account in chunk {
             let result = results
                 .remove(&account.id)
@@ -364,8 +354,8 @@ async fn check_one_inner(
         Err(error) => return Err(error).context("LLM check failed"),
     };
 
-    // Neither of the two outcomes below owes anything to Slack, so nothing has to be written
-    // ahead of time: the caller completes the job with this verdict as the next step.
+    // Neither outcome below owes anything to Slack, so nothing is written ahead of time: the
+    // caller completes the job with this verdict as the next step.
     let domain = account.domain.as_deref().unwrap_or("?");
     if !verdict.spam {
         info!(username = %account.username, %domain, "not spam");
@@ -408,7 +398,7 @@ async fn check_one_inner(
 /// Notifies moderators about a spam verdict that cleared the threshold, and records it.
 ///
 /// The classification is written as pending before the notification goes out, so a crash
-/// mid-delivery leaves the account in the retry queue rather than looking finished. With no Slack
+/// mid-delivery leaves the account queued for retry rather than looking finished. With no Slack
 /// configured nothing is owed, and the caller's `complete_job` records the verdict on its own.
 async fn report_spam(
     account: &AdminAccount,
@@ -511,10 +501,8 @@ async fn notify_with_claim(
 
 /// Records a delivered spam verdict as a Mastodon moderation note, when one is configured.
 ///
-/// Called only after the job has been completed: the notification this documents is already out,
-/// and a database timeout or process exit must not leave it pending for retry. For the same reason
-/// a failure here is logged rather than raised — a missing note must not undo a delivered
-/// notification.
+/// Called only after the job is completed, and failures are logged rather than raised: the
+/// notification this documents is already out, and a missing note must not undo it.
 async fn add_spam_note(services: &CheckServices, account_id: &str, verdict: &SpamVerdict) {
     let Some(writer) = &services.note_writer else {
         return;
@@ -550,7 +538,6 @@ mod tests {
 
     #[test]
     fn the_failure_that_stopped_a_run_is_the_one_reported() {
-        // Later failures are consequences of stopping, so the first one has to survive them.
         let mut summary = ProcessSummary::default();
         summary.record_failure(anyhow::anyhow!("first"));
         summary.record_failure(anyhow::anyhow!("second"));

@@ -9,10 +9,8 @@ use crate::config::PostgresConfig;
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Connects a note writer when moderation notes are configured, and nothing otherwise.
-///
-/// Both the checker and `serve` mode decide the same way from the same optional config, so the
-/// `Option` is unwrapped here rather than at each of them.
+/// Connects a note writer when moderation notes are configured, and nothing otherwise. The checker
+/// and `serve` mode decide the same way, so the `Option` is unwrapped here rather than at both.
 pub async fn writer_for(config: Option<&PostgresConfig>) -> Result<Option<ModerationNoteWriter>> {
     match config {
         Some(pg) => ModerationNoteWriter::connect(&pg.database_url, pg.moderator_account_id)
@@ -24,21 +22,19 @@ pub async fn writer_for(config: Option<&PostgresConfig>) -> Result<Option<Modera
 
 /// `created_at`/`updated_at` are bound as parameters rather than written with `NOW()`: Mastodon's
 /// columns are `timestamp without time zone` holding UTC, and Postgres would convert `now()` into
-/// the session time zone, dating every note by the database server's local wall clock. A
-/// `SystemTime` is encoded as UTC for both `timestamp` and `timestamptz`, so it is correct either
-/// way.
+/// the session time zone, dating every note by the server's local wall clock. A `SystemTime` is
+/// encoded as UTC for both `timestamp` and `timestamptz`, so it is correct either way.
 const INSERT_NOTE: &str = "INSERT INTO account_moderation_notes \
      (content, account_id, target_account_id, created_at, updated_at) \
      VALUES ($1, $2, $3, $4, $4)";
 
 /// Writes rows into Mastodon's `account_moderation_notes` table.
 ///
-/// The connection is treated as disposable. `serve` mode holds a writer for the lifetime of the
-/// process, and a `tokio_postgres::Client` whose connection has ended fails every later request, so
-/// a database restart, idle timeout, or brief network loss would otherwise silence moderation notes
-/// permanently. Each write checks the connection first and redials when it has gone.
-///
-/// [`crate::redis::StateStore`] uses Redis' connection manager for equivalent reconnection.
+/// The connection is disposable: each write checks it first and redials when it has gone. `serve`
+/// mode holds a writer for the life of the process, and a `tokio_postgres::Client` whose connection
+/// ended fails every later request, so a database restart or idle timeout would otherwise silence
+/// moderation notes permanently. [`crate::redis::StateStore`] gets the equivalent from Redis'
+/// connection manager.
 pub struct ModerationNoteWriter {
     database_url: String,
     moderator_account_id: i64,
@@ -101,8 +97,8 @@ impl ModerationNoteWriter {
         )
         .await
         else {
-            // Dropping the query future does not stop PostgreSQL from executing it. Cancel it
-            // explicitly before discarding this client so lock waits cannot leak sessions.
+            // Dropping the query future does not stop PostgreSQL from executing it, so it is
+            // cancelled explicitly before this client is discarded, or lock waits leak sessions.
             match tokio::time::timeout(DATABASE_TIMEOUT, client.cancel_token().cancel_query(NoTls))
                 .await
             {
@@ -112,8 +108,8 @@ impl ModerationNoteWriter {
             }
             bail!("timed out inserting moderation note");
         };
-        // Keep the connection for the next note unless the query itself killed it. A connection that
-        // dies mid-query costs this one note; the next call reconnects.
+        // Kept for the next note unless the query itself killed it, in which case this one note is
+        // lost and the next call reconnects.
         if !client.is_closed() {
             *guard = Some(client);
         }

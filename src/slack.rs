@@ -14,9 +14,9 @@ use crate::text::truncate_chars;
 
 const APP_NAME: &str = "Mastodon Spam Checker";
 
-/// Action ID for the suspend button (shared with the serve-mode handler).
+// Action IDs, shared with the serve-mode handler that receives the clicks.
 pub const SUSPEND_ACTION_ID: &str = "suspend_account";
-/// Action ID for the delete button (appears only in post-suspension messages).
+/// Appears only in post-suspension messages.
 pub const DELETE_ACTION_ID: &str = "delete_account";
 pub const CONFIRM_SPAM_ACTION_ID: &str = "confirm_spam";
 pub const FALSE_POSITIVE_ACTION_ID: &str = "false_positive";
@@ -26,7 +26,7 @@ pub(crate) const TEXT_MAX_CHARS: usize = 3000;
 /// Character limit for the Block Kit confirm dialog text.
 const CONFIRM_TEXT_MAX_CHARS: usize = 300;
 
-/// Information embedded in the suspend button value (shared between the notifier and the serve-mode handler).
+/// What a button carries back to the serve-mode handler when it is clicked.
 #[derive(Serialize, Deserialize)]
 pub struct ButtonValue {
     pub id: String,
@@ -35,7 +35,7 @@ pub struct ButtonValue {
 
 #[derive(Serialize)]
 struct SlackMessage {
-    // When blocks are used, text serves as a notification/preview fallback.
+    /// With blocks present, this is the notification and preview fallback.
     text: String,
     blocks: Value,
     username: &'static str,
@@ -98,7 +98,6 @@ impl SlackNotifier {
         ]);
 
         let message = SlackMessage {
-            // Doubles as the notification/preview fallback; already within Slack's limit for it.
             text,
             blocks,
             username: APP_NAME,
@@ -106,8 +105,8 @@ impl SlackNotifier {
             channel: self.channel.clone(),
         };
 
-        // Retry transient failures: the caller aborts the whole run on a notification error,
-        // so a momentary blip would otherwise stall the checker on this account.
+        // Retried, because the caller aborts the whole run on a notification error: a momentary
+        // blip would otherwise stall the checker on this account.
         http::send_with_retry(
             || self.client.post(&self.webhook_url).json(&message),
             "Slack webhook",
@@ -119,10 +118,9 @@ impl SlackNotifier {
     }
 }
 
-/// Builds an actions block containing the "Delete Account" button for post-suspension messages.
-/// (DELETE /api/v1/admin/accounts/:id is only valid for suspended accounts.)
-/// Pass the suspend button's value JSON (ButtonValue) as value_json, and an account handle
-/// already run through [`sanitize_mrkdwn`] — this does not escape it again.
+/// The "Delete Account" button, for a message whose account has just been suspended — the endpoint
+/// behind it rejects anything else. `value_json` is the suspend button's [`ButtonValue`], and
+/// `safe_acct` must already be through [`sanitize_mrkdwn`]; this does not escape it again.
 pub fn delete_actions_block(value_json: &str, safe_acct: &str) -> Value {
     confirm_actions_block(
         DELETE_ACTION_ID,
@@ -214,7 +212,7 @@ fn confirm_button(
 /// `&...;` entity in half (a bare `&am` would render as literal text).
 pub(crate) fn truncate_mrkdwn(s: &str, max_chars: usize) -> String {
     let truncated = truncate_chars(s, max_chars);
-    // Only a shortened string can end mid-entity, and the ellipsis is what marks that case.
+    // Only a shortened string can end mid-entity, and the ellipsis marks that case.
     if !truncated.ends_with('…') {
         return truncated;
     }
@@ -227,9 +225,9 @@ pub(crate) fn truncate_mrkdwn(s: &str, max_chars: usize) -> String {
 /// Prepares untrusted text for embedding in an mrkdwn template.
 ///
 /// Escapes the three characters Slack treats as control sequences, so the content cannot inject
-/// links, user mentions, or broadcasts such as `<!channel>`, and folds line breaks so it cannot
-/// forge extra lines in the notification (mrkdwn offers no way to escape a newline). Every
-/// account-, LLM-, or error-derived value interpolated into a locale template goes through this.
+/// links, mentions, or broadcasts such as `<!channel>`, and folds line breaks, which mrkdwn offers
+/// no way to escape, so it cannot forge extra lines. Every account-, LLM-, or error-derived value
+/// interpolated into a locale template goes through this.
 ///
 /// Not idempotent: applying it twice renders the escapes literally.
 pub(crate) fn sanitize_mrkdwn(s: &str) -> String {

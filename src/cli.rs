@@ -1,8 +1,7 @@
 //! Command-line entry points.
 //!
 //! Each subcommand assembles what it needs from the environment and hands the work to
-//! [`crate::check`]. The commands that write shared state run under a Redis lease so overlapping
-//! invocations fail rather than duplicating work.
+//! [`crate::check`]. The ones that write shared state run under a Redis lease.
 
 use std::future::Future;
 
@@ -43,11 +42,11 @@ async fn connect_store() -> Result<StateStore> {
     StateStore::new(&config::redis_url_env()?).await
 }
 
-/// Runs `operation` as the only checker touching shared state, and hands it the store it holds the
-/// lease on so the run opens one Redis connection rather than two.
+/// Runs `operation` as the only checker touching shared state, handing it the store the lease is
+/// held on so the run opens one Redis connection rather than two.
 ///
-/// The lease outlives its own expiry through a renewal task; losing it aborts the operation, since
-/// a second run may already have started on the strength of the expired lease.
+/// A renewal task keeps the lease past its own expiry. Losing it aborts the operation: a second run
+/// may already have started on the strength of the expired lease.
 async fn exclusive_run<F, Fut>(operation: F) -> Result<()>
 where
     F: FnOnce(StateStore) -> Fut,
@@ -183,8 +182,8 @@ async fn cursor_command(args: &[String]) -> Result<()> {
 
 async fn retry_failed_command(store: StateStore, max: usize) -> Result<()> {
     let config = Config::from_env(true)?;
-    // The queue is walked well past `max`, because entries a moderator has since resolved are
-    // dropped as they are found rather than counting against the batch.
+    // Walked well past `max`: entries a moderator has since resolved are dropped as they are
+    // found, rather than counting against the batch.
     let ids = store.failed_ids(max.saturating_mul(10)).await?;
     if ids.is_empty() {
         info!("retry queue is empty");
@@ -271,8 +270,8 @@ impl BackfillOptions {
         let mut to = None;
         let mut max = 1_000;
         let mut notify = false;
-        // Each flag takes its value in the same arm that matched it, so there is no second match on
-        // an already-decided flag and no arm that the first match has to promise cannot be reached.
+        // Each flag takes its value in the arm that matched it, so no already-decided flag is
+        // matched a second time.
         let mut args = args.iter();
         while let Some(flag) = args.next() {
             let mut value = || args.next().with_context(|| format!("{flag} needs a value"));

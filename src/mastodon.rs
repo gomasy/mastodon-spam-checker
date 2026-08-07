@@ -77,11 +77,8 @@ pub struct MediaAttachment {
     pub description: Option<String>,
 }
 
-/// Puts accounts in ascending ID order and drops repeats.
-///
-/// `dedup_by` only collapses neighbours, so the sort has to come first. It is [`numeric_id_cmp`]
-/// rather than the derived string order: the IDs are unpadded decimals, where `"100"` sorts before
-/// `"20"` as text.
+/// Puts accounts in ascending ID order and drops repeats. `dedup_by` only collapses neighbours, so
+/// the sort has to come first, and it uses [`numeric_id_cmp`] because the IDs are unpadded decimals.
 fn sort_unique_by_id(accounts: &mut Vec<AdminAccount>) {
     accounts.sort_by(|a, b| numeric_id_cmp(&a.id, &b.id));
     accounts.dedup_by(|a, b| a.id == b.id);
@@ -105,13 +102,13 @@ impl MastodonClient {
         })
     }
 
-    /// Returns a clone of the inner HTTP client (clones share the connection pool).
+    /// A clone of the inner HTTP client; clones share the connection pool.
     pub fn http_client(&self) -> Client {
         self.client.clone()
     }
 
-    /// Send an authenticated request and return an error with the response body on non-success status (no retry).
-    /// Use for write operations with side effects (suspend, delete).
+    /// Sends an authenticated request without retrying, for write operations with side effects
+    /// (suspend, delete). A non-success status becomes an error carrying the response body.
     async fn send(&self, req: RequestBuilder, what: &str) -> Result<Response> {
         let resp = req
             .bearer_auth(&self.access_token)
@@ -121,8 +118,8 @@ impl MastodonClient {
         http::ensure_success(resp, what).await
     }
 
-    /// Send an authenticated request with exponential-backoff retry on transient failures.
-    /// Use for idempotent read operations (GET). `build` must return a fresh `RequestBuilder` on each call.
+    /// Sends an authenticated request with backoff retry, for idempotent reads. `build` must return
+    /// a fresh `RequestBuilder` on each call.
     async fn send_retry<F>(&self, build: F, what: &str) -> Result<Response>
     where
         F: Fn() -> RequestBuilder,
@@ -145,7 +142,7 @@ impl MastodonClient {
             let remaining = max_accounts - accounts.len();
             let limit = page_limit.min(remaining);
             // Encoded rather than concatenated, so the pagination bounds cannot smuggle in extra
-            // query parameters even though both reach here already validated as digits.
+            // query parameters even though both reach here validated as digits.
             let limit_param = limit.to_string();
             let mut query = vec![("origin", "remote"), ("limit", limit_param.as_str())];
             query.extend(page_min_id.as_deref().map(|id| ("min_id", id)));
@@ -162,8 +159,8 @@ impl MastodonClient {
                 .await
                 .context("failed to parse admin accounts response")?;
             // Whether the page was full decides if another one exists, so measure it before
-            // de-duplication: a repeated ID within a page would otherwise end pagination early
-            // and silently leave the remaining accounts unchecked.
+            // de-duplication: a repeated ID within a page would otherwise end pagination early,
+            // silently leaving the remaining accounts unchecked.
             let page_was_full = page.len() >= limit;
             sort_unique_by_id(&mut page);
             let next_min_id = page.last().map(|account| account.id.clone());
@@ -189,8 +186,7 @@ impl MastodonClient {
 
         info!(count = accounts.len(), "fetched accounts across pages");
 
-        // Pages can overlap at their bounds, so the merged result is ordered and de-duplicated
-        // again rather than trusting that per-page ordering carried across the seam.
+        // Pages can overlap at their bounds, so per-page ordering does not carry across the seam.
         sort_unique_by_id(&mut accounts);
         Ok(accounts)
     }
@@ -202,9 +198,8 @@ impl MastodonClient {
     }
 
     /// The admin endpoint for a single account, shared by the read, suspend, and delete paths.
-    ///
-    /// `account_id` reaches this as a path segment, and callers are responsible for having
-    /// validated it with [`crate::ids::validate_account_id`] first.
+    /// `account_id` becomes a path segment, so callers must have validated it with
+    /// [`crate::ids::validate_account_id`] first.
     fn admin_account_url(&self, account_id: &str) -> String {
         format!("{}/api/v1/admin/accounts/{account_id}", self.base_url)
     }
@@ -233,8 +228,7 @@ impl MastodonClient {
 
     /// Returns whether the account is suspended (requires admin:read:accounts scope).
     pub async fn is_account_suspended(&self, account_id: &str) -> Result<bool> {
-        /// Only the suspension flag is read here. A missing or null field is treated as
-        /// unsuspended, to tolerate Mastodon version differences.
+        /// A missing or null field reads as unsuspended, tolerating Mastodon version differences.
         #[derive(Deserialize)]
         struct SuspensionState {
             #[serde(default)]
@@ -296,8 +290,8 @@ impl MastodonClient {
         )
         .await?;
 
-        // Treat permanent errors (e.g. account deleted) as "no posts"
-        // and continue with profile-only classification (do not abort the caller).
+        // A permanent error (a deleted account, typically) reads as "no posts" rather than
+        // aborting the caller, leaving a profile-only classification.
         let status = resp.status();
         if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
             warn!(account_id = %account_id, %status, "statuses unavailable, treating as no posts");

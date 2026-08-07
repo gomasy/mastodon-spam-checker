@@ -16,7 +16,7 @@ pub fn analyze(account: &AdminAccount, statuses: &[Status]) -> AccountSignals {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase();
-    // Short generic bios create noisy campaign matches (for example, "hello" or "artist").
+    // Short generic bios ("hello", "artist") would match as campaigns.
     let bio_fingerprint = (normalized_bio.chars().count() >= 40).then(|| digest(&normalized_bio));
 
     let mut links = BTreeSet::new();
@@ -106,8 +106,8 @@ fn collect_url(candidate: &str, links: &mut BTreeSet<String>) {
         && matches!(url.scheme(), "http" | "https")
     {
         let path = url.path();
-        // Mastodon renders mentions and hashtags as links. They describe federation navigation,
-        // not a promotional destination shared by a spam campaign.
+        // Mentions and hashtags render as links, but they are federation navigation, not a
+        // promotional destination a campaign could share.
         if path.starts_with("/@") || path.starts_with("/users/") || path.starts_with("/tags/") {
             return;
         }
@@ -149,8 +149,8 @@ mod tests {
 
     #[test]
     fn federation_links_are_not_campaign_destinations() {
-        // Mastodon renders every mention and hashtag as a link. Counting them would make each
-        // instance a shared "destination domain" and match unrelated accounts as one campaign.
+        // Counted, they would make each instance a shared "destination domain" and match
+        // unrelated accounts as one campaign.
         assert_eq!(
             links_in(
                 r#"<a href="https://mstdn.example/@bob">@bob</a>
@@ -175,8 +175,7 @@ mod tests {
 
     #[test]
     fn bare_and_non_http_urls_are_handled() {
-        // Plain-text URLs are picked up with their surrounding punctuation trimmed, while schemes
-        // that cannot be a campaign destination are left out.
+        // Surrounding punctuation is trimmed; schemes that cannot be a destination are left out.
         assert_eq!(
             links_in("see (https://plain.example/a), javascript:alert(1) mailto:x@example.com"),
             ["https://plain.example/a"]

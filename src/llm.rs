@@ -14,10 +14,9 @@ use crate::redis::{CampaignContext, StoredVerdict};
 use crate::signals::{AccountSignals, html_to_plain};
 use crate::text::truncate_chars;
 
-// Caps on the untrusted account text copied into the prompt. Without them a single account with
-// very long posts can exceed the model's context window, which fails its check on every run (see
-// UnparseableVerdict for why a permanent per-account failure matters), and inflates cost for every
-// account.
+// Caps on the untrusted account text copied into the prompt. Uncapped, one account with very long
+// posts can exceed the context window and fail its check on every run (see [`UnparseableVerdict`]),
+// and every account costs more than it needs to.
 const FIELD_MAX_CHARS: usize = 200;
 const BIO_MAX_CHARS: usize = 1_000;
 const POST_MAX_CHARS: usize = 500;
@@ -34,7 +33,6 @@ pub struct SpamVerdict {
     pub confidence: f64,
 }
 
-/// The stored form of a verdict, for persisting one that was just reached.
 impl From<&SpamVerdict> for StoredVerdict {
     fn from(verdict: &SpamVerdict) -> Self {
         Self {
@@ -45,7 +43,7 @@ impl From<&SpamVerdict> for StoredVerdict {
     }
 }
 
-/// The reverse, for re-notifying from a stored verdict rather than asking the model again.
+/// For re-notifying from a stored verdict rather than asking the model again.
 impl From<StoredVerdict> for SpamVerdict {
     fn from(stored: StoredVerdict) -> Self {
         Self {
@@ -58,14 +56,12 @@ impl From<StoredVerdict> for SpamVerdict {
 
 /// The model replied, but the reply carried no verdict this program can act on.
 ///
-/// Retrying cannot help: the same prompt yields the same unusable reply, so failing the run here
-/// would park the cursor in front of this account forever and stop the checker entirely until
-/// someone intervenes. Callers skip the account instead — the same reasoning as
-/// [`normalize_confidence`], one level further out.
+/// Retrying cannot help — the same prompt yields the same unusable reply — so failing the run would
+/// park the cursor in front of this account forever. Callers skip the account instead, the same
+/// reasoning as [`normalize_confidence`] one level further out.
 ///
-/// Deliberately *not* used for a response body that does not even deserialize as a chat completion:
-/// that points at a misconfigured or non-OpenAI-compatible endpoint, which affects every account
-/// and should fail loudly.
+/// Deliberately *not* used for a body that does not deserialize as a chat completion at all: that
+/// points at a misconfigured endpoint, which affects every account and should fail loudly.
 #[derive(Debug)]
 pub struct UnparseableVerdict(String);
 
@@ -206,9 +202,8 @@ impl LlmClient {
         })
     }
 
-    /// `signals` is the caller's already-computed [`AccountSignals`] for this account. It is
-    /// threaded in rather than recomputed here: the campaign lookup needs it first, and analysing
-    /// an account hashes its bio and parses every link it carries.
+    /// `signals` is threaded in rather than recomputed here: the campaign lookup needs it first,
+    /// and analysing an account hashes its bio and parses every link it carries.
     pub async fn check_spam(
         &self,
         account: &AdminAccount,
@@ -262,9 +257,8 @@ impl LlmClient {
 
 /// Unwraps the markdown code fence models wrap JSON in despite being told not to.
 ///
-/// The system prompt asks for bare JSON and `json_mode` enforces it where the endpoint supports
-/// it, but neither is guaranteed, and a fence is the one deviation common enough to absorb rather
-/// than fail the account over.
+/// The system prompt asks for bare JSON and `json_mode` enforces it where supported, but neither is
+/// guaranteed, and a fence is the one deviation common enough to absorb rather than fail over.
 fn strip_code_fence(content: &str) -> &str {
     content
         .trim()
@@ -283,15 +277,14 @@ fn parse_verdict(content: &str) -> Result<SpamVerdict> {
 
 /// Coerces a verdict confidence into 0.0–1.0.
 ///
-/// Some models report confidence on a 0–100 scale or drift slightly out of range. Normalising
-/// keeps a single odd verdict from failing the run forever: an error here would stop the caller
-/// without advancing the cursor, so the same account would be retried on every subsequent run.
+/// Some models report on a 0–100 scale or drift slightly out of range. Failing instead would stop
+/// the caller without advancing the cursor, so the same account would be retried on every run.
 fn normalize_confidence(confidence: f64) -> f64 {
     let normalized = if confidence.is_nan() {
         // clamp() would pass NaN straight through.
         0.0
     } else if confidence > 1.0 && confidence <= 100.0 {
-        // Within the percentage range, read it as a 0-100 scale; clamp anything beyond.
+        // In the percentage range, read as a 0-100 scale; anything beyond is clamped.
         confidence / 100.0
     } else {
         confidence.clamp(0.0, 1.0)
@@ -381,8 +374,8 @@ fn build_user_prompt(
     prompt
 }
 
-/// Appends the recent posts section, spending a shared character budget across the posts so a few
-/// very long ones cannot crowd out the rest of the prompt.
+/// Appends the recent posts, spending one shared character budget across them so a few very long
+/// posts cannot crowd out the rest.
 fn append_recent_posts(prompt: &mut String, statuses: &[Status]) {
     if statuses.is_empty() {
         prompt.push_str("\n## Recent Posts\n(No posts found)\n");
@@ -419,10 +412,8 @@ fn append_recent_posts(prompt: &mut String, statuses: &[Status]) {
     }
 }
 
-/// One post as plain text, with its content warning and media descriptions folded in.
-///
-/// The three parts share the post's character budget rather than each getting their own: a spam
-/// link is as likely to sit in an image description as in the post body.
+/// One post as plain text, with its content warning and media descriptions folded in. The three
+/// share the post's budget: a spam link is as likely to sit in an image description as in the body.
 fn post_text(status: &Status) -> String {
     let mut text = html_to_plain(&status.content);
     if !status.spoiler_text.is_empty() {

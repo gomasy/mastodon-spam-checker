@@ -15,8 +15,8 @@ const CURSOR_KEY: &str = "mastodon_spam_checker:last_account_id";
 const FAILED_KEY: &str = "mastodon_spam_checker:failed_accounts";
 const PENDING_NOTIFICATION_KEY: &str = "mastodon_spam_checker:pending_notifications";
 const RETENTION_MIGRATION_KEY: &str = "mastodon_spam_checker:migration:account_state_retention_v2";
-// Slack uses a 30-second request timeout and at most three Retry-After delays capped at 30 seconds,
-// so ten minutes safely covers the complete delivery attempt.
+/// Covers a complete Slack delivery attempt: a 30-second request timeout plus at most three
+/// Retry-After delays, each capped at 30 seconds.
 const NOTIFICATION_CLAIM_SECS: u64 = 10 * 60;
 const RUN_LEASE_KEY: &str = "mastodon_spam_checker:run_lease";
 const RUN_LEASE_SECS: u64 = 180;
@@ -24,8 +24,8 @@ const CAMPAIGN_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
 const CAMPAIGN_MEMBERS_PER_SIGNAL: i64 = 1_000;
 /// How many matching accounts a campaign lookup keeps, per signal and in total.
 const CAMPAIGN_MATCHES_REPORTED: usize = 20;
-/// Completed account history remains available for recent Slack actions, but must not accumulate
-/// forever. Unresolved retries and moderator feedback are intentionally retained.
+/// Keeps completed account history available for recent Slack actions without accumulating
+/// forever. Unresolved retries and moderator feedback are deliberately exempt.
 const ACCOUNT_STATE_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,10 +59,9 @@ impl JobStatus {
         )
     }
 
-    /// The stored spelling, matching how `serde` renames the variants for [`JobRecord`].
-    ///
-    /// Statuses are written both inside JSON job records and as the bare value of the moderation
-    /// action key; sharing one spelling keeps the two greppable as the same thing.
+    /// The stored spelling, matching how `serde` renames the variants for [`JobRecord`]. Statuses
+    /// are written both inside job records and as the bare moderation action value; one spelling
+    /// keeps the two greppable as the same thing.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Processing => "processing",
@@ -132,13 +131,12 @@ impl StateStore {
     /// Runs a read, reissuing it once if the connection had gone away underneath it.
     ///
     /// [`ConnectionManager`] replaces a dropped connection in the background but still fails the
-    /// command that discovered the dead socket. A server that sits idle between moderator clicks
-    /// hits this on the first click after the socket goes — the click fails with nothing the
-    /// moderator can act on, and the same click works seconds later. The reissue runs against the
-    /// replacement, which the manager has already swapped in by the time the error surfaces.
+    /// command that discovered the dead socket — so an idle `serve` process fails the first
+    /// moderator click after the socket goes, with nothing the moderator can act on. By the time
+    /// the error surfaces the replacement is in place, and the reissue runs against it.
     ///
-    /// Reads only. A write that fails this way may still have reached Redis, and nothing in the
-    /// error says whether it did, so re-sending one could apply it twice.
+    /// Reads only: a failed write may still have reached Redis, and nothing in the error says
+    /// whether it did, so re-sending one could apply it twice.
     async fn read<T: FromRedisValue>(
         &self,
         query: &impl RedisRead,
@@ -352,12 +350,11 @@ impl StateStore {
 
     /// Records a moderator's verdict on an account, returning the verdict it replaced, if any.
     ///
-    /// A later verdict overwrites an earlier one. Correcting a mis-click is exactly what these
-    /// buttons are for, and either order is reachable: confirming spam hides both feedback buttons
-    /// on that message, but an older notification for the same account still carries them. The
-    /// replaced verdict is handed back so the caller can log the reversal.
-    ///
-    /// The one refusal is a notification still being delivered, which would race the claim.
+    /// A later verdict overwrites an earlier one — correcting a mis-click is what these buttons are
+    /// for, and either order is reachable, since an older notification for the same account still
+    /// carries the buttons the newer one hid. The replaced verdict is handed back so the caller can
+    /// log the reversal. The one refusal is a notification still being delivered, which would race
+    /// the claim.
     pub async fn record_feedback(
         &self,
         account_id: &str,
@@ -398,9 +395,8 @@ impl StateStore {
             2 => {}
             _ => bail!("unexpected moderator feedback result from Redis"),
         }
-        // Empty means there was nothing to replace. A value that is present but no longer parses
-        // reads the same way rather than failing: the verdict the moderator just recorded is
-        // already written, and this return only feeds a log line.
+        // Empty means nothing to replace; an unparseable value reads the same way rather than
+        // failing, since the new verdict is already written and this only feeds a log line.
         Ok(parse_feedback(Some(previous.as_str()))
             .ok()
             .flatten()
@@ -453,8 +449,8 @@ impl StateStore {
 
     /// Adds the current retention policy to records created before TTLs were introduced.
     ///
-    /// The migration marker avoids scanning every account key on every periodic run. It is written
-    /// only after both scans complete, so an interrupted migration is safely retried.
+    /// The marker keeps later runs from scanning every account key, and is written only after both
+    /// scans complete, so an interrupted migration is safely retried.
     pub async fn cleanup_expired_records(&self) -> Result<usize> {
         let migrated: bool = self
             .read(
@@ -611,8 +607,8 @@ impl StateStore {
             let (feedback, job): (Option<String>, Option<String>) = self
                 .read(&state, "failed to read queued account state")
                 .await?;
-            // A missing job remains retryable: an interrupted retry can leave its ID queued after
-            // the temporary Processing record expires, and begin_job can reconstruct it.
+            // A missing job stays retryable: an interrupted retry can leave its ID queued after the
+            // temporary Processing record expires, and begin_job reconstructs it.
             if is_terminal_feedback(feedback.as_deref())? || is_completed_job(job.as_deref())? {
                 self.remove_failed(&id).await?;
                 continue;
@@ -650,16 +646,13 @@ impl StateStore {
     }
 
     /// Records this account against its campaign signals and reports which other recently seen
-    /// accounts share one.
+    /// accounts share one. With `record` unset nothing is written, so a dry run reports the same
+    /// matches without leaving a trace.
     ///
     /// An account can carry a bio fingerprint plus a domain per extracted link, so this runs over
-    /// tens of keys. Every command for every key goes out in one pipeline: issued serially they
-    /// cost four to five round trips per key, which dominated the time spent checking an account.
-    /// The pipeline is deliberately not `atomic()` — these are independent per-key housekeeping
-    /// commands, and wrapping them in MULTI/EXEC would only add contention.
-    ///
-    /// With `record` unset nothing is written at all, so a dry run reports the same matches
-    /// without leaving a trace.
+    /// tens of keys, all in one pipeline: issued serially they cost four to five round trips per
+    /// key, which dominated the time spent checking an account. Not `atomic()` — these are
+    /// independent per-key housekeeping commands, and MULTI/EXEC would only add contention.
     pub async fn campaign_context(
         &self,
         account_id: &str,
@@ -709,12 +702,12 @@ impl StateStore {
             .context("failed to save account job to Redis")
     }
 
-    /// Persists a job that has reached an outcome, and moves the account in or out of the retry
-    /// queue to match, in one transaction.
+    /// Persists a job that reached an outcome and moves the account in or out of the retry queue to
+    /// match, in one transaction: split, a crash in between would leave a completed account queued
+    /// for retry, or a failed one with nothing to pick it up.
     ///
-    /// Splitting the two would let a crash in between leave a completed account queued for retry,
-    /// or a failed one with nothing to pick it up. The pending-notification set is cleared either
-    /// way: the delivery it tracked is no longer in doubt once the job says what happened.
+    /// The pending-notification set is cleared either way — once the job says what happened, the
+    /// delivery it tracked is no longer in doubt.
     async fn write_job(&self, job: &JobRecord, retry: Retry, what: &'static str) -> Result<()> {
         let value = serialize_job(job)?;
         let account_id = &job.account_id;
@@ -765,17 +758,16 @@ fn remaining_job_ttl(job: &JobRecord, now: u64) -> Option<u64> {
         .then(|| ACCOUNT_STATE_RETENTION_SECS.saturating_sub(now.saturating_sub(job.updated_at)))
 }
 
-/// Builds the per-key campaign commands for [`StateStore::campaign_context`].
-///
-/// Exactly one reply is kept per key — the newest members still inside the window — so the caller
-/// can read the result back as one list per key regardless of `record`.
+/// Builds the per-key campaign commands for [`StateStore::campaign_context`]. Exactly one reply is
+/// kept per key — the newest members still inside the window — so the caller reads back the same
+/// shape regardless of `record`.
 fn campaign_pipeline(keys: &[String], account_id: &str, now: u64, record: bool) -> redis::Pipeline {
     let cutoff = now.saturating_sub(CAMPAIGN_WINDOW_SECS);
     let mut pipeline = redis::pipe();
     for key in keys {
         if record {
             pipeline
-                // Drop entries that fell out of the window before the key is added to or capped.
+                // Drop entries that fell out of the window before adding to or capping the key.
                 .cmd("ZREMRANGEBYSCORE")
                 .arg(key)
                 .arg("-inf")
@@ -792,9 +784,9 @@ fn campaign_pipeline(keys: &[String], account_id: &str, now: u64, record: bool) 
                 .arg(-(CAMPAIGN_MEMBERS_PER_SIGNAL + 1))
                 .ignore();
         }
-        // Selecting by score rather than by rank is what lets a dry run skip the trim above and
-        // stay purely read-only, without reporting accounts that have since aged out. The bound is
-        // exclusive, matching what the trim removes.
+        // By score rather than by rank, so a dry run can skip the trim above and stay read-only
+        // without reporting accounts that have since aged out. The bound is exclusive, matching
+        // what the trim removes.
         pipeline
             .cmd("ZREVRANGEBYSCORE")
             .arg(key)
@@ -807,10 +799,9 @@ fn campaign_pipeline(keys: &[String], account_id: &str, now: u64, record: bool) 
     pipeline
 }
 
-/// A read [`StateStore::read`] can reissue against a replacement connection.
-///
-/// `Cmd` and `Pipeline` carry the same `query_async`, but share no trait that names it, so the one
-/// retry would otherwise be written out once per shape of read.
+/// A read [`StateStore::read`] can reissue against a replacement connection. `Cmd` and `Pipeline`
+/// carry the same `query_async` but share no trait that names it, so without this the one retry
+/// would be written out once per shape of read.
 trait RedisRead {
     async fn run<T: FromRedisValue>(&self, conn: &mut ConnectionManager) -> RedisResult<T>;
 }
@@ -827,11 +818,9 @@ impl RedisRead for Pipeline {
     }
 }
 
-/// Reports the connection loss [`StateStore::read`] is about to retry through.
-///
-/// It guards on `is_unrecoverable_error`, the same condition [`ConnectionManager`] uses to decide
-/// the connection must be replaced — so it is exactly the set of failures a second attempt reaches
-/// a live socket for.
+/// Reports the connection loss [`StateStore::read`] is about to retry through. Its
+/// `is_unrecoverable_error` guard is the same condition [`ConnectionManager`] uses to replace the
+/// connection, so it is exactly the set of failures a second attempt reaches a live socket for.
 fn note_reconnect(error: &RedisError, what: &'static str) {
     warn!(error = %error, read = what, "Redis connection was replaced, retrying the read once");
 }
@@ -863,9 +852,9 @@ fn is_completed_job(value: Option<&str>) -> Result<bool> {
 
 /// Caps the merged per-signal matches at the newest [`CAMPAIGN_MATCHES_REPORTED`] accounts.
 ///
-/// Each signal is read newest-first, but merging them for de-duplication loses that order, and
-/// taking the set's own order would keep whichever IDs sort first as text — `"1000"` ahead of
-/// `"999"`. Re-sorting numerically, descending, keeps the accounts the campaign report is about.
+/// Each signal is read newest-first, but merging them for de-duplication loses that order, and the
+/// set's own order is textual — `"1000"` ahead of `"999"`. Re-sorting numerically, descending,
+/// keeps the accounts the campaign report is about.
 fn most_recent_matches(matches: BTreeSet<String>) -> Vec<String> {
     let mut matches: Vec<String> = matches.into_iter().collect();
     matches.sort_by(|a, b| numeric_id_cmp(b, a));
@@ -936,8 +925,7 @@ mod tests {
 
     #[test]
     fn campaign_matches_keep_the_most_recent_accounts() {
-        // IDs increase over time, so "most recent" is the numerically largest, and the cap must
-        // not fall back on lexicographic order (which would keep "1000" over "999").
+        // IDs increase over time, so "most recent" is the numerically largest.
         let ids = (1..=CAMPAIGN_MATCHES_REPORTED as u64 + 5)
             .map(|id| (id * 100).to_string())
             .collect::<BTreeSet<_>>();
@@ -1015,8 +1003,7 @@ mod tests {
 
     #[test]
     fn a_dry_run_reads_the_campaign_index_without_writing_to_it() {
-        // `dry-run` promises to leave no trace, so the read must not depend on trimming the key
-        // first. One reply per key either way, so the caller parses the same shape.
+        // `dry-run` leaves no trace, so the read must not depend on trimming the key first.
         let commands = |record| {
             campaign_tokens(record)
                 .into_iter()
@@ -1051,9 +1038,8 @@ mod tests {
 
     #[test]
     fn the_verdict_a_moderator_replaced_is_reported_back() {
-        // `record_feedback` maps the script's reply through this: the empty string means there was
-        // nothing to replace, and a stored value that no longer parses must not fail the verdict
-        // that has already been written.
+        // `record_feedback` maps the script's reply through this: an empty string means nothing was
+        // replaced, and an unparseable one must not fail the verdict already written.
         let replaced = |raw: &str| {
             parse_feedback(Some(raw))
                 .ok()

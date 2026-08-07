@@ -1,23 +1,19 @@
 //! Mastodon account IDs.
 //!
 //! IDs arrive as decimal strings and are kept that way: they are snowflake-style values that
-//! already exceed what a signed 32-bit integer holds, and every consumer (URL paths, Redis keys,
-//! cursors) needs the string form anyway. Ordering and validation therefore work on the digits.
+//! already exceed a signed 32-bit integer, and every consumer (URL paths, Redis keys, cursors)
+//! needs the string form anyway. Ordering and validation therefore work on the digits.
 
 use anyhow::{Result, bail};
 
-/// Orders two decimal ID strings numerically without parsing them.
-///
-/// Plain lexicographic order would sort `"100"` before `"20"`; comparing length first restores
-/// numeric order for the unpadded decimal strings Mastodon emits.
+/// Orders two decimal ID strings numerically without parsing them. Lexicographic order would sort
+/// `"100"` before `"20"`; comparing length first restores numeric order for unpadded decimals.
 pub fn numeric_id_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
 
-/// Whether `id` is a non-empty run of ASCII digits.
-///
-/// IDs are interpolated into Mastodon API paths and Redis keys, so anything else is rejected
-/// before it can steer a request at a different endpoint or key.
+/// Whether `id` is a non-empty run of ASCII digits. IDs are interpolated into Mastodon API paths
+/// and Redis keys, so anything else is rejected before it can steer a request elsewhere.
 pub fn is_numeric_id(id: &str) -> bool {
     !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
 }

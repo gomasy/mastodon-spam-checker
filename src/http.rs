@@ -6,7 +6,7 @@ use tracing::warn;
 
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 
-/// Builds an HTTP client with common settings (User-Agent, timeout).
+/// An HTTP client with the shared User-Agent and the given timeout.
 pub fn client(timeout: Duration) -> Result<Client> {
     Client::builder()
         .user_agent(concat!(
@@ -30,9 +30,9 @@ pub async fn ensure_success(resp: Response, what: &str) -> Result<Response> {
 
 #[derive(Clone, Copy)]
 pub struct RetryConfig {
-    /// Maximum number of retries after the first attempt (0 means no retries).
+    /// Retries after the first attempt; 0 means none.
     pub max_retries: u32,
-    /// Wait duration before the first retry; doubles on each subsequent attempt.
+    /// Wait before the first retry, doubling on each subsequent one.
     pub base_delay: Duration,
 }
 
@@ -46,7 +46,7 @@ impl Default for RetryConfig {
 }
 
 impl RetryConfig {
-    /// Delay before the given attempt (0-based): base_delay * 2^attempt.
+    /// `base_delay * 2^attempt`, with `attempt` 0-based.
     fn backoff(&self, attempt: u32) -> Duration {
         self.base_delay
             .saturating_mul(1u32.checked_shl(attempt).unwrap_or(u32::MAX))
@@ -57,13 +57,13 @@ fn is_retryable_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
-/// Returns true for network errors that warrant a retry (timeouts, connection failures, etc.).
-/// Request-builder errors (is_request) are not retried as they indicate configuration problems.
+/// Timeouts and connection failures are worth retrying; request-builder errors are not, since they
+/// point at a configuration problem.
 fn is_retryable_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect()
 }
 
-/// Parses the `Retry-After` header (integer seconds only) as a wait duration.
+/// The `Retry-After` header as a wait duration. Integer seconds only.
 fn retry_after(resp: &Response) -> Option<Duration> {
     resp.headers()
         .get(reqwest::header::RETRY_AFTER)
@@ -73,11 +73,8 @@ fn retry_after(resp: &Response) -> Option<Duration> {
         .map(|duration| duration.min(MAX_RETRY_AFTER))
 }
 
-/// Sends a request with exponential-backoff retry and returns the successful response.
-///
-/// `build` is a closure that returns a fresh `RequestBuilder` for each attempt.
-/// Retries 429 / 5xx responses and transient errors up to `retry.max_retries` times.
-/// Non-retryable failures or exhausted retries produce a body-bearing error equivalent to [`ensure_success`].
+/// [`send_with_retry_raw`] plus [`ensure_success`]: anything but a success status, whether
+/// non-retryable or left after the retries ran out, becomes a body-bearing error.
 pub async fn send_with_retry<F>(build: F, what: &str, retry: RetryConfig) -> Result<Response>
 where
     F: Fn() -> RequestBuilder,
@@ -86,10 +83,10 @@ where
     ensure_success(resp, what).await
 }
 
-/// Same retry logic as [`send_with_retry`], but leaves success/failure judgement to the caller.
+/// Retries network errors and 429 / 5xx up to `retry.max_retries` times, then returns the final
+/// response whatever its status. `build` must return a fresh `RequestBuilder` for each attempt.
 ///
-/// Retries only on network errors and 429 / 5xx, then returns the final response
-/// as-is regardless of status. Use when you need to handle 404 or other codes yourself.
+/// Judging the status is left to the caller, for the paths that handle 404 or 410 themselves.
 pub async fn send_with_retry_raw<F>(build: F, what: &str, retry: RetryConfig) -> Result<Response>
 where
     F: Fn() -> RequestBuilder,

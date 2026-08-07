@@ -50,10 +50,10 @@ fn init_logging() {
 
 /// Renders an error together with the causes its context wraps.
 ///
-/// `anyhow`'s plain `Display` — what `%error` in a log line reaches for — prints only the
-/// outermost context, so a failure arrives as "failed to read account job from Redis" with the
-/// Redis error that actually explains it dropped. Every logged failure goes through this instead.
-/// The errors that reach `main` need no help: returning them prints the chain already.
+/// `anyhow`'s plain `Display` — what `%error` in a log line reaches for — prints only the outermost
+/// context, dropping the Redis error that actually explains "failed to read account job from
+/// Redis". Every logged failure goes through this instead; errors returned to `main` already print
+/// the chain.
 pub fn chain(error: &anyhow::Error) -> String {
     format!("{error:#}")
 }

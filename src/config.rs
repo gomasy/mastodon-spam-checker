@@ -51,7 +51,7 @@ impl DetectionConfig {
     }
 }
 
-/// Everything a checking run needs beyond its Redis connection, which every entry point opens for
+/// Everything a checking run needs beyond its Redis connection, which each entry point opens for
 /// itself through [`redis_url_env`] before the run starts.
 pub struct Config {
     pub detection: DetectionConfig,
@@ -104,8 +104,8 @@ impl ServeConfig {
 
 const DEFAULT_REDIS_URL: &str = "redis://localhost:6379";
 
-/// `REDIS_URL`, or the local default. Every entry point reaches Redis, including the subcommands
-/// that build no full [`Config`], so the default lives here rather than at each call site.
+/// `REDIS_URL`, or the local default. Every entry point reaches Redis, including subcommands that
+/// build no full [`Config`], so the default lives here rather than at each call site.
 pub fn redis_url_env() -> Result<String> {
     env_or("REDIS_URL", DEFAULT_REDIS_URL)
 }
@@ -117,10 +117,8 @@ fn mastodon_env() -> Result<(String, String)> {
     ))
 }
 
-/// Reads an environment variable, treating a blank value as unset.
-///
-/// `KEY=` in a .env file is the usual way to disable a setting, so it falls back to the default
-/// instead of failing to parse. Matches how SLACK_CHANNEL and DATABASE_URL are handled.
+/// Reads an environment variable, treating a blank value as unset: `KEY=` in a .env file is the
+/// usual way to disable a setting, so it falls back to the default instead of failing to parse.
 fn optional_env(key: &str) -> Result<Option<String>> {
     match std::env::var(key) {
         Ok(value) => Ok(Some(value).filter(|v| !v.trim().is_empty())),
@@ -156,8 +154,8 @@ fn positive_usize_env(key: &str, default: usize) -> Result<usize> {
     }
 }
 
-/// Parses a count that must be at least one, naming `source` (an environment variable or a CLI
-/// flag) in the error. Shared with the command-line argument parsing in `main`.
+/// Parses a count that must be at least one, naming `source` — an environment variable or a CLI
+/// flag — in the error.
 pub fn parse_positive_usize(value: &str, source: &str) -> Result<usize> {
     let parsed = value
         .trim()
@@ -222,7 +220,7 @@ mod tests {
         assert!(parse_positive_usize("-1", "TEST").is_err());
         assert!(parse_positive_usize("", "TEST").is_err());
         assert!(parse_positive_usize("abc", "TEST").is_err());
-        // The failing source is named, so the message points at the setting to fix.
+        // The message names the setting to fix.
         let error = parse_positive_usize("0", "--max").unwrap_err().to_string();
         assert!(error.contains("--max"), "{error}");
     }
