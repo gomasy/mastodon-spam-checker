@@ -186,5 +186,26 @@ mod tests {
     #[test]
     fn html_to_plain_strips_tags_and_decodes_entities() {
         assert_eq!(html_to_plain("<p>A &amp; B<br>next</p>"), "A & B\nnext");
+        assert_eq!(
+            html_to_plain("<p>Hello <a href=\"https://example.com\">link</a></p>"),
+            "Hello link"
+        );
+    }
+
+    #[test]
+    fn html_to_plain_converts_breaks_and_paragraphs() {
+        assert_eq!(html_to_plain("<p>one</p><p>two</p>"), "one\n\ntwo");
+        assert_eq!(html_to_plain("a<br>b<br/>c<br />d"), "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn html_to_plain_unescapes_entities_once() {
+        assert_eq!(
+            html_to_plain("&lt;b&gt; &quot;x&quot; &#39;y&#39;"),
+            "<b> \"x\" 'y'"
+        );
+        // Double-escaped entities are unescaped only one level deep (because &amp; is replaced last).
+        assert_eq!(html_to_plain("&amp;lt;script&amp;gt;"), "&lt;script&gt;");
+        assert_eq!(html_to_plain("A &amp; B"), "A & B");
     }
 }
