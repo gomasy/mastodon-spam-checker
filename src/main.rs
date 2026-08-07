@@ -21,7 +21,7 @@ use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::Subscriber
 
 use crate::config::parse_positive_usize;
 use crate::ids::{numeric_id_cmp, validate_account_id};
-use crate::redis::{CampaignContext, JobRecord, JobStatus, StateStore, StoredVerdict};
+use crate::redis::{CampaignContext, JobRecord, JobStatus, StateStore};
 
 rust_i18n::i18n!("locales", fallback = "en");
 
@@ -120,23 +120,11 @@ struct CheckServices {
     slack: Option<slack::SlackNotifier>,
     /// Present for every run. Dry runs still read campaign context through it; `persist` is what
     /// decides whether anything is written back.
-    store: Option<StateStore>,
+    store: StateStore,
     note_writer: Option<postgres::ModerationNoteWriter>,
     threshold: f64,
     persist: bool,
     retry_pending: bool,
-}
-
-impl CheckServices {
-    /// The state store, for the write paths that only run when `persist` is set.
-    ///
-    /// Every caller is already inside a `persist` branch, where the store is always present, so
-    /// this collapses what would otherwise be the same `Option` handling repeated at each one.
-    fn persist_store(&self) -> Result<&StateStore> {
-        self.store
-            .as_ref()
-            .context("persistent check has no state store")
-    }
 }
 
 #[derive(Debug)]
@@ -174,6 +162,12 @@ struct ProcessSummary {
 }
 
 impl ProcessSummary {
+    /// Keeps the failure that stopped the run, which is the one that explains it. Later failures
+    /// are consequences of stopping, and the accounts behind them stay queued for retry regardless.
+    fn record_failure(&mut self, error: anyhow::Error) {
+        self.first_failure.get_or_insert(error);
+    }
+
     /// Reports what the run did, then hands back the failure that stopped it, if any.
     ///
     /// The counts are logged before the error is returned rather than after a successful finish, so
@@ -219,7 +213,7 @@ async fn check(dry_run: bool) -> Result<()> {
         "previous cursor"
     );
 
-    let services = build_services(&config, Some(store.clone()), !dry_run).await?;
+    let services = build_services(&config, store.clone(), !dry_run).await?;
     let accounts = services
         .mastodon
         .fetch_remote_accounts(cursor.as_deref(), None, config.max_accounts_per_run)
@@ -245,7 +239,7 @@ async fn check(dry_run: bool) -> Result<()> {
 
 async fn build_services(
     config: &config::Config,
-    store: Option<StateStore>,
+    store: StateStore,
     notify: bool,
 ) -> Result<CheckServices> {
     let detection = &config.detection;
@@ -262,13 +256,7 @@ async fn build_services(
     } else {
         None
     };
-    let note_writer = match config.postgres {
-        Some(ref pg) if notify => Some(
-            postgres::ModerationNoteWriter::connect(&pg.database_url, pg.moderator_account_id)
-                .await?,
-        ),
-        _ => None,
-    };
+    let note_writer = postgres::writer_for(config.postgres.as_ref().filter(|_| notify)).await?;
     Ok(CheckServices {
         mastodon,
         llm,
@@ -318,7 +306,7 @@ async fn process_accounts(
             let services = Arc::clone(&services);
             tasks.spawn(async move {
                 let id = account.id.clone();
-                (id, check_one(account, services, false).await)
+                (id, check_one(account, services).await)
             });
         }
 
@@ -328,12 +316,12 @@ async fn process_accounts(
                 Ok((id, result)) => {
                     results.insert(id, result);
                 }
-                Err(error) => {
-                    summary.first_failure = Some(anyhow::Error::new(error));
-                }
+                Err(error) => summary.record_failure(anyhow::Error::new(error)),
             }
         }
 
+        // Walked in the original order, not the order the tasks finished in: the cursor may only
+        // advance across accounts whose predecessors all succeeded.
         for account in chunk {
             let result = results
                 .remove(&account.id)
@@ -342,30 +330,20 @@ async fn process_accounts(
                 Ok(AccountCheckOutcome::Spam { notified }) => {
                     summary.spam_detected += 1;
                     summary.spam_notified += u32::from(notified);
-                    summary.last_contiguous_id = Some(account.id.clone());
                 }
-                Ok(AccountCheckOutcome::Undetermined) => {
-                    summary.undetermined += 1;
-                    summary.last_contiguous_id = Some(account.id.clone());
-                }
-                Ok(AccountCheckOutcome::Existing) => {
-                    summary.skipped_existing += 1;
-                    summary.last_contiguous_id = Some(account.id.clone());
-                }
-                Ok(AccountCheckOutcome::System | AccountCheckOutcome::NotSpam) => {
-                    summary.last_contiguous_id = Some(account.id.clone());
-                }
+                Ok(AccountCheckOutcome::Undetermined) => summary.undetermined += 1,
+                Ok(AccountCheckOutcome::Existing) => summary.skipped_existing += 1,
+                Ok(AccountCheckOutcome::System | AccountCheckOutcome::NotSpam) => {}
                 Err(error) => {
-                    if summary.first_failure.is_none() {
-                        summary.first_failure = Some(error.context(format!(
-                            "check failed for {} (account {}); retry with retry-failed",
-                            account.acct(),
-                            account.id
-                        )));
-                    }
+                    summary.record_failure(error.context(format!(
+                        "check failed for {} (account {}); retry with retry-failed",
+                        account.acct(),
+                        account.id
+                    )));
                     break;
                 }
             }
+            summary.last_contiguous_id = Some(account.id.clone());
         }
         if summary.first_failure.is_some() {
             break;
@@ -378,7 +356,6 @@ async fn process_accounts(
 async fn check_one(
     account: mastodon::AdminAccount,
     services: Arc<CheckServices>,
-    force: bool,
 ) -> Result<AccountCheckOutcome> {
     let domain = account.domain.as_deref().unwrap_or("?");
     if is_system_account(&account.username, domain) {
@@ -386,8 +363,8 @@ async fn check_one(
         return Ok(AccountCheckOutcome::System);
     }
 
-    if services.persist && !force {
-        let store = services.persist_store()?;
+    if services.persist {
+        let store = &services.store;
         if store.has_terminal_feedback(&account.id).await? {
             info!(account_id = %account.id, "account has terminal moderator feedback");
             return Ok(AccountCheckOutcome::Existing);
@@ -411,7 +388,7 @@ async fn check_one(
     let job = if services.persist {
         Some(
             services
-                .persist_store()?
+                .store
                 .begin_job(
                     &account.id,
                     &account.acct(),
@@ -426,16 +403,13 @@ async fn check_one(
 
     match check_one_inner(&account, &services).await {
         Ok(checked) => {
-            // Keyed off the job rather than off the store: a job exists only on a persistent run,
-            // where the store is guaranteed, so a missing store here is a bug to surface and not a
-            // reason to silently drop the result of a check that has already been paid for.
             if let Some(job) = job {
                 services
-                    .persist_store()?
+                    .store
                     .complete_job(
                         job,
                         checked.status,
-                        checked.verdict.as_ref().map(stored_verdict),
+                        checked.verdict.as_ref().map(Into::into),
                         checked.notified(),
                         &checked.campaign,
                     )
@@ -450,8 +424,8 @@ async fn check_one(
             Ok(checked.outcome)
         }
         Err(error) => {
-            if let (Some(store), Some(job)) = (&services.store, job)
-                && let Err(store_error) = store.fail_job(job, &error).await
+            if let Some(job) = job
+                && let Err(store_error) = services.store.fail_job(job, &error).await
             {
                 error!(error = %chain(&store_error), "failed to persist account failure");
             }
@@ -470,19 +444,15 @@ async fn check_one_inner(
         .await
         .context("failed to fetch statuses")?;
     let signals = signals::analyze(account, &statuses);
-    let campaign = match &services.store {
-        Some(store) => {
-            store
-                .campaign_context(
-                    &account.id,
-                    signals.bio_fingerprint.as_deref(),
-                    &signals.link_domains,
-                    services.persist,
-                )
-                .await?
-        }
-        None => CampaignContext::default(),
-    };
+    let campaign = services
+        .store
+        .campaign_context(
+            &account.id,
+            signals.bio_fingerprint.as_deref(),
+            &signals.link_domains,
+            services.persist,
+        )
+        .await?;
 
     let verdict = match services
         .llm
@@ -493,7 +463,7 @@ async fn check_one_inner(
         Err(error) if llm::is_unparseable_verdict(&error) => {
             warn!(
                 account_id = %account.id,
-                error = format!("{error:#}"),
+                error = %chain(&error),
                 "no usable LLM verdict, storing as undetermined"
             );
             return Ok(CheckedAccount {
@@ -560,11 +530,11 @@ async fn report_spam(
 ) -> Result<CheckedAccount> {
     if services.slack.is_some() {
         services
-            .persist_store()?
+            .store
             .record_classification(
                 &account.id,
                 JobStatus::NotificationPending,
-                stored_verdict(&verdict),
+                (&verdict).into(),
                 &campaign,
             )
             .await?;
@@ -588,26 +558,22 @@ async fn retry_pending_notification(
     services: &CheckServices,
     job: JobRecord,
 ) -> Result<AccountCheckOutcome> {
-    let stored = job
+    let verdict: llm::SpamVerdict = job
         .verdict
         .clone()
-        .context("pending notification has no stored verdict")?;
-    let verdict = llm::SpamVerdict {
-        spam: stored.spam,
-        reason: stored.reason,
-        confidence: stored.confidence,
-    };
+        .context("pending notification has no stored verdict")?
+        .into();
     let campaign = CampaignContext {
         matching_accounts: job.campaign_accounts.clone(),
     };
     match notify_with_claim(services, &account, &verdict).await {
         Ok(notified) => {
             services
-                .persist_store()?
+                .store
                 .complete_job(
                     job,
                     JobStatus::Spam,
-                    Some(stored_verdict(&verdict)),
+                    Some((&verdict).into()),
                     notified,
                     &campaign,
                 )
@@ -618,9 +584,7 @@ async fn retry_pending_notification(
             Ok(AccountCheckOutcome::Spam { notified })
         }
         Err(error) => {
-            if let Some(store) = &services.store
-                && let Err(store_error) = store.fail_job(job, &error).await
-            {
+            if let Err(store_error) = services.store.fail_job(job, &error).await {
                 error!(error = %chain(&store_error), "failed to persist notification retry failure");
             }
             Err(error)
@@ -636,7 +600,7 @@ async fn notify_with_claim(
     let Some(slack) = &services.slack else {
         return Ok(false);
     };
-    let store = services.persist_store()?;
+    let store = &services.store;
     let Some(token) = store.claim_notification(&account.id).await? else {
         if store.has_terminal_feedback(&account.id).await? {
             info!(account_id = %account.id, "notification suppressed by moderator feedback");
@@ -674,14 +638,6 @@ async fn add_spam_note(services: &CheckServices, account_id: &str, verdict: &llm
     );
     if let Err(error) = writer.add_note(account_id, &note).await {
         error!(account_id = %account_id, error = %chain(&error), "failed to add moderation note");
-    }
-}
-
-fn stored_verdict(verdict: &llm::SpamVerdict) -> StoredVerdict {
-    StoredVerdict {
-        spam: verdict.spam,
-        reason: verdict.reason.clone(),
-        confidence: verdict.confidence,
     }
 }
 
@@ -732,7 +688,7 @@ async fn retry_failed_command(args: &[String]) -> Result<()> {
         info!("retry queue is empty");
         return Ok(());
     }
-    let mut services = build_services(&config, Some(store.clone()), true).await?;
+    let mut services = build_services(&config, store.clone(), true).await?;
     services.retry_pending = true;
     let mut accounts = Vec::with_capacity(max.min(ids.len()));
     let mut unavailable = 0usize;
@@ -773,7 +729,7 @@ async fn backfill_command(args: &[String]) -> Result<()> {
     let options = BackfillOptions::parse(args)?;
     let config = config::Config::from_env(options.notify)?;
     let store = StateStore::new(&config.redis_url).await?;
-    let mut services = build_services(&config, Some(store), options.notify).await?;
+    let mut services = build_services(&config, store, options.notify).await?;
     // Backfills persist results even when notifications are intentionally disabled.
     services.persist = true;
     let accounts = services

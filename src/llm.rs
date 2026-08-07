@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -7,11 +8,9 @@ use tracing::warn;
 
 use rust_i18n::t;
 
-use std::fmt::Write;
-
 use crate::http;
 use crate::mastodon::{AdminAccount, Status};
-use crate::redis::CampaignContext;
+use crate::redis::{CampaignContext, StoredVerdict};
 use crate::signals::{AccountSignals, html_to_plain};
 use crate::text::truncate_chars;
 
@@ -33,6 +32,28 @@ pub struct SpamVerdict {
     pub spam: bool,
     pub reason: String,
     pub confidence: f64,
+}
+
+/// The stored form of a verdict, for persisting one that was just reached.
+impl From<&SpamVerdict> for StoredVerdict {
+    fn from(verdict: &SpamVerdict) -> Self {
+        Self {
+            spam: verdict.spam,
+            reason: verdict.reason.clone(),
+            confidence: verdict.confidence,
+        }
+    }
+}
+
+/// The reverse, for re-notifying from a stored verdict rather than asking the model again.
+impl From<StoredVerdict> for SpamVerdict {
+    fn from(stored: StoredVerdict) -> Self {
+        Self {
+            spam: stored.spam,
+            reason: stored.reason,
+            confidence: stored.confidence,
+        }
+    }
 }
 
 /// The model replied, but the reply carried no verdict this program can act on.
