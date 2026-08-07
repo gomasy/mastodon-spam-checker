@@ -51,9 +51,10 @@ impl DetectionConfig {
     }
 }
 
+/// Everything a checking run needs beyond its Redis connection, which every entry point opens for
+/// itself through [`redis_url_env`] before the run starts.
 pub struct Config {
     pub detection: DetectionConfig,
-    pub redis_url: String,
     pub max_accounts_per_run: usize,
     pub check_concurrency: usize,
     pub slack_webhook_url: Option<String>,
@@ -65,7 +66,6 @@ impl Config {
     pub fn from_env(require_slack: bool) -> Result<Self> {
         Ok(Self {
             detection: DetectionConfig::from_env()?,
-            redis_url: redis_url_env()?,
             max_accounts_per_run: positive_usize_env("MAX_ACCOUNTS_PER_RUN", 1_000)?,
             check_concurrency: positive_usize_env("CHECK_CONCURRENCY", 4)?,
             slack_webhook_url: if require_slack {
