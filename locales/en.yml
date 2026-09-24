@@ -24,6 +24,8 @@ feedback_check_failed_delete: ":x: Deletion aborted: could not check feedback fo
 feedback_failed: ":x: Failed to save feedback for `%{acct}`: %{error}"
 feedback_false_positive: ":information_source: <@%{user_id}> marked `%{acct}` as a false positive"
 
+decision_reason: Judged by a decision model (no reason given)
+
 llm_reason_lang: English
 
 not_suspended: ":x: Deletion aborted: `%{acct}` is not suspended (the suspension may have been lifted)"

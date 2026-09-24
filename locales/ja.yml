@@ -24,6 +24,8 @@ feedback_check_failed_delete: ":x: `%{acct}` のフィードバックを確認�
 feedback_failed: ":x: `%{acct}` のフィードバック保存に失敗しました: %{error}"
 feedback_false_positive: ":information_source: <@%{user_id}> が `%{acct}` を誤検知として記録しました"
 
+decision_reason: 判断モデルによる判定（理由なし）
+
 llm_reason_lang: Japanese
 
 not_suspended: ":x: `%{acct}` は停止されていないため削除を中止しました（停止が解除された可能性があります）"

@@ -178,6 +178,39 @@ Respond ONLY with a JSON object in this exact format (no markdown, no extra text
     )
 }
 
+/// Whether `model` is a System One decision model such as Jev, which returns typed answers
+/// through `/systemone` instead of chat text.
+fn is_decision_model(model: &str) -> bool {
+    let model = model.trim_start_matches('~');
+    model.starts_with("typesafe/") || model.starts_with("jev-")
+}
+
+#[derive(Deserialize)]
+struct DecisionResponse {
+    answers: Answers,
+}
+
+#[derive(Deserialize)]
+struct Answers {
+    spam: Option<NoulAnswer>,
+}
+
+#[derive(Deserialize)]
+struct NoulAnswer {
+    noul: Option<f64>,
+}
+
+/// Turns a spam probability into a verdict. Decision models give no reason.
+fn decision_verdict(probability: f64) -> SpamVerdict {
+    let probability = normalize_confidence(probability);
+    let spam = probability > 0.5;
+    SpamVerdict {
+        spam,
+        reason: t!("decision_reason").into_owned(),
+        confidence: if spam { probability } else { 1.0 - probability },
+    }
+}
+
 #[derive(Clone)]
 pub struct LlmClient {
     client: Client,
@@ -185,6 +218,7 @@ pub struct LlmClient {
     api_key: String,
     model: String,
     json_mode: bool,
+    decision: bool,
     retry: http::RetryConfig,
 }
 
@@ -202,6 +236,7 @@ impl LlmClient {
             api_key: api_key.to_string(),
             model: model.to_string(),
             json_mode,
+            decision: is_decision_model(model),
             retry,
         })
     }
@@ -216,7 +251,14 @@ impl LlmClient {
         campaign: &CampaignContext,
     ) -> Result<SpamVerdict> {
         let user_prompt = build_user_prompt(account, statuses, signals, campaign);
+        if self.decision {
+            self.decide(user_prompt).await
+        } else {
+            self.chat(user_prompt).await
+        }
+    }
 
+    async fn chat(&self, user_prompt: String) -> Result<SpamVerdict> {
         let request = ChatRequest {
             model: self.model.clone(),
             messages: vec![
@@ -234,9 +276,30 @@ impl LlmClient {
                 kind: "json_object",
             }),
         };
-
         let resp: ChatResponse = self.post("chat/completions", &request).await?;
         parse_verdict(strip_code_fence(response_content(&resp)?))
+    }
+
+    async fn decide(&self, user_prompt: String) -> Result<SpamVerdict> {
+        let request = serde_json::json!({
+            "model": self.model,
+            "state": user_prompt,
+            "questions": { "spam": {
+                "type": "noul",
+                "instructions": SPAM_GUIDELINES,
+                "criteria": {
+                    "true": "The account clearly matches at least two distinct evaluation criteria.",
+                    "false": "Fewer than two distinct evaluation criteria are clearly supported.",
+                },
+            }},
+        });
+        let resp: DecisionResponse = self.post("systemone", &request).await?;
+        let probability = resp
+            .answers
+            .spam
+            .and_then(|answer| answer.noul)
+            .ok_or_else(|| UnparseableVerdict::new("response has no spam probability", ""))?;
+        Ok(decision_verdict(probability))
     }
 
     async fn post<T: DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> Result<T> {
@@ -587,6 +650,28 @@ mod tests {
         assert_eq!(verdict.confidence, 0.0);
         let verdict = parse_verdict(r#"{"spam":true,"reason":"test","confidence":85}"#).unwrap();
         assert_eq!(verdict.confidence, 0.85);
+    }
+
+    #[test]
+    fn decision_models_are_detected() {
+        assert!(is_decision_model("typesafe/jev-1.13"));
+        assert!(is_decision_model("~typesafe/jev-latest"));
+        assert!(is_decision_model("jev-latest"));
+        assert!(!is_decision_model("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn decision_probability_becomes_a_verdict() {
+        let verdict = decision_verdict(0.9);
+        assert!(verdict.spam);
+        assert_eq!(verdict.confidence, 0.9);
+
+        // An undecided answer falls on the not-spam side.
+        assert!(!decision_verdict(0.5).spam);
+
+        let verdict = decision_verdict(0.2);
+        assert!(!verdict.spam);
+        assert_eq!(verdict.confidence, 0.8);
     }
 
     #[test]
