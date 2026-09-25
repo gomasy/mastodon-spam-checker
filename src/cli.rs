@@ -12,6 +12,7 @@ use crate::chain;
 use crate::check::{self, CheckServices, ServiceOptions};
 use crate::config::{self, Config, DetectionConfig, parse_positive_usize};
 use crate::ids::{numeric_id_cmp, validate_account_id};
+use crate::mastodon::{AdminAccount, MastodonClient};
 use crate::redis::{CampaignContext, StateStore};
 use crate::{server, signals};
 
@@ -236,22 +237,33 @@ async fn retry_failed_command(store: StateStore, max: usize) -> Result<()> {
 }
 
 async fn backfill_command(store: StateStore, options: BackfillOptions) -> Result<()> {
-    let config = Config::from_env(options.notify)?;
+    persisted_check(store, options.notify, async |mastodon| {
+        mastodon
+            .fetch_remote_accounts(Some(&options.from), options.to.as_deref(), options.max)
+            .await
+    })
+    .await
+}
+
+/// Checks the accounts `select` picks, persisting results without touching the cursor.
+async fn persisted_check(
+    store: StateStore,
+    notify: bool,
+    select: impl AsyncFnOnce(&MastodonClient) -> Result<Vec<AdminAccount>>,
+) -> Result<()> {
+    let config = Config::from_env(notify)?;
     let services = CheckServices::build(
         &config,
         store,
         ServiceOptions {
-            notify: options.notify,
-            // Backfills persist results even when notifications are intentionally disabled.
+            notify,
+            // Results are persisted even when notifications are intentionally disabled.
             persist: true,
             retry_pending: false,
         },
     )
     .await?;
-    let accounts = services
-        .mastodon()
-        .fetch_remote_accounts(Some(&options.from), options.to.as_deref(), options.max)
-        .await?;
+    let accounts = select(services.mastodon()).await?;
     check::process_accounts(accounts, services, config.check_concurrency)
         .await
         .finish(false)
