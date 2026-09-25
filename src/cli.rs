@@ -17,7 +17,7 @@ use crate::redis::{CampaignContext, StateStore};
 use crate::{server, signals};
 
 pub fn usage() -> &'static str {
-    "usage: mastodon-spam-checker [serve|dry-run|check-account <ID>|cursor|retry-failed [--max N]|backfill --from ID [--to ID] [--max N] [--notify]]"
+    "usage: mastodon-spam-checker [serve|dry-run|check-account <ID>|cursor|retry-failed [--max N]|backfill --from ID [--to ID] [--max N] [--notify]|check-acct <USER@DOMAIN>... [--notify]]"
 }
 
 pub async fn dispatch(args: &[String]) -> Result<()> {
@@ -34,6 +34,10 @@ pub async fn dispatch(args: &[String]) -> Result<()> {
         Some("backfill") => {
             let options = BackfillOptions::parse(&args[1..])?;
             exclusive_run(|store| backfill_command(store, options)).await
+        }
+        Some("check-acct") => {
+            let options = AcctOptions::parse(&args[1..])?;
+            exclusive_run(|store| check_acct_command(store, options)).await
         }
         _ => bail!(usage()),
     }
@@ -245,6 +249,24 @@ async fn backfill_command(store: StateStore, options: BackfillOptions) -> Result
     .await
 }
 
+async fn check_acct_command(store: StateStore, options: AcctOptions) -> Result<()> {
+    persisted_check(store, options.notify, async |mastodon| {
+        let mut accounts: Vec<AdminAccount> = Vec::with_capacity(options.accts.len());
+        for acct in &options.accts {
+            let account = mastodon
+                .fetch_admin_account_by_acct(acct)
+                .await?
+                .with_context(|| format!("account {acct} was not found"))?;
+            // A duplicate would be checked concurrently with itself, racing the processed guard.
+            if accounts.iter().all(|a| a.id != account.id) {
+                accounts.push(account);
+            }
+        }
+        Ok(accounts)
+    })
+    .await
+}
+
 /// Checks the accounts `select` picks, persisting results without touching the cursor.
 async fn persisted_check(
     store: StateStore,
@@ -267,6 +289,42 @@ async fn persisted_check(
     check::process_accounts(accounts, services, config.check_concurrency)
         .await
         .finish(false)
+}
+
+struct AcctOptions {
+    accts: Vec<String>,
+    notify: bool,
+}
+
+impl AcctOptions {
+    fn parse(args: &[String]) -> Result<Self> {
+        let mut accts = Vec::new();
+        let mut notify = false;
+        for arg in args {
+            if arg == "--notify" {
+                notify = true;
+            } else {
+                accts.push(parse_acct(arg)?);
+            }
+        }
+        if accts.is_empty() {
+            bail!(usage());
+        }
+        Ok(Self { accts, notify })
+    }
+}
+
+/// Normalizes `[@]username@domain` to `username@domain`.
+fn parse_acct(acct: &str) -> Result<String> {
+    let bare = acct.strip_prefix('@').unwrap_or(acct);
+    match bare.split_once('@') {
+        Some((username, domain))
+            if !username.is_empty() && !domain.is_empty() && !domain.contains('@') =>
+        {
+            Ok(bare.to_string())
+        }
+        _ => bail!("invalid acct {acct:?}: expected username@domain"),
+    }
 }
 
 struct BackfillOptions {
@@ -366,6 +424,19 @@ mod tests {
         let options = parse(&["--notify", "--from", "10"]).unwrap();
         assert!(options.notify);
         assert_eq!(options.from, "10");
+    }
+
+    #[test]
+    fn acct_options_are_parsed() {
+        let options =
+            AcctOptions::parse(&["@Alice@example.com".into(), "--notify".into()]).unwrap();
+        assert_eq!(options.accts, ["Alice@example.com"]);
+        assert!(options.notify);
+        assert!(AcctOptions::parse(&[]).is_err(), "no acct");
+        assert!(AcctOptions::parse(&["--notify".into()]).is_err(), "no acct");
+        for bad in ["alice", "alice@", "@example.com", "a@b@c", "--wat"] {
+            assert!(parse_acct(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

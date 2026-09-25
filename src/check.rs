@@ -1,4 +1,4 @@
-//! The spam-check pipeline, shared by the periodic run, `retry-failed`, and `backfill`.
+//! The spam-check pipeline, shared by the periodic run, `retry-failed`, `backfill`, and `check-acct`.
 //!
 //! [`check_one`] takes one account through statuses, campaign signals, verdict, notification, and
 //! recording; [`process_accounts`] runs that over a list and reports how far it got.

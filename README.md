@@ -115,7 +115,7 @@ directory is also loaded.
 | `OPENAI_MODEL` | | `gpt-4o` | Model name. Decision models (`typesafe/…`, `jev-…`) are called through `/systemone` and report only a spam probability, with no written reason |
 | `OPENAI_JSON_MODE` | | `true` | Set to `false` for APIs without `response_format` support. Accepts `true`, `false`, `1`, or `0` (case-insensitive) |
 | `SPAM_CONFIDENCE_THRESHOLD` | | `0.0` | Skip Slack notifications for spam verdicts below this confidence (0.0–1.0) |
-| `SLACK_WEBHOOK_URL` | normal check | – | Slack incoming webhook URL. Not required by `dry-run`, `check-account`, or backfill without `--notify` |
+| `SLACK_WEBHOOK_URL` | normal check | – | Slack incoming webhook URL. Not required by `dry-run`, `check-account`, or backfill and `check-acct` without `--notify` |
 | `SLACK_CHANNEL` | | – | Override the webhook's default channel. Only honored by legacy custom-integration webhooks — Slack-app webhooks (required for the suspend button) always post to the channel chosen at install time. Quote the value (`"#spam-alerts"`) so `#` is not parsed as a comment |
 | `SLACK_SIGNING_SECRET` | `serve` only | – | Signing secret of your Slack app (Basic Information page) |
 | `LISTEN_ADDR` | | `127.0.0.1:8990` | Listen address for `serve` mode |
@@ -169,6 +169,15 @@ notifications are disabled unless `--notify` is supplied:
 ```sh
 mastodon-spam-checker backfill --from 1000000000 --to 2000000000 --max 500
 mastodon-spam-checker backfill --from 1000000000 --max 100 --notify
+```
+
+Check only specific accounts by acct (resolved via the public
+`/api/v1/accounts/lookup`). Like backfill, results are
+persisted without changing the cursor, already-processed accounts are skipped,
+and Slack notifications require `--notify`:
+
+```sh
+mastodon-spam-checker check-acct alice@example.com @bob@example.net --notify
 ```
 
 ## Slack actions (`serve` mode)

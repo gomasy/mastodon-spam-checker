@@ -6,7 +6,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::http;
-use crate::ids::numeric_id_cmp;
+use crate::ids::{numeric_id_cmp, validate_account_id};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AdminAccount {
@@ -189,6 +189,32 @@ impl MastodonClient {
         // Pages can overlap at their bounds, so per-page ordering does not carry across the seam.
         sort_unique_by_id(&mut accounts);
         Ok(accounts)
+    }
+
+    /// Resolves an acct to its admin account. `lookup` matches exactly and normalizes case, and is
+    /// called anonymously like [`Self::fetch_statuses`], since the token carries only admin scopes.
+    pub async fn fetch_admin_account_by_acct(&self, acct: &str) -> Result<Option<AdminAccount>> {
+        #[derive(Deserialize)]
+        struct Lookup {
+            id: String,
+        }
+
+        let query = serde_urlencoded::to_string([("acct", acct)])
+            .context("failed to build lookup query")?;
+        let url = format!("{}/api/v1/accounts/lookup?{query}", self.base_url);
+        let resp =
+            http::send_with_retry_raw(|| self.client.get(&url), "Account lookup API", self.retry)
+                .await?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let Lookup { id } = http::ensure_success(resp, "Account lookup API")
+            .await?
+            .json()
+            .await
+            .context("failed to parse account lookup response")?;
+        validate_account_id(&id)?;
+        self.fetch_admin_account_optional(&id).await
     }
 
     pub async fn fetch_admin_account(&self, account_id: &str) -> Result<AdminAccount> {
