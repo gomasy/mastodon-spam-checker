@@ -1,4 +1,4 @@
-//! The spam-check pipeline, shared by the periodic run, `retry-failed`, `backfill`, and `check-acct`.
+//! The spam-check pipeline, shared by the periodic run, `retry-failed`, and `backfill`.
 //!
 //! [`check_one`] takes one account through statuses, campaign signals, verdict, notification, and
 //! recording; [`process_accounts`] runs that over a list and reports how far it got.
@@ -29,8 +29,6 @@ pub struct ServiceOptions {
     pub persist: bool,
     /// Re-send a notification whose delivery was left uncertain, rather than skipping the account.
     pub retry_pending: bool,
-    /// Print each fresh verdict as [`verdict_json`].
-    pub print_verdicts: bool,
 }
 
 pub struct CheckServices {
@@ -43,7 +41,6 @@ pub struct CheckServices {
     note_writer: Option<ModerationNoteWriter>,
     persist: bool,
     retry_pending: bool,
-    print_verdicts: bool,
 }
 
 impl CheckServices {
@@ -76,7 +73,6 @@ impl CheckServices {
             note_writer,
             persist: options.persist,
             retry_pending: options.retry_pending,
-            print_verdicts: options.print_verdicts,
         })
     }
 
@@ -86,8 +82,8 @@ impl CheckServices {
     }
 }
 
-/// The two clients a spam check always needs. Shared with `check-account`, which builds them
-/// without the rest of [`CheckServices`].
+/// The two clients a spam check always needs. Shared with the one-off inspection commands, which
+/// build them without the rest of [`CheckServices`].
 pub fn detection_clients(detection: &DetectionConfig) -> Result<(MastodonClient, LlmClient)> {
     let mastodon = MastodonClient::new(
         &detection.mastodon_base_url,
@@ -135,7 +131,7 @@ struct CheckedAccount {
     campaign: CampaignContext,
 }
 
-/// The `check-account` output for one verdict.
+/// The `check-account` and `check-acct` output for one verdict.
 pub fn verdict_json(account: &AdminAccount, verdict: &SpamVerdict) -> serde_json::Value {
     serde_json::json!({
         "account_id": account.id,
@@ -322,11 +318,6 @@ async fn check_one(
             } = &checked.outcome
             {
                 add_spam_note(&services, &account.id, verdict).await;
-            }
-            if services.print_verdicts
-                && let Some(verdict) = checked.outcome.verdict()
-            {
-                println!("{:#}", verdict_json(&account, verdict));
             }
             Ok(checked.outcome)
         }

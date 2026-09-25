@@ -12,12 +12,13 @@ use crate::chain;
 use crate::check::{self, CheckServices, ServiceOptions};
 use crate::config::{self, Config, DetectionConfig, parse_positive_usize};
 use crate::ids::{numeric_id_cmp, validate_account_id};
+use crate::llm::LlmClient;
 use crate::mastodon::{AdminAccount, MastodonClient};
 use crate::redis::{CampaignContext, StateStore};
 use crate::{server, signals};
 
 pub fn usage() -> &'static str {
-    "usage: mastodon-spam-checker [serve|dry-run|check-account <ID>|cursor|retry-failed [--max N]|backfill --from ID [--to ID] [--max N] [--notify]|check-acct <USER@DOMAIN>... [--notify]]"
+    "usage: mastodon-spam-checker [serve|dry-run|check-account <ID>|cursor|retry-failed [--max N]|backfill --from ID [--to ID] [--max N] [--notify]|check-acct <USER@DOMAIN>]"
 }
 
 pub async fn dispatch(args: &[String]) -> Result<()> {
@@ -35,10 +36,7 @@ pub async fn dispatch(args: &[String]) -> Result<()> {
             let options = BackfillOptions::parse(&args[1..])?;
             exclusive_run(|store| backfill_command(store, options)).await
         }
-        Some("check-acct") => {
-            let options = AcctOptions::parse(&args[1..])?;
-            exclusive_run(|store| check_acct_command(store, options)).await
-        }
+        Some("check-acct") => check_acct_command(&args[1..]).await,
         _ => bail!(usage()),
     }
 }
@@ -121,7 +119,6 @@ async fn check(store: StateStore, dry_run: bool) -> Result<()> {
             notify: !dry_run,
             persist: !dry_run,
             retry_pending: false,
-            print_verdicts: false,
         },
     )
     .await?;
@@ -155,14 +152,36 @@ async fn check_account_command(args: &[String]) -> Result<()> {
     validate_account_id(account_id)?;
     let (mastodon, llm) = check::detection_clients(&DetectionConfig::from_env()?)?;
     let account = mastodon.fetch_admin_account(account_id).await?;
-    let statuses = mastodon.fetch_statuses(account_id).await?;
-    let signals = signals::analyze(&account, &statuses);
+    inspect_account(&mastodon, &llm, &account).await
+}
+
+async fn check_acct_command(args: &[String]) -> Result<()> {
+    let [acct] = args else {
+        bail!("usage: mastodon-spam-checker check-acct <USER@DOMAIN>");
+    };
+    let acct = parse_acct(acct)?;
+    let (mastodon, llm) = check::detection_clients(&DetectionConfig::from_env()?)?;
+    let account = mastodon
+        .fetch_admin_account_by_acct(&acct)
+        .await?
+        .with_context(|| format!("account {acct} was not found"))?;
+    inspect_account(&mastodon, &llm, &account).await
+}
+
+/// Classifies one account and prints the verdict, shared by `check-account` and `check-acct`.
+async fn inspect_account(
+    mastodon: &MastodonClient,
+    llm: &LlmClient,
+    account: &AdminAccount,
+) -> Result<()> {
+    let statuses = mastodon.fetch_statuses(&account.id).await?;
+    let signals = signals::analyze(account, &statuses);
     // A one-off inspection touches no state, so it carries no campaign history.
     let verdict = llm
-        .check_spam(&account, &statuses, &signals, &CampaignContext::default())
+        .check_spam(account, &statuses, &signals, &CampaignContext::default())
         .await?;
     info!(spam_probability = verdict.spam_probability(), "checked");
-    println!("{:#}", check::verdict_json(&account, &verdict));
+    println!("{:#}", check::verdict_json(account, &verdict));
     Ok(())
 }
 
@@ -194,7 +213,6 @@ async fn retry_failed_command(store: StateStore, max: usize) -> Result<()> {
             notify: true,
             persist: true,
             retry_pending: true,
-            print_verdicts: false,
         },
     )
     .await?;
@@ -235,28 +253,10 @@ async fn retry_failed_command(store: StateStore, max: usize) -> Result<()> {
 }
 
 async fn backfill_command(store: StateStore, options: BackfillOptions) -> Result<()> {
-    persisted_check(store, options.notify, false, async |mastodon| {
+    persisted_check(store, options.notify, async |mastodon| {
         mastodon
             .fetch_remote_accounts(Some(&options.from), options.to.as_deref(), options.max)
             .await
-    })
-    .await
-}
-
-async fn check_acct_command(store: StateStore, options: AcctOptions) -> Result<()> {
-    persisted_check(store, options.notify, true, async |mastodon| {
-        let mut accounts: Vec<AdminAccount> = Vec::with_capacity(options.accts.len());
-        for acct in &options.accts {
-            let account = mastodon
-                .fetch_admin_account_by_acct(acct)
-                .await?
-                .with_context(|| format!("account {acct} was not found"))?;
-            // A duplicate would be checked concurrently with itself, racing the processed guard.
-            if accounts.iter().all(|a| a.id != account.id) {
-                accounts.push(account);
-            }
-        }
-        Ok(accounts)
     })
     .await
 }
@@ -265,7 +265,6 @@ async fn check_acct_command(store: StateStore, options: AcctOptions) -> Result<(
 async fn persisted_check(
     store: StateStore,
     notify: bool,
-    print_verdicts: bool,
     select: impl AsyncFnOnce(&MastodonClient) -> Result<Vec<AdminAccount>>,
 ) -> Result<()> {
     let config = Config::from_env(notify)?;
@@ -277,7 +276,6 @@ async fn persisted_check(
             // Results are persisted even when notifications are intentionally disabled.
             persist: true,
             retry_pending: false,
-            print_verdicts,
         },
     )
     .await?;
@@ -285,29 +283,6 @@ async fn persisted_check(
     check::process_accounts(accounts, services, config.check_concurrency)
         .await
         .finish(false)
-}
-
-struct AcctOptions {
-    accts: Vec<String>,
-    notify: bool,
-}
-
-impl AcctOptions {
-    fn parse(args: &[String]) -> Result<Self> {
-        let mut accts = Vec::new();
-        let mut notify = false;
-        for arg in args {
-            if arg == "--notify" {
-                notify = true;
-            } else {
-                accts.push(parse_acct(arg)?);
-            }
-        }
-        if accts.is_empty() {
-            bail!(usage());
-        }
-        Ok(Self { accts, notify })
-    }
 }
 
 /// Normalizes `[@]username@domain` to `username@domain`.
@@ -423,13 +398,11 @@ mod tests {
     }
 
     #[test]
-    fn acct_options_are_parsed() {
-        let options =
-            AcctOptions::parse(&["@Alice@example.com".into(), "--notify".into()]).unwrap();
-        assert_eq!(options.accts, ["Alice@example.com"]);
-        assert!(options.notify);
-        assert!(AcctOptions::parse(&[]).is_err(), "no acct");
-        assert!(AcctOptions::parse(&["--notify".into()]).is_err(), "no acct");
+    fn acct_is_parsed() {
+        assert_eq!(
+            parse_acct("@Alice@example.com").unwrap(),
+            "Alice@example.com"
+        );
         for bad in ["alice", "alice@", "@example.com", "a@b@c", "--wat"] {
             assert!(parse_acct(bad).is_err(), "{bad}");
         }
