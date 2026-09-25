@@ -181,7 +181,16 @@ async fn inspect_account(
         .check_spam(account, &statuses, &signals, &CampaignContext::default())
         .await?;
     info!(spam_probability = verdict.spam_probability(), "checked");
-    println!("{:#}", check::verdict_json(account, &verdict));
+    println!(
+        "{:#}",
+        serde_json::json!({
+            "account_id": account.id,
+            "acct": account.acct(),
+            "spam": verdict.spam,
+            "confidence": verdict.confidence,
+            "reason": verdict.reason,
+        })
+    );
     Ok(())
 }
 
@@ -252,34 +261,24 @@ async fn retry_failed_command(store: StateStore, max: usize) -> Result<()> {
         .finish(false)
 }
 
+/// Checks an ID range, persisting results without touching the cursor.
 async fn backfill_command(store: StateStore, options: BackfillOptions) -> Result<()> {
-    persisted_check(store, options.notify, async |mastodon| {
-        mastodon
-            .fetch_remote_accounts(Some(&options.from), options.to.as_deref(), options.max)
-            .await
-    })
-    .await
-}
-
-/// Checks the accounts `select` picks, persisting results without touching the cursor.
-async fn persisted_check(
-    store: StateStore,
-    notify: bool,
-    select: impl AsyncFnOnce(&MastodonClient) -> Result<Vec<AdminAccount>>,
-) -> Result<()> {
-    let config = Config::from_env(notify)?;
+    let config = Config::from_env(options.notify)?;
     let services = CheckServices::build(
         &config,
         store,
         ServiceOptions {
-            notify,
+            notify: options.notify,
             // Results are persisted even when notifications are intentionally disabled.
             persist: true,
             retry_pending: false,
         },
     )
     .await?;
-    let accounts = select(services.mastodon()).await?;
+    let accounts = services
+        .mastodon()
+        .fetch_remote_accounts(Some(&options.from), options.to.as_deref(), options.max)
+        .await?;
     check::process_accounts(accounts, services, config.check_concurrency)
         .await
         .finish(false)

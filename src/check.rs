@@ -131,17 +131,6 @@ struct CheckedAccount {
     campaign: CampaignContext,
 }
 
-/// The `check-account` and `check-acct` output for one verdict.
-pub fn verdict_json(account: &AdminAccount, verdict: &SpamVerdict) -> serde_json::Value {
-    serde_json::json!({
-        "account_id": account.id,
-        "acct": account.acct(),
-        "spam": verdict.spam,
-        "confidence": verdict.confidence,
-        "reason": verdict.reason,
-    })
-}
-
 #[derive(Default)]
 pub struct ProcessSummary {
     last_contiguous_id: Option<String>,
@@ -373,11 +362,11 @@ async fn check_one_inner(
         Err(error) => return Err(error).context("LLM check failed"),
     };
 
-    // Neither outcome below owes anything to Slack, so nothing is written ahead of time: the
-    // caller completes the job with this verdict as the next step.
     let domain = account.domain.as_deref().unwrap_or("?");
+    let spam_probability = verdict.spam_probability();
     if !verdict.spam {
-        let spam_probability = verdict.spam_probability();
+        // Nothing is owed to Slack, so nothing is written ahead of time: the caller completes the
+        // job with this verdict as the next step.
         info!(username = %account.username, %domain, spam_probability, "not spam");
         return Ok(CheckedAccount {
             outcome: AccountCheckOutcome::NotSpam(verdict),
@@ -389,7 +378,7 @@ async fn check_one_inner(
     warn!(
         username = %account.username,
         %domain,
-        spam_probability = verdict.confidence,
+        spam_probability,
         reason = %verdict.reason,
         campaign_matches = campaign.match_count(),
         "spam detected"
