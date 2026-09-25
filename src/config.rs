@@ -29,7 +29,7 @@ pub struct DetectionConfig {
     pub openai_api_key: String,
     pub openai_model: String,
     pub openai_json_mode: bool,
-    /// Skip Slack notifications if the spam confidence is below this threshold (0.0–1.0).
+    /// Decision models: a not-spam verdict below this confidence (0.0–1.0) counts as spam.
     pub spam_confidence_threshold: f64,
 }
 
@@ -45,7 +45,7 @@ impl DetectionConfig {
             openai_json_mode: bool_env("OPENAI_JSON_MODE", true)?,
             spam_confidence_threshold: match optional_env("SPAM_CONFIDENCE_THRESHOLD")? {
                 Some(value) => parse_confidence_threshold(&value)?,
-                None => 0.0,
+                None => 0.7,
             },
         })
     }

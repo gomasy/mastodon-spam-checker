@@ -210,10 +210,11 @@ struct NoulAnswer {
     noul: Option<f64>,
 }
 
-/// Turns a spam probability into a verdict. Decision models give no reason.
-fn decision_verdict(probability: f64) -> SpamVerdict {
+/// Turns a spam probability into a verdict: spam unless not-spam is at least `min_not_spam` sure.
+/// Decision models give no reason.
+fn decision_verdict(probability: f64, min_not_spam: f64) -> SpamVerdict {
     let probability = normalize_confidence(probability);
-    let spam = probability > 0.5;
+    let spam = 1.0 - probability < min_not_spam;
     SpamVerdict {
         spam,
         reason: t!("decision_reason").into_owned(),
@@ -229,6 +230,7 @@ pub struct LlmClient {
     model: String,
     json_mode: bool,
     decision: bool,
+    min_not_spam: f64,
     retry: http::RetryConfig,
 }
 
@@ -238,6 +240,7 @@ impl LlmClient {
         api_key: &str,
         model: &str,
         json_mode: bool,
+        min_not_spam: f64,
         retry: http::RetryConfig,
     ) -> Result<Self> {
         Ok(Self {
@@ -247,6 +250,7 @@ impl LlmClient {
             model: model.to_string(),
             json_mode,
             decision: is_decision_model(model),
+            min_not_spam,
             retry,
         })
     }
@@ -309,7 +313,7 @@ impl LlmClient {
             .spam
             .and_then(|answer| answer.noul)
             .ok_or_else(|| UnparseableVerdict::new("response has no spam probability", ""))?;
-        Ok(decision_verdict(probability))
+        Ok(decision_verdict(probability, self.min_not_spam))
     }
 
     async fn post<T: DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> Result<T> {
@@ -672,16 +676,21 @@ mod tests {
 
     #[test]
     fn decision_probability_becomes_a_verdict() {
-        let verdict = decision_verdict(0.9);
+        let verdict = decision_verdict(0.9, 0.5);
         assert!(verdict.spam);
         assert_eq!(verdict.confidence, 0.9);
 
         // An undecided answer falls on the not-spam side.
-        assert!(!decision_verdict(0.5).spam);
+        assert!(!decision_verdict(0.5, 0.5).spam);
 
-        let verdict = decision_verdict(0.2);
+        let verdict = decision_verdict(0.2, 0.5);
         assert!(!verdict.spam);
         assert_eq!(verdict.confidence, 0.8);
+        assert!((verdict.spam_probability() - 0.2).abs() < 1e-9);
+
+        // Not-spam below the required confidence counts as spam.
+        assert!(decision_verdict(0.4, 0.7).spam);
+        assert!(!decision_verdict(0.25, 0.7).spam);
     }
 
     #[test]

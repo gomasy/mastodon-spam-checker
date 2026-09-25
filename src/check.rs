@@ -41,7 +41,6 @@ pub struct CheckServices {
     /// whether anything is written back.
     store: StateStore,
     note_writer: Option<ModerationNoteWriter>,
-    threshold: f64,
     persist: bool,
     retry_pending: bool,
     print_verdicts: bool,
@@ -75,7 +74,6 @@ impl CheckServices {
             slack,
             store,
             note_writer,
-            threshold: detection.spam_confidence_threshold,
             persist: options.persist,
             retry_pending: options.retry_pending,
             print_verdicts: options.print_verdicts,
@@ -100,6 +98,7 @@ pub fn detection_clients(detection: &DetectionConfig) -> Result<(MastodonClient,
         &detection.openai_api_key,
         &detection.openai_model,
         detection.openai_json_mode,
+        detection.spam_confidence_threshold,
         http::RetryConfig::default(),
     )?;
     Ok((mastodon, llm))
@@ -396,25 +395,6 @@ async fn check_one_inner(
         });
     }
 
-    if verdict.confidence < services.threshold {
-        info!(
-            username = %account.username,
-            %domain,
-            spam_probability = verdict.confidence,
-            threshold = services.threshold,
-            reason = %verdict.reason,
-            "spam detected below notification threshold"
-        );
-        return Ok(CheckedAccount {
-            outcome: AccountCheckOutcome::Spam {
-                verdict,
-                notified: false,
-            },
-            status: JobStatus::Spam,
-            campaign,
-        });
-    }
-
     warn!(
         username = %account.username,
         %domain,
@@ -426,7 +406,7 @@ async fn check_one_inner(
     report_spam(account, services, verdict, campaign).await
 }
 
-/// Notifies moderators about a spam verdict that cleared the threshold, and records it.
+/// Notifies moderators about a spam verdict, and records it.
 ///
 /// The classification is written as pending before the notification goes out, so a crash
 /// mid-delivery leaves the account queued for retry rather than looking finished. With no Slack

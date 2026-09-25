@@ -65,10 +65,9 @@ alone, and `retry-failed` re-sends it from the persisted verdict.
 
 ### Confidence threshold
 
-`SPAM_CONFIDENCE_THRESHOLD` (0.0–1.0) suppresses noisy notifications: a spam
-verdict is reported to Slack only when its `confidence` meets the threshold.
-Detections below it are logged and otherwise ignored. The default `0.0` notifies
-on every spam verdict.
+With a decision model, `SPAM_CONFIDENCE_THRESHOLD` (0.0–1.0, default `0.7`) is
+how sure a not-spam verdict must be: below it, the account counts as spam. Every
+spam verdict is reported to Slack, and each account's spam probability is logged.
 
 ### Dry-run mode
 
@@ -79,7 +78,7 @@ on every spam verdict.
 Runs the same fetch → LLM judgment pipeline but **does not** send Slack
 notifications, require `SLACK_WEBHOOK_URL`, persist account jobs, or advance the
 cursor — useful for tuning the prompt, model, or `SPAM_CONFIDENCE_THRESHOLD`.
-Judgment results, including below-threshold detections, are still logged.
+Judgment results are still logged.
 
 ## Requirements
 
@@ -114,7 +113,7 @@ directory is also loaded.
 | `OPENAI_API_KEY` | ✅ | – | API key |
 | `OPENAI_MODEL` | | `gpt-4o` | Model name. Decision models (`typesafe/…`, `jev-…`) are called through `/systemone` and report only a spam probability, with no written reason |
 | `OPENAI_JSON_MODE` | | `true` | Set to `false` for APIs without `response_format` support. Accepts `true`, `false`, `1`, or `0` (case-insensitive) |
-| `SPAM_CONFIDENCE_THRESHOLD` | | `0.0` | Skip Slack notifications for spam verdicts below this confidence (0.0–1.0) |
+| `SPAM_CONFIDENCE_THRESHOLD` | | `0.7` | Decision models only: a not-spam verdict below this confidence (0.0–1.0) counts as spam |
 | `SLACK_WEBHOOK_URL` | normal check | – | Slack incoming webhook URL. Not required by `dry-run`, `check-account`, or backfill and `check-acct` without `--notify` |
 | `SLACK_CHANNEL` | | – | Override the webhook's default channel. Only honored by legacy custom-integration webhooks — Slack-app webhooks (required for the suspend button) always post to the channel chosen at install time. Quote the value (`"#spam-alerts"`) so `#` is not parsed as a comment |
 | `SLACK_SIGNING_SECRET` | `serve` only | – | Signing secret of your Slack app (Basic Information page) |
