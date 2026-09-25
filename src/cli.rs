@@ -161,6 +161,7 @@ async fn check_account_command(args: &[String]) -> Result<()> {
     let verdict = llm
         .check_spam(&account, &statuses, &signals, &CampaignContext::default())
         .await?;
+    info!(spam_probability = verdict.spam_probability(), "checked");
     println!("{:#}", check::verdict_json(&account, &verdict));
     Ok(())
 }

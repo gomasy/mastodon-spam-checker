@@ -387,7 +387,8 @@ async fn check_one_inner(
     // caller completes the job with this verdict as the next step.
     let domain = account.domain.as_deref().unwrap_or("?");
     if !verdict.spam {
-        info!(username = %account.username, %domain, "not spam");
+        let spam_probability = verdict.spam_probability();
+        info!(username = %account.username, %domain, spam_probability, "not spam");
         return Ok(CheckedAccount {
             outcome: AccountCheckOutcome::NotSpam(verdict),
             status: JobStatus::NotSpam,
@@ -399,7 +400,7 @@ async fn check_one_inner(
         info!(
             username = %account.username,
             %domain,
-            confidence = verdict.confidence,
+            spam_probability = verdict.confidence,
             threshold = services.threshold,
             reason = %verdict.reason,
             "spam detected below notification threshold"
@@ -417,7 +418,7 @@ async fn check_one_inner(
     warn!(
         username = %account.username,
         %domain,
-        confidence = verdict.confidence,
+        spam_probability = verdict.confidence,
         reason = %verdict.reason,
         campaign_matches = campaign.match_count(),
         "spam detected"

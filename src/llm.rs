@@ -34,6 +34,16 @@ pub struct SpamVerdict {
     pub confidence: f64,
 }
 
+impl SpamVerdict {
+    pub fn spam_probability(&self) -> f64 {
+        if self.spam {
+            self.confidence
+        } else {
+            1.0 - self.confidence
+        }
+    }
+}
+
 impl From<&SpamVerdict> for StoredVerdict {
     fn from(verdict: &SpamVerdict) -> Self {
         Self {
