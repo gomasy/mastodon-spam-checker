@@ -174,7 +174,8 @@ mastodon-spam-checker backfill --from 1000000000 --max 100 --notify
 Check only specific accounts by acct (resolved via the public
 `/api/v1/accounts/lookup`). Like backfill, results are
 persisted without changing the cursor, already-processed accounts are skipped,
-and Slack notifications require `--notify`:
+and Slack notifications require `--notify`. Each fresh verdict is printed
+like `check-account`:
 
 ```sh
 mastodon-spam-checker check-acct alice@example.com @bob@example.net --notify

@@ -121,6 +121,7 @@ async fn check(store: StateStore, dry_run: bool) -> Result<()> {
             notify: !dry_run,
             persist: !dry_run,
             retry_pending: false,
+            print_verdicts: false,
         },
     )
     .await?;
@@ -160,16 +161,7 @@ async fn check_account_command(args: &[String]) -> Result<()> {
     let verdict = llm
         .check_spam(&account, &statuses, &signals, &CampaignContext::default())
         .await?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "account_id": account.id,
-            "acct": account.acct(),
-            "spam": verdict.spam,
-            "confidence": verdict.confidence,
-            "reason": verdict.reason,
-        }))?
-    );
+    println!("{:#}", check::verdict_json(&account, &verdict));
     Ok(())
 }
 
@@ -201,6 +193,7 @@ async fn retry_failed_command(store: StateStore, max: usize) -> Result<()> {
             notify: true,
             persist: true,
             retry_pending: true,
+            print_verdicts: false,
         },
     )
     .await?;
@@ -241,7 +234,7 @@ async fn retry_failed_command(store: StateStore, max: usize) -> Result<()> {
 }
 
 async fn backfill_command(store: StateStore, options: BackfillOptions) -> Result<()> {
-    persisted_check(store, options.notify, async |mastodon| {
+    persisted_check(store, options.notify, false, async |mastodon| {
         mastodon
             .fetch_remote_accounts(Some(&options.from), options.to.as_deref(), options.max)
             .await
@@ -250,7 +243,7 @@ async fn backfill_command(store: StateStore, options: BackfillOptions) -> Result
 }
 
 async fn check_acct_command(store: StateStore, options: AcctOptions) -> Result<()> {
-    persisted_check(store, options.notify, async |mastodon| {
+    persisted_check(store, options.notify, true, async |mastodon| {
         let mut accounts: Vec<AdminAccount> = Vec::with_capacity(options.accts.len());
         for acct in &options.accts {
             let account = mastodon
@@ -271,6 +264,7 @@ async fn check_acct_command(store: StateStore, options: AcctOptions) -> Result<(
 async fn persisted_check(
     store: StateStore,
     notify: bool,
+    print_verdicts: bool,
     select: impl AsyncFnOnce(&MastodonClient) -> Result<Vec<AdminAccount>>,
 ) -> Result<()> {
     let config = Config::from_env(notify)?;
@@ -282,6 +276,7 @@ async fn persisted_check(
             // Results are persisted even when notifications are intentionally disabled.
             persist: true,
             retry_pending: false,
+            print_verdicts,
         },
     )
     .await?;

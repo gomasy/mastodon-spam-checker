@@ -29,6 +29,8 @@ pub struct ServiceOptions {
     pub persist: bool,
     /// Re-send a notification whose delivery was left uncertain, rather than skipping the account.
     pub retry_pending: bool,
+    /// Print each fresh verdict as [`verdict_json`].
+    pub print_verdicts: bool,
 }
 
 pub struct CheckServices {
@@ -42,6 +44,7 @@ pub struct CheckServices {
     threshold: f64,
     persist: bool,
     retry_pending: bool,
+    print_verdicts: bool,
 }
 
 impl CheckServices {
@@ -75,6 +78,7 @@ impl CheckServices {
             threshold: detection.spam_confidence_threshold,
             persist: options.persist,
             retry_pending: options.retry_pending,
+            print_verdicts: options.print_verdicts,
         })
     }
 
@@ -105,23 +109,42 @@ pub fn detection_clients(detection: &DetectionConfig) -> Result<(MastodonClient,
 enum AccountCheckOutcome {
     Existing,
     System,
-    NotSpam,
-    Spam { notified: bool },
+    NotSpam(SpamVerdict),
+    Spam {
+        verdict: SpamVerdict,
+        notified: bool,
+    },
     Undetermined,
+}
+
+impl AccountCheckOutcome {
+    fn verdict(&self) -> Option<&SpamVerdict> {
+        match self {
+            Self::NotSpam(verdict) | Self::Spam { verdict, .. } => Some(verdict),
+            _ => None,
+        }
+    }
+
+    fn notified(&self) -> bool {
+        matches!(self, Self::Spam { notified: true, .. })
+    }
 }
 
 struct CheckedAccount {
     outcome: AccountCheckOutcome,
     status: JobStatus,
-    verdict: Option<SpamVerdict>,
     campaign: CampaignContext,
 }
 
-impl CheckedAccount {
-    /// Read back off the outcome rather than carried alongside it, so the two cannot disagree.
-    fn notified(&self) -> bool {
-        matches!(self.outcome, AccountCheckOutcome::Spam { notified: true })
-    }
+/// The `check-account` output for one verdict.
+pub fn verdict_json(account: &AdminAccount, verdict: &SpamVerdict) -> serde_json::Value {
+    serde_json::json!({
+        "account_id": account.id,
+        "acct": account.acct(),
+        "spam": verdict.spam,
+        "confidence": verdict.confidence,
+        "reason": verdict.reason,
+    })
 }
 
 #[derive(Default)]
@@ -205,13 +228,13 @@ pub async fn process_accounts(
                 .remove(&account.id)
                 .unwrap_or_else(|| Err(anyhow::anyhow!("account check task produced no result")));
             match result {
-                Ok(AccountCheckOutcome::Spam { notified }) => {
+                Ok(AccountCheckOutcome::Spam { notified, .. }) => {
                     summary.spam_detected += 1;
                     summary.spam_notified += u32::from(notified);
                 }
                 Ok(AccountCheckOutcome::Undetermined) => summary.undetermined += 1,
                 Ok(AccountCheckOutcome::Existing) => summary.skipped_existing += 1,
-                Ok(AccountCheckOutcome::System | AccountCheckOutcome::NotSpam) => {}
+                Ok(AccountCheckOutcome::System | AccountCheckOutcome::NotSpam(_)) => {}
                 Err(error) => {
                     summary.record_failure(error.context(format!(
                         "check failed for {} (account {}); retry with retry-failed",
@@ -287,17 +310,24 @@ async fn check_one(
                     .complete_job(
                         job,
                         checked.status,
-                        checked.verdict.as_ref().map(Into::into),
-                        checked.notified(),
+                        checked.outcome.verdict().map(Into::into),
+                        checked.outcome.notified(),
                         &checked.campaign,
                     )
                     .await?;
             }
             // After the job is completed, never before: see `add_spam_note`.
-            if checked.notified()
-                && let Some(verdict) = &checked.verdict
+            if let AccountCheckOutcome::Spam {
+                verdict,
+                notified: true,
+            } = &checked.outcome
             {
                 add_spam_note(&services, &account.id, verdict).await;
+            }
+            if services.print_verdicts
+                && let Some(verdict) = checked.outcome.verdict()
+            {
+                println!("{:#}", verdict_json(&account, verdict));
             }
             Ok(checked.outcome)
         }
@@ -347,7 +377,6 @@ async fn check_one_inner(
             return Ok(CheckedAccount {
                 outcome: AccountCheckOutcome::Undetermined,
                 status: JobStatus::Undetermined,
-                verdict: None,
                 campaign,
             });
         }
@@ -360,9 +389,8 @@ async fn check_one_inner(
     if !verdict.spam {
         info!(username = %account.username, %domain, "not spam");
         return Ok(CheckedAccount {
-            outcome: AccountCheckOutcome::NotSpam,
+            outcome: AccountCheckOutcome::NotSpam(verdict),
             status: JobStatus::NotSpam,
-            verdict: Some(verdict),
             campaign,
         });
     }
@@ -377,9 +405,11 @@ async fn check_one_inner(
             "spam detected below notification threshold"
         );
         return Ok(CheckedAccount {
-            outcome: AccountCheckOutcome::Spam { notified: false },
+            outcome: AccountCheckOutcome::Spam {
+                verdict,
+                notified: false,
+            },
             status: JobStatus::Spam,
-            verdict: Some(verdict),
             campaign,
         });
     }
@@ -424,9 +454,8 @@ async fn report_spam(
     }
 
     Ok(CheckedAccount {
-        outcome: AccountCheckOutcome::Spam { notified },
+        outcome: AccountCheckOutcome::Spam { verdict, notified },
         status: JobStatus::Spam,
-        verdict: Some(verdict),
         campaign,
     })
 }
@@ -459,7 +488,7 @@ async fn retry_pending_notification(
             if notified {
                 add_spam_note(services, &account.id, &verdict).await;
             }
-            Ok(AccountCheckOutcome::Spam { notified })
+            Ok(AccountCheckOutcome::Spam { verdict, notified })
         }
         Err(error) => {
             if let Err(store_error) = services.store.fail_job(job, &error).await {
