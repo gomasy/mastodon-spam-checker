@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail};
 
+use crate::llm::is_decision_model;
+
 pub struct PostgresConfig {
     pub database_url: String,
     pub moderator_account_id: i64,
@@ -31,22 +33,28 @@ pub struct DetectionConfig {
     pub openai_json_mode: bool,
     /// Decision models: a not-spam verdict below this confidence (0.0–1.0) counts as spam.
     pub spam_confidence_threshold: f64,
+    /// Decision models: a chat model that re-checks spam verdicts.
+    pub openai_review_model: Option<String>,
 }
 
 impl DetectionConfig {
     pub fn from_env() -> Result<Self> {
         let (mastodon_base_url, mastodon_access_token) = mastodon_env()?;
+        let openai_model = env_or("OPENAI_MODEL", "gpt-4o")?;
+        let openai_review_model = optional_env("OPENAI_REVIEW_MODEL")?;
+        validate_review_model(&openai_model, openai_review_model.as_deref())?;
         Ok(Self {
             mastodon_base_url,
             mastodon_access_token,
             openai_api_base: required_env("OPENAI_API_BASE")?,
             openai_api_key: required_env("OPENAI_API_KEY")?,
-            openai_model: env_or("OPENAI_MODEL", "gpt-4o")?,
+            openai_model,
             openai_json_mode: bool_env("OPENAI_JSON_MODE", true)?,
             spam_confidence_threshold: match optional_env("SPAM_CONFIDENCE_THRESHOLD")? {
                 Some(value) => parse_confidence_threshold(&value)?,
                 None => 0.7,
             },
+            openai_review_model,
         })
     }
 }
@@ -175,6 +183,20 @@ fn parse_bool(key: &str, value: &str) -> Result<bool> {
     }
 }
 
+/// A review model must be a chat model behind a decision model.
+fn validate_review_model(model: &str, review_model: Option<&str>) -> Result<()> {
+    let Some(review_model) = review_model else {
+        return Ok(());
+    };
+    if !is_decision_model(model) {
+        bail!("OPENAI_REVIEW_MODEL requires OPENAI_MODEL to be a decision model");
+    }
+    if is_decision_model(review_model) {
+        bail!("OPENAI_REVIEW_MODEL must be a chat model, not a decision model");
+    }
+    Ok(())
+}
+
 fn parse_confidence_threshold(value: &str) -> Result<f64> {
     let threshold = value
         .trim()
@@ -210,6 +232,14 @@ mod tests {
         assert!(parse_confidence_threshold("1.1").is_err());
         assert!(parse_confidence_threshold("NaN").is_err());
         assert!(parse_confidence_threshold("invalid").is_err());
+    }
+
+    #[test]
+    fn review_model_is_only_accepted_behind_a_decision_model() {
+        assert!(validate_review_model("gpt-4o", None).is_ok());
+        assert!(validate_review_model("typesafe/jev-1.13", Some("openai/gpt-4o")).is_ok());
+        assert!(validate_review_model("openai/gpt-4o", Some("openai/gpt-4o-mini")).is_err());
+        assert!(validate_review_model("typesafe/jev-1.13", Some("kev-latest")).is_err());
     }
 
     #[test]

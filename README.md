@@ -69,6 +69,12 @@ With a decision model, `SPAM_CONFIDENCE_THRESHOLD` (0.0–1.0, default `0.7`) is
 how sure a not-spam verdict must be: below it, the account counts as spam. Every
 spam verdict is reported to Slack, and each account's spam probability is logged.
 
+### Two-stage checks
+
+With a decision model, set `OPENAI_REVIEW_MODEL` to a chat model to re-check
+each spam verdict. Its verdict and written reason are final; verdicts are
+recorded against `decision-model+review-model`.
+
 ### Dry-run mode
 
 ```sh
@@ -113,6 +119,7 @@ directory is also loaded.
 | `OPENAI_API_KEY` | ✅ | – | API key |
 | `OPENAI_MODEL` | | `gpt-4o` | Model name. Decision models (`typesafe/jev-…`, `jaredpalmer/kev-…`, `jev-…`, `kev-…`) are called through `/systemone` and report only a spam probability, with no written reason |
 | `OPENAI_JSON_MODE` | | `true` | Set to `false` for APIs without `response_format` support. Accepts `true`, `false`, `1`, or `0` (case-insensitive) |
+| `OPENAI_REVIEW_MODEL` | | – | Decision models only: chat model (e.g. `openai/gpt-4o`) that re-checks spam verdicts via the same API. See [Two-stage checks](#two-stage-checks) |
 | `SPAM_CONFIDENCE_THRESHOLD` | | `0.7` | Decision models only: a not-spam verdict below this confidence (0.0–1.0) counts as spam |
 | `SLACK_WEBHOOK_URL` | normal check | – | Slack incoming webhook URL. Not required by `dry-run`, `check-account`, `check-acct`, or backfill without `--notify` |
 | `SLACK_CHANNEL` | | – | Override the webhook's default channel. Only honored by legacy custom-integration webhooks — Slack-app webhooks (required for the suspend button) always post to the channel chosen at install time. Quote the value (`"#spam-alerts"`) so `#` is not parsed as a comment |

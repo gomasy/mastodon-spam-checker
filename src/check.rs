@@ -89,14 +89,7 @@ pub fn detection_clients(detection: &DetectionConfig) -> Result<(MastodonClient,
         &detection.mastodon_base_url,
         &detection.mastodon_access_token,
     )?;
-    let llm = LlmClient::new(
-        &detection.openai_api_base,
-        &detection.openai_api_key,
-        &detection.openai_model,
-        detection.openai_json_mode,
-        detection.spam_confidence_threshold,
-        http::RetryConfig::default(),
-    )?;
+    let llm = LlmClient::new(detection, http::RetryConfig::default())?;
     Ok((mastodon, llm))
 }
 
@@ -277,7 +270,7 @@ async fn check_one(
                 .begin_job(
                     &account.id,
                     &account.acct(),
-                    services.llm.model(),
+                    &services.llm.model_label(),
                     llm::PROMPT_VERSION,
                 )
                 .await?,

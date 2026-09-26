@@ -95,6 +95,7 @@ async fn check(store: StateStore, dry_run: bool) -> Result<()> {
     info!(
         dry_run,
         threshold = config.detection.spam_confidence_threshold,
+        review_model = config.detection.openai_review_model.as_deref(),
         max_accounts = config.max_accounts_per_run,
         concurrency = config.check_concurrency,
         "configuration loaded"

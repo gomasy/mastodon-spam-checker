@@ -5,10 +5,11 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 use rust_i18n::t;
 
+use crate::config::DetectionConfig;
 use crate::http;
 use crate::mastodon::{AdminAccount, Status};
 use crate::redis::{CampaignContext, StoredVerdict};
@@ -192,7 +193,7 @@ const DECISION_MODEL_PREFIXES: &[&str] = &["typesafe/jev-", "jaredpalmer/kev-", 
 
 /// Whether `model` is a System One decision model such as Jev or Kev, which returns typed answers
 /// through `/systemone` instead of chat text.
-fn is_decision_model(model: &str) -> bool {
+pub fn is_decision_model(model: &str) -> bool {
     let model = model.trim_start_matches('~');
     DECISION_MODEL_PREFIXES
         .iter()
@@ -235,28 +236,32 @@ pub struct LlmClient {
     json_mode: bool,
     decision: bool,
     min_not_spam: f64,
+    /// Re-checks the decision model's spam verdicts.
+    review: Option<Box<LlmClient>>,
     retry: http::RetryConfig,
 }
 
 impl LlmClient {
-    pub fn new(
-        api_base: &str,
-        api_key: &str,
-        model: &str,
-        json_mode: bool,
-        min_not_spam: f64,
-        retry: http::RetryConfig,
-    ) -> Result<Self> {
-        Ok(Self {
+    pub fn new(detection: &DetectionConfig, retry: http::RetryConfig) -> Result<Self> {
+        let client = Self {
             client: http::client(Duration::from_secs(120))?,
-            api_base: api_base.trim_end_matches('/').to_string(),
-            api_key: api_key.to_string(),
-            model: model.to_string(),
-            json_mode,
-            decision: is_decision_model(model),
-            min_not_spam,
+            api_base: detection.openai_api_base.trim_end_matches('/').to_string(),
+            api_key: detection.openai_api_key.clone(),
+            model: detection.openai_model.clone(),
+            json_mode: detection.openai_json_mode,
+            decision: is_decision_model(&detection.openai_model),
+            min_not_spam: detection.spam_confidence_threshold,
+            review: None,
             retry,
-        })
+        };
+        let review = detection.openai_review_model.as_ref().map(|model| {
+            Box::new(Self {
+                model: model.clone(),
+                decision: false,
+                ..client.clone()
+            })
+        });
+        Ok(Self { review, ..client })
     }
 
     /// `signals` is threaded in rather than recomputed here: the campaign lookup needs it first,
@@ -269,10 +274,28 @@ impl LlmClient {
         campaign: &CampaignContext,
     ) -> Result<SpamVerdict> {
         let user_prompt = build_user_prompt(account, statuses, signals, campaign);
-        if self.decision {
-            self.decide(user_prompt).await
-        } else {
-            self.chat(user_prompt).await
+        if !self.decision {
+            return self.chat(user_prompt).await;
+        }
+        let verdict = self.decide(&user_prompt).await?;
+        // Only spam is reviewed, to weed out false positives.
+        let (true, Some(review)) = (verdict.spam, &self.review) else {
+            return Ok(verdict);
+        };
+        match review.chat(user_prompt).await {
+            Ok(reviewed) => {
+                info!(
+                    review_spam = reviewed.spam,
+                    "reviewed decision model verdict"
+                );
+                Ok(reviewed)
+            }
+            // An unusable review must not bury the spam flag as undetermined.
+            Err(error) if is_unparseable_verdict(&error) => {
+                warn!(%error, "no usable review verdict, keeping the decision model's");
+                Ok(verdict)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -298,7 +321,7 @@ impl LlmClient {
         parse_verdict(strip_code_fence(response_content(&resp)?))
     }
 
-    async fn decide(&self, user_prompt: String) -> Result<SpamVerdict> {
+    async fn decide(&self, user_prompt: &str) -> Result<SpamVerdict> {
         let request = serde_json::json!({
             "model": self.model,
             "state": user_prompt,
@@ -331,8 +354,12 @@ impl LlmClient {
         resp.json().await.context("failed to parse LLM response")
     }
 
-    pub fn model(&self) -> &str {
-        &self.model
+    /// The model recorded with each verdict: `decision+review` when reviewed.
+    pub fn model_label(&self) -> String {
+        match &self.review {
+            Some(review) => format!("{}+{}", self.model, review.model),
+            None => self.model.clone(),
+        }
     }
 }
 
