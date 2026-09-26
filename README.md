@@ -86,7 +86,7 @@ Judgment results are still logged.
   (plus `admin:write:accounts` if you use the suspend button)
 - Redis (cursor storage)
 - An OpenAI-compatible chat completions API, or a decision model such as
-  [Jev](https://openrouter.ai/docs/guides/community/jev) via OpenRouter
+  [Jev](https://openrouter.ai/docs/guides/community/jev) or Kev via OpenRouter
 - A Slack incoming webhook (created from a Slack app if you use the
   suspend button — see below)
 
@@ -111,7 +111,7 @@ directory is also loaded.
 | `CHECK_CONCURRENCY` | | `4` | Maximum concurrent account checks |
 | `OPENAI_API_BASE` | ✅ | – | OpenAI-compatible API base (e.g. `https://api.openai.com/v1`) |
 | `OPENAI_API_KEY` | ✅ | – | API key |
-| `OPENAI_MODEL` | | `gpt-4o` | Model name. Decision models (`typesafe/…`, `jev-…`) are called through `/systemone` and report only a spam probability, with no written reason |
+| `OPENAI_MODEL` | | `gpt-4o` | Model name. Decision models (`typesafe/jev-…`, `jaredpalmer/kev-…`, `jev-…`, `kev-…`) are called through `/systemone` and report only a spam probability, with no written reason |
 | `OPENAI_JSON_MODE` | | `true` | Set to `false` for APIs without `response_format` support. Accepts `true`, `false`, `1`, or `0` (case-insensitive) |
 | `SPAM_CONFIDENCE_THRESHOLD` | | `0.7` | Decision models only: a not-spam verdict below this confidence (0.0–1.0) counts as spam |
 | `SLACK_WEBHOOK_URL` | normal check | – | Slack incoming webhook URL. Not required by `dry-run`, `check-account`, `check-acct`, or backfill without `--notify` |

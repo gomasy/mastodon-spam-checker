@@ -188,11 +188,15 @@ Respond ONLY with a JSON object in this exact format (no markdown, no extra text
     )
 }
 
-/// Whether `model` is a System One decision model such as Jev, which returns typed answers
+const DECISION_MODEL_PREFIXES: &[&str] = &["typesafe/jev-", "jaredpalmer/kev-", "jev-", "kev-"];
+
+/// Whether `model` is a System One decision model such as Jev or Kev, which returns typed answers
 /// through `/systemone` instead of chat text.
 fn is_decision_model(model: &str) -> bool {
     let model = model.trim_start_matches('~');
-    model.starts_with("typesafe/") || model.starts_with("jev-")
+    DECISION_MODEL_PREFIXES
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
 }
 
 #[derive(Deserialize)]
@@ -671,6 +675,11 @@ mod tests {
         assert!(is_decision_model("typesafe/jev-1.13"));
         assert!(is_decision_model("~typesafe/jev-latest"));
         assert!(is_decision_model("jev-latest"));
+        assert!(is_decision_model("jaredpalmer/kev-1.0"));
+        assert!(is_decision_model("~jaredpalmer/kev-latest"));
+        assert!(is_decision_model("kev-latest"));
+        assert!(!is_decision_model("jaredpalmer/other-model"));
+        assert!(!is_decision_model("typesafe/other-model"));
         assert!(!is_decision_model("openai/gpt-4o"));
     }
 
