@@ -457,6 +457,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1357,9 +1363,9 @@ dependencies = [
 
 [[package]]
 name = "rust-i18n"
-version = "4.2.2"
+version = "4.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c43fd69c20da13756643a5bf51ae799965465c78e05c57a1242a736aaa56527"
+checksum = "68abb338402a175bc93faba6a7d7f7e57adc48bc607b93ec86a57447f9edf6fb"
 dependencies = [
  "globwalk",
  "regex",
@@ -1370,9 +1376,9 @@ dependencies = [
 
 [[package]]
 name = "rust-i18n-macro"
-version = "4.2.2"
+version = "4.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "086ec8a9eaa6afda33919b9bc1661c1f4e017c40e99bbd33ca98f6e1cb6ca91f"
+checksum = "746fe7815ad5d74ff5012fc653c4d1a208878536cc2d5d81f5d58a2f35f53272"
 dependencies = [
  "glob",
  "proc-macro2",
@@ -1385,12 +1391,13 @@ dependencies = [
 
 [[package]]
 name = "rust-i18n-support"
-version = "4.2.2"
+version = "4.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac02dcb9a01ec145d0a5534ea9554a966050ca250b346bb2a9ab0fcdafab5979"
+checksum = "65d8776635f9d13887dc2eb41da7ea624e7e401ecc7da6e82eb7ff29339b252a"
 dependencies = [
  "arc-swap",
  "base62",
+ "foldhash",
  "globwalk",
  "itertools",
  "normpath",
