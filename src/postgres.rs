@@ -20,6 +20,26 @@ pub async fn writer_for(config: Option<&PostgresConfig>) -> Result<Option<Modera
     }
 }
 
+/// Opens a connection to Mastodon's database, driving it on a background task until the client is
+/// dropped.
+pub async fn connect(database_url: &str) -> Result<Client> {
+    let (client, connection) = tokio::time::timeout(
+        DATABASE_TIMEOUT,
+        tokio_postgres::connect(database_url, NoTls),
+    )
+    .await
+    .context("timed out connecting to PostgreSQL")?
+    .context("failed to connect to PostgreSQL")?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            error!(error = %e, "PostgreSQL connection error");
+        }
+    });
+
+    Ok(client)
+}
+
 /// `created_at`/`updated_at` are bound as parameters rather than written with `NOW()`: Mastodon's
 /// columns are `timestamp without time zone` holding UTC, and Postgres would convert `now()` into
 /// the session time zone, dating every note by the server's local wall clock. A `SystemTime` is
@@ -44,31 +64,13 @@ pub struct ModerationNoteWriter {
 impl ModerationNoteWriter {
     pub async fn connect(database_url: &str, moderator_account_id: i64) -> Result<Self> {
         // Connect eagerly so a bad DATABASE_URL is reported at startup, not on the first detection.
-        let client = Self::open(database_url).await?;
+        let client = connect(database_url).await?;
         info!("connected to PostgreSQL for moderation notes");
         Ok(Self {
             database_url: database_url.to_string(),
             moderator_account_id,
             client: Mutex::new(Some(client)),
         })
-    }
-
-    async fn open(database_url: &str) -> Result<Client> {
-        let (client, connection) = tokio::time::timeout(
-            DATABASE_TIMEOUT,
-            tokio_postgres::connect(database_url, NoTls),
-        )
-        .await
-        .context("timed out connecting to PostgreSQL")?
-        .context("failed to connect to PostgreSQL")?;
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                error!(error = %e, "PostgreSQL connection error");
-            }
-        });
-
-        Ok(client)
     }
 
     pub async fn add_note(&self, target_account_id: &str, content: &str) -> Result<()> {
@@ -84,7 +86,7 @@ impl ModerationNoteWriter {
                 if previous.is_some() {
                     warn!("PostgreSQL connection was lost, reconnecting");
                 }
-                Self::open(&self.database_url).await?
+                connect(&self.database_url).await?
             }
         };
 

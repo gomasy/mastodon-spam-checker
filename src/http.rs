@@ -1,13 +1,20 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use reqwest::{Client, ClientBuilder, RequestBuilder, Response, StatusCode};
 use tracing::warn;
 
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// An HTTP client with the shared User-Agent and the given timeout.
 pub fn client(timeout: Duration) -> Result<Client> {
+    client_builder(timeout)
+        .build()
+        .context("failed to build HTTP client")
+}
+
+/// The builder behind [`client`], for callers that need to tighten it further.
+pub fn client_builder(timeout: Duration) -> ClientBuilder {
     Client::builder()
         .user_agent(concat!(
             env!("CARGO_PKG_NAME"),
@@ -15,8 +22,6 @@ pub fn client(timeout: Duration) -> Result<Client> {
             env!("CARGO_PKG_VERSION")
         ))
         .timeout(timeout)
-        .build()
-        .context("failed to build HTTP client")
 }
 
 pub async fn ensure_success(resp: Response, what: &str) -> Result<Response> {

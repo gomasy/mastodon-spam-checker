@@ -8,6 +8,9 @@ use tracing::{info, warn};
 use crate::http;
 use crate::ids::{numeric_id_cmp, validate_account_id};
 
+/// How many recent posts a check reads.
+pub const STATUSES_LIMIT: usize = 10;
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct AdminAccount {
     pub id: String,
@@ -301,7 +304,7 @@ impl MastodonClient {
 
     pub async fn fetch_statuses(&self, account_id: &str) -> Result<Vec<Status>> {
         let url = format!(
-            "{}/api/v1/accounts/{}/statuses?limit=10&exclude_reblogs=true",
+            "{}/api/v1/accounts/{}/statuses?limit={STATUSES_LIMIT}&exclude_reblogs=true",
             self.base_url, account_id
         );
 
