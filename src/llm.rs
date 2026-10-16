@@ -551,6 +551,7 @@ mod tests {
             username: "alice".to_string(),
             domain: Some("example.com".to_string()),
             account: crate::mastodon::Account {
+                uri: None,
                 display_name: "Alice".to_string(),
                 note: note.to_string(),
                 avatar: "https://example.com/avatar.png".to_string(),

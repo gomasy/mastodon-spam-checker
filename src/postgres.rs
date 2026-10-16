@@ -40,6 +40,21 @@ pub async fn connect(database_url: &str) -> Result<Client> {
     Ok(client)
 }
 
+/// The instance actor's private key (PEM). `-99` is Mastodon's `Account::INSTANCE_ACTOR_ID`.
+pub async fn read_instance_actor_key(database_url: &str) -> Result<String> {
+    let client = connect(database_url).await?;
+    let row = tokio::time::timeout(
+        DATABASE_TIMEOUT,
+        client.query_opt("SELECT private_key FROM accounts WHERE id = -99", &[]),
+    )
+    .await
+    .context("timed out reading the instance actor's key")?
+    .context("failed to read the instance actor's key")?;
+    row.and_then(|row| row.get::<_, Option<String>>(0))
+        .filter(|key| !key.trim().is_empty())
+        .context("the instance actor has no private key")
+}
+
 /// `created_at`/`updated_at` are bound as parameters rather than written with `NOW()`: Mastodon's
 /// columns are `timestamp without time zone` holding UTC, and Postgres would convert `now()` into
 /// the session time zone, dating every note by the server's local wall clock. A `SystemTime` is

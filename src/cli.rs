@@ -9,11 +9,11 @@ use anyhow::{Context, Result, bail};
 use tracing::{error, info, warn};
 
 use crate::chain;
-use crate::check::{self, CheckServices, ServiceOptions};
+use crate::check::{self, CheckServices, PostSource, ServiceOptions};
 use crate::config::{self, Config, DetectionConfig, parse_positive_usize};
 use crate::ids::{numeric_id_cmp, validate_account_id};
 use crate::llm::LlmClient;
-use crate::mastodon::{AdminAccount, MastodonClient};
+use crate::mastodon::AdminAccount;
 use crate::redis::{CampaignContext, StateStore};
 use crate::{server, signals};
 
@@ -151,9 +151,9 @@ async fn check_account_command(args: &[String]) -> Result<()> {
         bail!("usage: mastodon-spam-checker check-account <ID>");
     };
     validate_account_id(account_id)?;
-    let (mastodon, llm) = check::detection_clients(&DetectionConfig::from_env()?)?;
-    let account = mastodon.fetch_admin_account(account_id).await?;
-    inspect_account(&mastodon, &llm, &account).await
+    let (posts, llm) = check::detection_clients(&DetectionConfig::from_env()?).await?;
+    let account = posts.mastodon.fetch_admin_account(account_id).await?;
+    inspect_account(&posts, &llm, &account).await
 }
 
 async fn check_acct_command(args: &[String]) -> Result<()> {
@@ -161,21 +161,22 @@ async fn check_acct_command(args: &[String]) -> Result<()> {
         bail!("usage: mastodon-spam-checker check-acct <USER@DOMAIN>");
     };
     let acct = parse_acct(acct)?;
-    let (mastodon, llm) = check::detection_clients(&DetectionConfig::from_env()?)?;
-    let account = mastodon
+    let (posts, llm) = check::detection_clients(&DetectionConfig::from_env()?).await?;
+    let account = posts
+        .mastodon
         .fetch_admin_account_by_acct(&acct)
         .await?
         .with_context(|| format!("account {acct} was not found"))?;
-    inspect_account(&mastodon, &llm, &account).await
+    inspect_account(&posts, &llm, &account).await
 }
 
 /// Classifies one account and prints the verdict, shared by `check-account` and `check-acct`.
 async fn inspect_account(
-    mastodon: &MastodonClient,
+    posts: &PostSource,
     llm: &LlmClient,
     account: &AdminAccount,
 ) -> Result<()> {
-    let statuses = mastodon.fetch_statuses(&account.id).await?;
+    let statuses = posts.fetch(account).await?;
     let signals = signals::analyze(account, &statuses);
     // A one-off inspection touches no state, so it carries no campaign history.
     let verdict = llm

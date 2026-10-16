@@ -983,7 +983,9 @@ version = "1.2.1"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "dotenvy",
+ "httpdate",
  "redis",
  "reqwest",
  "ring",

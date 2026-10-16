@@ -1,3 +1,4 @@
+mod activitypub;
 mod check;
 mod cli;
 mod config;

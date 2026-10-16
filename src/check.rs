@@ -10,11 +10,12 @@ use anyhow::{Context, Result, bail};
 use rust_i18n::t;
 use tracing::{error, info, warn};
 
+use crate::activitypub::RemoteFetcher;
 use crate::chain;
 use crate::config::{Config, DetectionConfig};
 use crate::http;
 use crate::llm::{self, LlmClient, SpamVerdict};
-use crate::mastodon::{AdminAccount, MastodonClient};
+use crate::mastodon::{AdminAccount, MastodonClient, Status};
 use crate::postgres::{self, ModerationNoteWriter};
 use crate::redis::{CampaignContext, JobRecord, JobStatus, StateStore};
 use crate::signals;
@@ -32,7 +33,7 @@ pub struct ServiceOptions {
 }
 
 pub struct CheckServices {
-    mastodon: MastodonClient,
+    posts: PostSource,
     llm: LlmClient,
     slack: Option<SlackNotifier>,
     /// Present for every run: dry runs read campaign context through it, and `persist` decides
@@ -50,7 +51,7 @@ impl CheckServices {
         options: ServiceOptions,
     ) -> Result<Self> {
         let detection = &config.detection;
-        let (mastodon, llm) = detection_clients(detection)?;
+        let (posts, llm) = detection_clients(detection).await?;
         let slack = if options.notify {
             Some(SlackNotifier::new(
                 config
@@ -66,7 +67,7 @@ impl CheckServices {
         let note_writer =
             postgres::writer_for(config.postgres.as_ref().filter(|_| options.notify)).await?;
         Ok(Self {
-            mastodon,
+            posts,
             llm,
             slack,
             store,
@@ -78,19 +79,53 @@ impl CheckServices {
 
     /// For callers that select the accounts to check before handing them to [`process_accounts`].
     pub fn mastodon(&self) -> &MastodonClient {
-        &self.mastodon
+        &self.posts.mastodon
     }
 }
 
-/// The two clients a spam check always needs. Shared with the one-off inspection commands, which
+/// The clients a spam check always needs. Shared with the one-off inspection commands, which
 /// build them without the rest of [`CheckServices`].
-pub fn detection_clients(detection: &DetectionConfig) -> Result<(MastodonClient, LlmClient)> {
+pub async fn detection_clients(detection: &DetectionConfig) -> Result<(PostSource, LlmClient)> {
     let mastodon = MastodonClient::new(
         &detection.mastodon_base_url,
         &detection.mastodon_access_token,
     )?;
+    let remote = RemoteFetcher::from_config(detection.remote_fetch.as_ref(), &mastodon).await?;
     let llm = LlmClient::new(detection, http::RetryConfig::default())?;
-    Ok((mastodon, llm))
+    Ok((PostSource { mastodon, remote }, llm))
+}
+
+/// An account's recent posts: this instance's copy, or the account's own outbox when that is empty.
+pub struct PostSource {
+    pub mastodon: MastodonClient,
+    remote: Option<RemoteFetcher>,
+}
+
+impl PostSource {
+    /// A failed remote fetch is logged and yields no posts, as if remote fetching were off.
+    pub async fn fetch(&self, account: &AdminAccount) -> Result<Vec<Status>> {
+        let statuses = self.mastodon.fetch_statuses(&account.id).await?;
+        // Local accounts are skipped: their outbox is this instance.
+        let Some(remote) = self.remote.as_ref().filter(|_| {
+            statuses.is_empty() && account.account.statuses_count > 0 && account.domain.is_some()
+        }) else {
+            return Ok(statuses);
+        };
+        let Some(uri) = account.account.uri.as_deref().filter(|uri| !uri.is_empty()) else {
+            warn!(account_id = %account.id, "account has no actor URI, skipping remote fetch");
+            return Ok(statuses);
+        };
+        match remote.fetch_statuses(uri).await {
+            Ok(statuses) => {
+                info!(account_id = %account.id, count = statuses.len(), "fetched remote outbox");
+                Ok(statuses)
+            }
+            Err(error) => {
+                warn!(account_id = %account.id, error = %chain(&error), "remote outbox fetch failed");
+                Ok(Vec::new())
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -319,8 +354,8 @@ async fn check_one_inner(
     services: &CheckServices,
 ) -> Result<CheckedAccount> {
     let statuses = services
-        .mastodon
-        .fetch_statuses(&account.id)
+        .posts
+        .fetch(account)
         .await
         .context("failed to fetch statuses")?;
     let signals = signals::analyze(account, &statuses);

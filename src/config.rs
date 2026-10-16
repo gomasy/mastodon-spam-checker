@@ -24,6 +24,46 @@ impl PostgresConfig {
     }
 }
 
+/// Reading posts from a remote account's own outbox when this instance holds none of them.
+pub struct RemoteFetchConfig {
+    /// Mastodon's database, for the instance actor's private key.
+    pub database_url: String,
+    /// The `keyId` remote servers resolve to verify signatures.
+    pub key_id: reqwest::Url,
+    /// Replaces the User-Agent otherwise built to match Mastodon's own.
+    pub user_agent: Option<String>,
+}
+
+impl RemoteFetchConfig {
+    fn from_env(mastodon_base_url: &str) -> Result<Option<Self>> {
+        if !bool_env("REMOTE_FETCH", false)? {
+            return Ok(None);
+        }
+        let database_url = optional_env("DATABASE_URL")?
+            .context("REMOTE_FETCH requires DATABASE_URL to read the instance actor's key")?;
+        let key_id = optional_env("INSTANCE_ACTOR_KEY_ID")?
+            .unwrap_or_else(|| default_key_id(mastodon_base_url));
+        let key_id =
+            reqwest::Url::parse(&key_id).context("INSTANCE_ACTOR_KEY_ID is not a valid URL")?;
+        if key_id.scheme() != "https" {
+            bail!(
+                "INSTANCE_ACTOR_KEY_ID must be an https URL; set it explicitly when \
+                 MASTODON_BASE_URL is not the instance's public https URL"
+            );
+        }
+        Ok(Some(Self {
+            database_url,
+            key_id,
+            user_agent: optional_env("REMOTE_FETCH_USER_AGENT")?,
+        }))
+    }
+}
+
+/// Where Mastodon publishes the instance actor's key: `/actor#main-key` on the web domain.
+fn default_key_id(mastodon_base_url: &str) -> String {
+    format!("{}/actor#main-key", mastodon_base_url.trim_end_matches('/'))
+}
+
 pub struct DetectionConfig {
     pub mastodon_base_url: String,
     pub mastodon_access_token: String,
@@ -35,6 +75,7 @@ pub struct DetectionConfig {
     pub spam_confidence_threshold: f64,
     /// Decision models: a chat model that re-checks spam verdicts.
     pub openai_review_model: Option<String>,
+    pub remote_fetch: Option<RemoteFetchConfig>,
 }
 
 impl DetectionConfig {
@@ -43,6 +84,7 @@ impl DetectionConfig {
         let openai_model = env_or("OPENAI_MODEL", "gpt-4o")?;
         let openai_review_model = optional_env("OPENAI_REVIEW_MODEL")?;
         validate_review_model(&openai_model, openai_review_model.as_deref())?;
+        let remote_fetch = RemoteFetchConfig::from_env(&mastodon_base_url)?;
         Ok(Self {
             mastodon_base_url,
             mastodon_access_token,
@@ -55,6 +97,7 @@ impl DetectionConfig {
                 None => 0.7,
             },
             openai_review_model,
+            remote_fetch,
         })
     }
 }
@@ -240,6 +283,14 @@ mod tests {
         assert!(validate_review_model("typesafe/jev-1.13", Some("openai/gpt-4o")).is_ok());
         assert!(validate_review_model("openai/gpt-4o", Some("openai/gpt-4o-mini")).is_err());
         assert!(validate_review_model("typesafe/jev-1.13", Some("kev-latest")).is_err());
+    }
+
+    #[test]
+    fn default_key_id_points_at_the_instance_actor() {
+        assert_eq!(
+            default_key_id("https://mastodon.example/"),
+            "https://mastodon.example/actor#main-key"
+        );
     }
 
     #[test]

@@ -127,6 +127,9 @@ directory is also loaded.
 | `LISTEN_ADDR` | | `127.0.0.1:8990` | Listen address for `serve` mode |
 | `DATABASE_URL` | | – | Mastodon's PostgreSQL database. When set, moderation notes are written on spam detection and on suspension. Connects without TLS, so point it at a local socket or `localhost` |
 | `MODERATOR_ACCOUNT_ID` | with `DATABASE_URL` | – | `account.id` shown as the note author in the Mastodon admin UI |
+| `REMOTE_FETCH` | | `false` | Fetch posts from the account's own server when this instance holds none. Requires `DATABASE_URL`. See [Remote post fetching](#remote-post-fetching) |
+| `REMOTE_FETCH_USER_AGENT` | | `Mastodon/<version> (+https://<key ID host>/)` | User-Agent for remote requests. The default follows Mastodon's, with the version read from `/api/v2/instance` |
+| `INSTANCE_ACTOR_KEY_ID` | | `<MASTODON_BASE_URL>/actor#main-key` | `keyId` used to sign remote requests. Set it when `MASTODON_BASE_URL` is not the instance's public https URL |
 
 Values are validated at startup: malformed booleans, confidence thresholds, or
 zero/invalid processing limits abort the run instead of being ignored. An empty
@@ -145,9 +148,35 @@ note that fails to write is logged and does not abort the action it accompanies.
 Because `serve` mode is long-running, a connection lost to a database restart or
 idle timeout is re-established on the next write.
 
+### Remote post fetching
+
+Mastodon only has the posts that have federated to it, so a newly discovered
+account often shows none locally and is judged on its profile alone. With
+`REMOTE_FETCH=true`, an account whose local post list is empty although it
+reports posts has its recent public posts read straight from its ActivityPub
+outbox (actor → outbox → first page). Mastodon itself is not asked to fetch
+anything.
+
+Requests are signed with HTTP Signatures using the instance actor's private key,
+read once at startup from the `accounts` table (`id = -99`), so servers running
+authorized fetch answer as they would to your instance. The actor URI comes from
+the account's `uri`, which requires Mastodon 4.2 or later.
+
+The User-Agent follows Mastodon's own, `Mastodon/<version> (+https://<host>/)`,
+with the version read from `/api/v2/instance` at startup and the host taken from
+the key ID. `REMOTE_FETCH_USER_AGENT` replaces it.
+
+Because the URLs come from the remote account, the fetcher only uses https,
+does not follow redirects, stays on the actor's origin, refuses private,
+loopback, and link-local addresses (including those a host name resolves to),
+and caps responses at 1 MiB. Any failure — a 401/403 from a server that refuses
+the request, a timeout, an unparseable page — is logged and the check continues
+without posts. Reblogs and posts referenced by URL only are skipped.
+
 ## Operator commands
 
-Classify one account without Redis, Slack, PostgreSQL, or cursor changes:
+Classify one account without Redis, Slack, PostgreSQL writes, or cursor changes
+(with `REMOTE_FETCH=true`, PostgreSQL is read once for the signing key):
 
 ```sh
 mastodon-spam-checker check-account 1234567890

@@ -32,6 +32,9 @@ impl AdminAccount {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Account {
+    /// The ActivityPub actor ID. Mastodon 4.2 and later.
+    #[serde(default)]
+    pub uri: Option<String>,
     pub display_name: String,
     pub note: String,
     pub avatar: String,
@@ -103,6 +106,23 @@ impl MastodonClient {
             access_token: access_token.to_string(),
             retry: http::RetryConfig::default(),
         })
+    }
+
+    /// The instance's Mastodon version, as `Mastodon::Version.to_s` renders it.
+    pub async fn fetch_version(&self) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Instance {
+            version: String,
+        }
+
+        let url = format!("{}/api/v2/instance", self.base_url);
+        let Instance { version } =
+            http::send_with_retry(|| self.client.get(&url), "Instance API", self.retry)
+                .await?
+                .json()
+                .await
+                .context("failed to parse instance response")?;
+        Ok(version)
     }
 
     /// A clone of the inner HTTP client; clones share the connection pool.
