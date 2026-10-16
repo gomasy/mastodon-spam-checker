@@ -130,6 +130,8 @@ directory is also loaded.
 | `REMOTE_FETCH` | | `false` | Fetch posts from the account's own server when this instance holds none. Requires `DATABASE_URL`. See [Remote post fetching](#remote-post-fetching) |
 | `REMOTE_FETCH_USER_AGENT` | | `Mastodon/<version> (+https://<key ID host>/)` | User-Agent for remote requests. The default follows Mastodon's, with the version read from `/api/v2/instance` |
 | `INSTANCE_ACTOR_KEY_ID` | | `<MASTODON_BASE_URL>/actor#main-key` | `keyId` used to sign remote requests. Set it when `MASTODON_BASE_URL` is not the instance's public https URL |
+| `ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY` | `REMOTE_FETCH` on Mastodon 4.7+ | – | From Mastodon's `.env.production`; decrypts the instance actor's key |
+| `ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT` | `REMOTE_FETCH` on Mastodon 4.7+ | – | From Mastodon's `.env.production` |
 
 Values are validated at startup: malformed booleans, confidence thresholds, or
 zero/invalid processing limits abort the run instead of being ignored. An empty
@@ -158,9 +160,10 @@ outbox (actor → outbox → first page). Mastodon itself is not asked to fetch
 anything.
 
 Requests are signed with HTTP Signatures using the instance actor's private key,
-read once at startup from the `accounts` table (`id = -99`), so servers running
-authorized fetch answer as they would to your instance. The actor URI comes from
-the account's `uri`, which requires Mastodon 4.2 or later.
+read once at startup, so servers running authorized fetch answer as they would
+to your instance. On Mastodon 4.7 and later the key is encrypted; set the two
+`ACTIVE_RECORD_ENCRYPTION_*` variables from Mastodon's `.env.production`. The
+actor URI comes from the account's `uri`, which requires Mastodon 4.2 or later.
 
 The User-Agent follows Mastodon's own, `Mastodon/<version> (+https://<host>/)`,
 with the version read from `/api/v2/instance` at startup and the host taken from

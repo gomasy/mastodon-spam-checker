@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 
+use crate::encryption;
 use crate::llm::is_decision_model;
 
 pub struct PostgresConfig {
@@ -32,6 +33,8 @@ pub struct RemoteFetchConfig {
     pub key_id: reqwest::Url,
     /// Replaces the User-Agent otherwise built to match Mastodon's own.
     pub user_agent: Option<String>,
+    /// Decrypts the key on Mastodon 4.7+.
+    pub encryption: Option<encryption::Secrets>,
 }
 
 impl RemoteFetchConfig {
@@ -45,6 +48,9 @@ impl RemoteFetchConfig {
             .unwrap_or_else(|| default_key_id(mastodon_base_url));
         let key_id =
             reqwest::Url::parse(&key_id).context("INSTANCE_ACTOR_KEY_ID is not a valid URL")?;
+        if key_id.fragment().is_none_or(str::is_empty) {
+            bail!("INSTANCE_ACTOR_KEY_ID must name a key with a fragment, e.g. #main-key");
+        }
         if key_id.scheme() != "https" {
             bail!(
                 "INSTANCE_ACTOR_KEY_ID must be an https URL; set it explicitly when \
@@ -55,7 +61,25 @@ impl RemoteFetchConfig {
             database_url,
             key_id,
             user_agent: optional_env("REMOTE_FETCH_USER_AGENT")?,
+            encryption: encryption_secrets_from_env()?,
         }))
+    }
+}
+
+fn encryption_secrets_from_env() -> Result<Option<encryption::Secrets>> {
+    match (
+        optional_env("ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY")?,
+        optional_env("ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT")?,
+    ) {
+        (Some(primary_key), Some(key_derivation_salt)) => Ok(Some(encryption::Secrets {
+            primary_key,
+            key_derivation_salt,
+        })),
+        (None, None) => Ok(None),
+        _ => bail!(
+            "ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY and \
+             ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT must be set together"
+        ),
     }
 }
 

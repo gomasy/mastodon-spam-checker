@@ -61,7 +61,11 @@ impl RemoteFetcher {
             }
         };
         let (pem, user_agent) = tokio::try_join!(
-            postgres::read_instance_actor_key(&config.database_url),
+            postgres::read_instance_actor_key(
+                &config.database_url,
+                &config.key_id,
+                config.encryption.as_ref()
+            ),
             user_agent
         )?;
         let key = parse_private_key(&pem).context("failed to load the instance actor's key")?;

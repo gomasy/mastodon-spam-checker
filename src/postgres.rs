@@ -2,10 +2,12 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use tokio::sync::Mutex;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 use tracing::{error, info, warn};
 
 use crate::config::PostgresConfig;
+use crate::encryption;
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -40,19 +42,54 @@ pub async fn connect(database_url: &str) -> Result<Client> {
     Ok(client)
 }
 
-/// The instance actor's private key (PEM). `-99` is Mastodon's `Account::INSTANCE_ACTOR_ID`.
-pub async fn read_instance_actor_key(database_url: &str) -> Result<String> {
+/// Mastodon 4.7+ keeps keys, encrypted, in `keypairs`; `type = 0` is RSA.
+const SELECT_KEYPAIR: &str = "SELECT private_key FROM keypairs \
+     WHERE account_id = -99 AND type = 0 AND local_fragment = $1 AND NOT revoked \
+     AND (expires_at IS NULL OR expires_at > now()) \
+     ORDER BY id DESC LIMIT 1";
+
+/// The instance actor's private key (PEM) for `key_id`. `-99` is Mastodon's
+/// `Account::INSTANCE_ACTOR_ID`; before 4.7 its key is plain text in `accounts`.
+pub async fn read_instance_actor_key(
+    database_url: &str,
+    key_id: &reqwest::Url,
+    secrets: Option<&encryption::Secrets>,
+) -> Result<String> {
     let client = connect(database_url).await?;
-    let row = tokio::time::timeout(
-        DATABASE_TIMEOUT,
-        client.query_opt("SELECT private_key FROM accounts WHERE id = -99", &[]),
-    )
-    .await
-    .context("timed out reading the instance actor's key")?
-    .context("failed to read the instance actor's key")?;
-    row.and_then(|row| row.get::<_, Option<String>>(0))
-        .filter(|key| !key.trim().is_empty())
-        .context("the instance actor has no private key")
+    let fragment = format!("#{}", key_id.fragment().unwrap_or_default());
+    let read = async {
+        match client.query_opt(SELECT_KEYPAIR, &[&fragment]).await {
+            Ok(row) => {
+                if let Some(key) = row.and_then(|row| non_empty_key(row.get(0))) {
+                    return Ok(Some((key, true)));
+                }
+            }
+            Err(e) if e.code() == Some(&SqlState::UNDEFINED_TABLE) => {}
+            Err(e) => return Err(e),
+        }
+        let row = client
+            .query_opt("SELECT private_key FROM accounts WHERE id = -99", &[])
+            .await?;
+        Ok(row
+            .and_then(|row| non_empty_key(row.get(0)))
+            .map(|key| (key, false)))
+    };
+    let (key, encrypted) = tokio::time::timeout(DATABASE_TIMEOUT, read)
+        .await
+        .context("timed out reading the instance actor's key")?
+        .context("failed to read the instance actor's key")?
+        .with_context(|| format!("the instance actor has no private key for {fragment}"))?;
+    if !encrypted {
+        return Ok(key);
+    }
+    let secrets = secrets.context(
+        "the instance actor's key is encrypted; set the ACTIVE_RECORD_ENCRYPTION_* variables",
+    )?;
+    encryption::decrypt(&key, secrets).context("failed to decrypt the instance actor's key")
+}
+
+fn non_empty_key(key: Option<String>) -> Option<String> {
+    key.filter(|key| !key.trim().is_empty())
 }
 
 /// `created_at`/`updated_at` are bound as parameters rather than written with `NOW()`: Mastodon's

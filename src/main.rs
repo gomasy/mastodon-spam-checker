@@ -2,6 +2,7 @@ mod activitypub;
 mod check;
 mod cli;
 mod config;
+mod encryption;
 mod http;
 mod ids;
 mod llm;
