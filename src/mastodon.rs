@@ -3,10 +3,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 
 use crate::http;
 use crate::ids::{numeric_id_cmp, validate_account_id};
+
+/// The admin accounts API's maximum page size.
+pub const ADMIN_PAGE_LIMIT: usize = 200;
 
 /// How many recent posts a check reads.
 pub const STATUSES_LIMIT: usize = 10;
@@ -156,7 +160,7 @@ impl MastodonClient {
         max_id: Option<&str>,
         max_accounts: usize,
     ) -> Result<Vec<AdminAccount>> {
-        let page_limit = max_accounts.min(200);
+        let page_limit = max_accounts.min(ADMIN_PAGE_LIMIT);
         let mut accounts = Vec::new();
         let forward = min_id.is_some();
         let mut page_min_id = min_id.map(str::to_string);
@@ -164,23 +168,11 @@ impl MastodonClient {
         while accounts.len() < max_accounts {
             let remaining = max_accounts - accounts.len();
             let limit = page_limit.min(remaining);
-            // Encoded rather than concatenated, so the pagination bounds cannot smuggle in extra
-            // query parameters even though both reach here validated as digits.
             let limit_param = limit.to_string();
             let mut query = vec![("origin", "remote"), ("limit", limit_param.as_str())];
             query.extend(page_min_id.as_deref().map(|id| ("min_id", id)));
             query.extend(page_max_id.as_deref().map(|id| ("max_id", id)));
-            let query =
-                serde_urlencoded::to_string(&query).context("failed to build account query")?;
-            let url = format!("{}/api/v2/admin/accounts?{query}", self.base_url);
-            info!(url = %url, "fetching accounts");
-            let resp = self
-                .send_retry(|| self.client.get(&url), "Admin accounts API")
-                .await?;
-            let mut page: Vec<AdminAccount> = resp
-                .json()
-                .await
-                .context("failed to parse admin accounts response")?;
+            let mut page: Vec<AdminAccount> = self.admin_accounts_page(&query).await?;
             // Whether the page was full decides if another one exists, so measure it before
             // de-duplication: a repeated ID within a page would otherwise end pagination early,
             // silently leaving the remaining accounts unchecked.
@@ -212,6 +204,22 @@ impl MastodonClient {
         // Pages can overlap at their bounds, so per-page ordering does not carry across the seam.
         sort_unique_by_id(&mut accounts);
         Ok(accounts)
+    }
+
+    /// One page of `GET /api/v2/admin/accounts`. The query is encoded rather than concatenated, so
+    /// values cannot smuggle in extra parameters.
+    async fn admin_accounts_page<T: DeserializeOwned>(
+        &self,
+        query: &[(&str, &str)],
+    ) -> Result<Vec<T>> {
+        let query = serde_urlencoded::to_string(query).context("failed to build account query")?;
+        let url = format!("{}/api/v2/admin/accounts?{query}", self.base_url);
+        info!(url = %url, "fetching accounts");
+        self.send_retry(|| self.client.get(&url), "Admin accounts API")
+            .await?
+            .json()
+            .await
+            .context("failed to parse admin accounts response")
     }
 
     /// Resolves an acct to its admin account. `lookup` matches exactly and normalizes case, and is
