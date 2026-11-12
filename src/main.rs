@@ -5,6 +5,7 @@ mod config;
 mod encryption;
 mod http;
 mod ids;
+mod learn;
 mod llm;
 mod mastodon;
 mod postgres;

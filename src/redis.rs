@@ -15,7 +15,7 @@ mod known_spam;
 
 #[cfg(test)]
 pub use known_spam::ServerSpam;
-pub use known_spam::{CheckSignals, KnownSpamContext, LearnSource};
+pub use known_spam::{CheckSignals, KnownSpamContext, LearnOutcome, LearnSource};
 
 const KEY_PREFIX: &str = "mastodon_spam_checker";
 const CURSOR_KEY: &str = "mastodon_spam_checker:last_account_id";

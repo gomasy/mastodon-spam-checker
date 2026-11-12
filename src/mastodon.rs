@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 
 use crate::http;
-use crate::ids::{numeric_id_cmp, validate_account_id};
+use crate::ids::{is_numeric_id, numeric_id_cmp, validate_account_id};
 
 /// The admin accounts API's maximum page size.
 pub const ADMIN_PAGE_LIMIT: usize = 200;
@@ -204,6 +204,42 @@ impl MastodonClient {
         // Pages can overlap at their bounds, so per-page ordering does not carry across the seam.
         sort_unique_by_id(&mut accounts);
         Ok(accounts)
+    }
+
+    /// IDs of suspended remote accounts, newest first by account ID (not suspension time).
+    pub async fn fetch_suspended_remote_account_ids(&self, max: usize) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Suspended {
+            id: String,
+        }
+
+        let mut ids: Vec<String> = Vec::new();
+        let mut max_id: Option<String> = None;
+        while ids.len() < max {
+            let limit = (max - ids.len()).min(ADMIN_PAGE_LIMIT);
+            let limit_param = limit.to_string();
+            let mut query = vec![
+                ("origin", "remote"),
+                ("status", "suspended"),
+                ("limit", limit_param.as_str()),
+            ];
+            query.extend(max_id.as_deref().map(|id| ("max_id", id)));
+            let page: Vec<Suspended> = self.admin_accounts_page(&query).await?;
+            let page_was_full = page.len() >= limit;
+            let page: Vec<String> = page
+                .into_iter()
+                .map(|account| account.id)
+                .filter(|id| is_numeric_id(id))
+                .collect();
+            let next_max_id = page.iter().min_by(|a, b| numeric_id_cmp(a, b)).cloned();
+            ids.extend(page);
+            if !page_was_full || next_max_id.is_none() || next_max_id == max_id {
+                break;
+            }
+            max_id = next_max_id;
+        }
+        ids.truncate(max);
+        Ok(ids)
     }
 
     /// One page of `GET /api/v2/admin/accounts`. The query is encoded rather than concatenated, so

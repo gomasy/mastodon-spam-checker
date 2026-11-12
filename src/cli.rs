@@ -13,12 +13,12 @@ use crate::check::{self, CheckServices, PostSource, ServiceOptions};
 use crate::config::{self, Config, DetectionConfig, parse_positive_usize};
 use crate::ids::{numeric_id_cmp, validate_account_id};
 use crate::llm::LlmClient;
-use crate::mastodon::AdminAccount;
+use crate::mastodon::{ADMIN_PAGE_LIMIT, AdminAccount, MastodonClient};
 use crate::redis::{CampaignContext, KnownSpamContext, StateStore};
-use crate::{server, signals};
+use crate::{learn, server, signals};
 
 pub fn usage() -> &'static str {
-    "usage: mastodon-spam-checker [serve|dry-run|check-account <ID>|cursor|retry-failed [--max N]|backfill --from ID [--to ID] [--max N] [--notify]|check-acct <USER@DOMAIN>]"
+    "usage: mastodon-spam-checker [serve|dry-run|check-account <ID>|cursor|retry-failed [--max N]|backfill --from ID [--to ID] [--max N] [--notify]|check-acct <USER@DOMAIN>|learn-suspended [--max N]]"
 }
 
 pub async fn dispatch(args: &[String]) -> Result<()> {
@@ -37,6 +37,10 @@ pub async fn dispatch(args: &[String]) -> Result<()> {
             exclusive_run(|store| backfill_command(store, options)).await
         }
         Some("check-acct") => check_acct_command(&args[1..]).await,
+        Some("learn-suspended") => {
+            let max = parse_optional_max(&args[1..], 1_000)?;
+            exclusive_run(|store| learn_suspended_command(store, max)).await
+        }
         _ => bail!(usage()),
     }
 }
@@ -123,6 +127,14 @@ async fn check(store: StateStore, dry_run: bool) -> Result<()> {
         },
     )
     .await?;
+    // First, so new suspensions count against this run; a failure must not block the checks.
+    if !dry_run
+        && let Err(error) =
+            learn::learn_suspended(&store, services.mastodon(), ADMIN_PAGE_LIMIT).await
+    {
+        warn!(error = %chain(&error), "failed to learn from suspended accounts");
+    }
+
     let accounts = services
         .mastodon()
         .fetch_remote_accounts(cursor.as_deref(), None, config.max_accounts_per_run)
@@ -292,6 +304,16 @@ async fn backfill_command(store: StateStore, options: BackfillOptions) -> Result
         .finish(false)
 }
 
+/// Learns from more suspended accounts than the one page a periodic run looks at.
+async fn learn_suspended_command(store: StateStore, max: usize) -> Result<()> {
+    let detection = DetectionConfig::from_env()?;
+    let mastodon = MastodonClient::new(
+        &detection.mastodon_base_url,
+        &detection.mastodon_access_token,
+    )?;
+    learn::learn_suspended(&store, &mastodon, max).await
+}
+
 /// Normalizes `[@]username@domain` to `username@domain`.
 fn parse_acct(acct: &str) -> Result<String> {
     let bare = acct.strip_prefix('@').unwrap_or(acct);
@@ -358,7 +380,7 @@ fn parse_optional_max(args: &[String], default: usize) -> Result<usize> {
     match args {
         [] => Ok(default),
         [flag, value] if flag == "--max" => parse_positive_usize(value, "--max"),
-        _ => bail!("usage: mastodon-spam-checker retry-failed [--max N]"),
+        _ => bail!("usage: mastodon-spam-checker <retry-failed|learn-suspended> [--max N]"),
     }
 }
 

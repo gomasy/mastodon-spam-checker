@@ -290,6 +290,34 @@ impl StateStore {
         self.write(&pipeline, "failed to forget known spam").await?;
         Ok(true)
     }
+
+    /// The accounts among `ids` that [`Self::learn_spam`] would learn, read in one round trip.
+    pub async fn learnable(&self, ids: &[String]) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut state = redis::pipe();
+        for id in ids {
+            state
+                .get(feedback_key(id))
+                .get(job_key(id))
+                .exists(known_spam_record_key(id));
+        }
+        let states: Vec<(Option<String>, Option<String>, bool)> =
+            self.read(&state, "failed to read account state").await?;
+        Ok(ids
+            .iter()
+            .zip(states)
+            .filter(|(_, (feedback, job, known))| {
+                // Unparseable state is left to learn_spam, which reports it.
+                !known
+                    && !is_false_positive(feedback.as_deref()).unwrap_or(false)
+                    && parse_job(job.as_deref())
+                        .map_or(true, |job| job.is_some_and(|job| job.signals.is_some()))
+            })
+            .map(|(id, _)| id.clone())
+            .collect())
+    }
 }
 
 fn is_false_positive(feedback: Option<&str>) -> Result<bool> {

@@ -26,12 +26,14 @@ moderator feedback, and the cursor stay durable.
 4. Correlates substantial bio fingerprints and linked domains with a capped
    sample of accounts observed in the last 30 days, exposing coordinated
    campaigns to the LLM without an unbounded Redis index.
-5. Asks the LLM for a verdict:
+5. Compares the same signals, and the account's server, with
+   moderator-confirmed spam (see [Learning from moderators](#learning-from-moderators)).
+6. Asks the LLM for a verdict:
    `{"spam": bool, "reason": "...", "confidence": 0.0-1.0}`.
-6. Persists the verdict and sends a Slack notification for each account judged
+7. Persists the verdict and sends a Slack notification for each account judged
    as spam, including the local moderation page, feedback actions, and a suspend
    button.
-7. Saves the last contiguously processed account ID as the cursor.
+8. Saves the last contiguously processed account ID as the cursor.
 
 The prompt treats all account data as untrusted: instructions embedded in
 profiles or posts are themselves a spam indicator.
@@ -62,6 +64,53 @@ Normal checks, retries, and backfills share a renewable Redis lease, so
 overlapping invocations fail instead of duplicating work. A Slack delivery
 interrupted after it starts is stored as pending; the periodic checker leaves it
 alone, and `retry-failed` re-sends it from the persisted verdict.
+
+### Learning from moderators
+
+Every check stores the account's server, bio fingerprint, and linked domains
+(excluding its own server) on its job record, kept for 90 days. No profile text
+is kept. When a moderator confirms the account as spam, these signals move into
+a confirmed-spam index. They are stored at check time because Mastodon blanks a
+suspended remote account's profile and deletes its posts. An account confirmed
+as spam is one that was:
+
+- marked **Confirm spam** in Slack,
+- suspended or deleted from Slack, or
+- found suspended in Mastodon, however it was suspended. Each periodic run
+  looks through the newest page (200) of suspended remote accounts before it
+  checks new ones. This is how spam the checker missed is learned: a moderator
+  suspends it by hand, and the next run picks it up.
+
+Later checks tell the LLM how the account matches that index:
+
+- **Identical bio, or a shared destination domain**: enough on its own to judge
+  the account as spam. Shared domains on major general-purpose platforms
+  (social networks, Fediverse servers, video hosting, link-in-bio services, …)
+  are ignored.
+- **Server share**: how many of the accounts recently observed from the
+  account's server were confirmed spam. A server with at least 2 confirmed
+  spam accounts that make up at least a quarter of those observed is marked
+  *spam-heavy*. On a spam-heavy server, commercial promotion in a profile
+  counts as a spam criterion. This catches campaigns that register a fresh
+  account per product on open-registration servers, where neither the text nor
+  the domain repeats. The share requirement keeps large general-purpose
+  servers from being tainted by the spam they inevitably host.
+
+Marking an account **False positive** removes it from the index, and an account
+already marked that way is never learned. A suspension lifted in Mastodon is
+not unlearned, so use the Slack button if a suspension was a mistake.
+Suspensions for reasons other than spam are learned like any other. Entries
+expire after a year.
+
+Only accounts checked after this feature was deployed have stored signals.
+Earlier accounts cannot be learned retroactively.
+
+To look further back than one page, for example after a moderation sweep:
+
+```sh
+mastodon-spam-checker learn-suspended            # up to 1000 accounts
+mastodon-spam-checker learn-suspended --max 5000
+```
 
 ### Confidence threshold
 
@@ -205,6 +254,13 @@ again:
 ```sh
 mastodon-spam-checker retry-failed
 mastodon-spam-checker retry-failed --max 25
+```
+
+Learn from suspended remote accounts beyond the page each run looks at (see
+[Learning from moderators](#learning-from-moderators)):
+
+```sh
+mastodon-spam-checker learn-suspended --max 2000
 ```
 
 Backfill an ID range. Both `--from` and the optional `--to` are exclusive
