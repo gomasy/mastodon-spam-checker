@@ -29,10 +29,13 @@ pub fn analyze(account: &AdminAccount, statuses: &[Status]) -> AccountSignals {
     }
 
     let links: Vec<String> = links.into_iter().take(30).collect();
+    // The account's own server is shared by everyone on it, not a destination.
+    let home = account.domain.as_deref().map(str::to_ascii_lowercase);
     let link_domains = links
         .iter()
         .filter_map(|link| reqwest::Url::parse(link).ok())
         .filter_map(|url| url.host_str().map(str::to_ascii_lowercase))
+        .filter(|host| home.as_deref() != Some(host))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -137,6 +140,26 @@ mod tests {
         let mut links = BTreeSet::new();
         collect_links(html, &mut links);
         links.into_iter().collect()
+    }
+
+    #[test]
+    fn the_accounts_own_server_is_not_a_destination_domain() {
+        let account: AdminAccount = serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "username": "shop",
+            "domain": "Spam.Example",
+            "account": {
+                "display_name": "",
+                "note": r#"<a href="https://spam.example/about">x</a> <a href="https://shop.example/">y</a>"#,
+                "avatar": "",
+                "url": "",
+                "followers_count": 0,
+                "following_count": 0,
+                "statuses_count": 0
+            }
+        }))
+        .unwrap();
+        assert_eq!(analyze(&account, &[]).link_domains, ["shop.example"]);
     }
 
     #[test]
