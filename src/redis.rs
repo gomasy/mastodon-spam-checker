@@ -766,23 +766,15 @@ fn campaign_pipeline(keys: &[String], account_id: &str, now: u64, record: bool) 
     let mut pipeline = redis::pipe();
     for key in keys {
         if record {
-            pipeline
-                // Drop entries that fell out of the window before adding to or capping the key.
-                .cmd("ZREMRANGEBYSCORE")
-                .arg(key)
-                .arg("-inf")
-                .arg(cutoff)
-                .ignore()
-                .zadd(key, account_id, now)
-                .ignore()
-                .expire(key, CAMPAIGN_WINDOW_SECS as i64)
-                .ignore()
-                // Keep only the newest members, so one busy domain cannot grow without bound.
-                .cmd("ZREMRANGEBYRANK")
-                .arg(key)
-                .arg(0)
-                .arg(-(CAMPAIGN_MEMBERS_PER_SIGNAL + 1))
-                .ignore();
+            add_windowed(
+                &mut pipeline,
+                key,
+                account_id,
+                now,
+                now,
+                CAMPAIGN_WINDOW_SECS,
+                CAMPAIGN_MEMBERS_PER_SIGNAL,
+            );
         }
         // By score rather than by rank, so a dry run can skip the trim above and stay read-only
         // without reporting accounts that have since aged out. The bound is exclusive, matching
@@ -802,6 +794,34 @@ fn campaign_pipeline(keys: &[String], account_id: &str, now: u64, record: bool) 
 /// A read [`StateStore::read`] can reissue against a replacement connection. `Cmd` and `Pipeline`
 /// carry the same `query_async` but share no trait that names it, so without this the one retry
 /// would be written out once per shape of read.
+/// Adds `member` to a time-scored set, dropping entries older than `window` and the oldest beyond
+/// `cap`; the set expires once nothing is added for `window`.
+fn add_windowed(
+    pipeline: &mut Pipeline,
+    key: &str,
+    member: &str,
+    score: u64,
+    now: u64,
+    window: u64,
+    cap: i64,
+) {
+    pipeline
+        .cmd("ZREMRANGEBYSCORE")
+        .arg(key)
+        .arg("-inf")
+        .arg(now.saturating_sub(window))
+        .ignore()
+        .zadd(key, member, score)
+        .ignore()
+        .expire(key, window as i64)
+        .ignore()
+        .cmd("ZREMRANGEBYRANK")
+        .arg(key)
+        .arg(0)
+        .arg(-(cap + 1))
+        .ignore();
+}
+
 trait RedisRead {
     async fn run<T: FromRedisValue>(&self, conn: &mut ConnectionManager) -> RedisResult<T>;
 }
