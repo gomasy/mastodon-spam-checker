@@ -17,7 +17,7 @@ use crate::http;
 use crate::llm::{self, LlmClient, SpamVerdict};
 use crate::mastodon::{AdminAccount, MastodonClient, Status};
 use crate::postgres::{self, ModerationNoteWriter};
-use crate::redis::{CampaignContext, JobRecord, JobStatus, StateStore};
+use crate::redis::{CampaignContext, CheckSignals, JobRecord, JobStatus, StateStore};
 use crate::signals;
 use crate::slack::SlackNotifier;
 
@@ -157,6 +157,7 @@ struct CheckedAccount {
     outcome: AccountCheckOutcome,
     status: JobStatus,
     campaign: CampaignContext,
+    signals: CheckSignals,
 }
 
 #[derive(Default)]
@@ -316,7 +317,8 @@ async fn check_one(
 
     match check_one_inner(&account, &services).await {
         Ok(checked) => {
-            if let Some(job) = job {
+            if let Some(mut job) = job {
+                job.signals = Some(checked.signals);
                 services
                     .store
                     .complete_job(
@@ -359,19 +361,26 @@ async fn check_one_inner(
         .await
         .context("failed to fetch statuses")?;
     let signals = signals::analyze(account, &statuses);
-    let campaign = services
-        .store
-        .campaign_context(
+    let stored = CheckSignals {
+        instance: account.domain.clone(),
+        bio_fingerprint: signals.bio_fingerprint.clone(),
+        link_domains: signals.link_domains.clone(),
+    };
+    let (campaign, known) = tokio::try_join!(
+        services.store.campaign_context(
             &account.id,
             signals.bio_fingerprint.as_deref(),
             &signals.link_domains,
             services.persist,
-        )
-        .await?;
+        ),
+        services
+            .store
+            .known_spam_context(&account.id, &stored, services.persist),
+    )?;
 
     let verdict = match services
         .llm
-        .check_spam(account, &statuses, &signals, &campaign)
+        .check_spam(account, &statuses, &signals, &campaign, &known)
         .await
     {
         Ok(verdict) => verdict,
@@ -385,6 +394,7 @@ async fn check_one_inner(
                 outcome: AccountCheckOutcome::Undetermined,
                 status: JobStatus::Undetermined,
                 campaign,
+                signals: stored,
             });
         }
         Err(error) => return Err(error).context("LLM check failed"),
@@ -400,6 +410,7 @@ async fn check_one_inner(
             outcome: AccountCheckOutcome::NotSpam(verdict),
             status: JobStatus::NotSpam,
             campaign,
+            signals: stored,
         });
     }
 
@@ -411,7 +422,7 @@ async fn check_one_inner(
         campaign_matches = campaign.match_count(),
         "spam detected"
     );
-    report_spam(account, services, verdict, campaign).await
+    report_spam(account, services, verdict, campaign, stored).await
 }
 
 /// Notifies moderators about a spam verdict, and records it.
@@ -424,6 +435,7 @@ async fn report_spam(
     services: &CheckServices,
     verdict: SpamVerdict,
     campaign: CampaignContext,
+    signals: CheckSignals,
 ) -> Result<CheckedAccount> {
     if services.slack.is_some() {
         services
@@ -433,6 +445,7 @@ async fn report_spam(
                 JobStatus::NotificationPending,
                 (&verdict).into(),
                 &campaign,
+                &signals,
             )
             .await?;
     }
@@ -446,6 +459,7 @@ async fn report_spam(
         outcome: AccountCheckOutcome::Spam { verdict, notified },
         status: JobStatus::Spam,
         campaign,
+        signals,
     })
 }
 

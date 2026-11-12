@@ -14,7 +14,7 @@ use crate::config::{self, Config, DetectionConfig, parse_positive_usize};
 use crate::ids::{numeric_id_cmp, validate_account_id};
 use crate::llm::LlmClient;
 use crate::mastodon::AdminAccount;
-use crate::redis::{CampaignContext, StateStore};
+use crate::redis::{CampaignContext, KnownSpamContext, StateStore};
 use crate::{server, signals};
 
 pub fn usage() -> &'static str {
@@ -178,9 +178,15 @@ async fn inspect_account(
 ) -> Result<()> {
     let statuses = posts.fetch(account).await?;
     let signals = signals::analyze(account, &statuses);
-    // A one-off inspection touches no state, so it carries no campaign history.
+    // A one-off inspection touches no state, so it carries no campaign or known spam history.
     let verdict = llm
-        .check_spam(account, &statuses, &signals, &CampaignContext::default())
+        .check_spam(
+            account,
+            &statuses,
+            &signals,
+            &CampaignContext::default(),
+            &KnownSpamContext::default(),
+        )
         .await?;
     info!(spam_probability = verdict.spam_probability(), "checked");
     println!(

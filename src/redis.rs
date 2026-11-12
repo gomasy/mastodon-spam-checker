@@ -5,10 +5,17 @@ use anyhow::{Context, Result, bail};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, FromRedisValue, Pipeline, RedisError, RedisResult};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{error, warn};
 
+use crate::chain;
 use crate::ids::numeric_id_cmp;
 use crate::signals::digest;
+
+mod known_spam;
+
+#[cfg(test)]
+pub use known_spam::ServerSpam;
+pub use known_spam::{CheckSignals, KnownSpamContext, LearnSource};
 
 const KEY_PREFIX: &str = "mastodon_spam_checker";
 const CURSOR_KEY: &str = "mastodon_spam_checker:last_account_id";
@@ -100,6 +107,8 @@ pub struct JobRecord {
     pub error: Option<String>,
     pub campaign_match_count: u64,
     pub campaign_accounts: Vec<String>,
+    #[serde(default)]
+    pub signals: Option<CheckSignals>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -159,6 +168,11 @@ impl StateStore {
         what: &'static str,
     ) -> Result<T> {
         self.read(redis::cmd("GET").arg(key), what).await
+    }
+
+    async fn write(&self, pipeline: &Pipeline, what: &'static str) -> Result<()> {
+        let mut conn = self.conn.clone();
+        pipeline.query_async::<()>(&mut conn).await.context(what)
     }
 
     pub async fn get_cursor(&self) -> Result<Option<String>> {
@@ -281,6 +295,7 @@ impl StateStore {
             error: None,
             campaign_match_count: 0,
             campaign_accounts: Vec::new(),
+            signals: None,
         };
         self.save_job(&job).await?;
         Ok(job)
@@ -311,6 +326,7 @@ impl StateStore {
         status: JobStatus,
         verdict: StoredVerdict,
         campaign: &CampaignContext,
+        signals: &CheckSignals,
     ) -> Result<()> {
         let mut job = self
             .get_job(account_id)
@@ -322,6 +338,7 @@ impl StateStore {
         job.error = None;
         job.campaign_match_count = campaign.match_count() as u64;
         job.campaign_accounts = campaign.matching_accounts.clone();
+        job.signals = Some(signals.clone());
         let mut pipeline = redis::pipe();
         pipeline.atomic();
         set_job(&mut pipeline, &job, serialize_job(&job)?);
@@ -340,6 +357,7 @@ impl StateStore {
             job.verdict = current.verdict;
             job.campaign_match_count = current.campaign_match_count;
             job.campaign_accounts = current.campaign_accounts;
+            job.signals = current.signals;
         }
         job.status = JobStatus::Failed;
         job.updated_at = now_timestamp();
@@ -395,6 +413,18 @@ impl StateStore {
             2 => {}
             _ => bail!("unexpected moderator feedback result from Redis"),
         }
+        match status {
+            JobStatus::ConfirmedSpam => {
+                self.learn_logged(account_id, LearnSource::ConfirmedSpam)
+                    .await;
+            }
+            JobStatus::FalsePositive => {
+                if let Err(error) = self.forget_spam(account_id).await {
+                    error!(account_id, error = %chain(&error), "failed to forget cleared account");
+                }
+            }
+            _ => {}
+        }
         // Empty means nothing to replace; an unparseable value reads the same way rather than
         // failing, since the new verdict is already written and this only feeds a log line.
         Ok(parse_feedback(Some(previous.as_str()))
@@ -444,7 +474,12 @@ impl StateStore {
             ACCOUNT_STATE_RETENTION_SECS,
         )
         .await
-        .context("failed to save moderation action")
+        .context("failed to save moderation action")?;
+        if matches!(status, JobStatus::Suspended | JobStatus::Deleted) {
+            self.learn_logged(account_id, LearnSource::SlackAction)
+                .await;
+        }
+        Ok(())
     }
 
     /// Adds the current retention policy to records created before TTLs were introduced.
@@ -930,6 +965,7 @@ mod tests {
             error: None,
             campaign_match_count: 0,
             campaign_accounts: Vec::new(),
+            signals: None,
         }
     }
 
