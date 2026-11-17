@@ -1,5 +1,13 @@
 already_suspended: ":information_source: `%{acct}` は既に停止済みです"
 
+auto_delete_failed: ":warning: *自動停止しましたが、データ削除に失敗しました*（一致: %{matched}）: %{error}"
+auto_deleted: ":wastebasket: *自動削除しました*（一致: %{matched}）。誤りの場合は誤検知として記録してください。"
+auto_failed: ":x: *自動停止に失敗しました*（一致: %{matched}）: %{error}。手動で確認してください。"
+auto_interrupted: "自動対応が中断されました。アカウントの現在の状態を確認してください"
+auto_match_bio: "確定済みスパム %{count} 件と同一のプロフィール文"
+auto_match_domain: "確定済みスパム %{count} 件と共通のリンク先ドメイン %{domain}"
+auto_suspended: ":robot_face: *自動停止しました*（一致: %{matched}）。誤検知の場合は下のボタンで記録し、モデレーション画面から停止を解除してください。"
+
 btn_cancel: キャンセル
 btn_confirm_spam: スパム確定
 btn_delete: アカウントを削除
@@ -30,6 +38,7 @@ llm_reason_lang: Japanese
 
 not_suspended: ":x: `%{acct}` は停止されていないため削除を中止しました（停止が解除された可能性があります）"
 
+note_auto_suspended: "[Mastodon Spam Checker] 既知スパムとの一致により自動停止 (一致: %{matched})"
 note_spam: |-
   [Mastodon Spam Checker] スパムの疑いあり
   確信度: %{confidence}%

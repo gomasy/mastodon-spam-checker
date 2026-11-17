@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
 use super::{
-    ACCOUNT_STATE_RETENTION_SECS, JobStatus, KEY_PREFIX, StateStore, add_windowed, feedback_key,
-    job_key, now_timestamp, parse_feedback, parse_job,
+    ACCOUNT_STATE_RETENTION_SECS, JobStatus, KEY_PREFIX, StateStore, action_key, add_windowed,
+    feedback_key, job_key, now_timestamp, parse_feedback, parse_job,
 };
+use crate::auto_moderation::{AutoModerationRecord, AutoModerationState};
 use crate::chain;
 use crate::signals::digest;
 
@@ -51,6 +52,9 @@ pub enum LearnOutcome {
     /// No job with signals: never checked, or checked too long ago.
     NoSignals,
     ClearedByModerator,
+    /// Suspended by auto-moderation, not by a moderator: learning it would let the checker confirm
+    /// its own verdicts, spreading each match to every other signal on the account.
+    AutoModerated,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -177,14 +181,19 @@ impl StateStore {
         state
             .get(feedback_key(account_id))
             .get(job_key(account_id))
-            .exists(known_spam_record_key(account_id));
-        let (feedback, job, known): (Option<String>, Option<String>, bool) =
+            .exists(known_spam_record_key(account_id))
+            .exists(auto_moderation_key(account_id));
+        let (feedback, job, known, auto_moderated): (Option<String>, Option<String>, bool, bool) =
             self.read(&state, "failed to read account state").await?;
         if is_false_positive(feedback.as_deref())? {
             return Ok(LearnOutcome::ClearedByModerator);
         }
         if known {
             return Ok(LearnOutcome::AlreadyKnown);
+        }
+        // A moderator's own confirmation of an auto-moderated account is still learned.
+        if auto_moderated && source == LearnSource::MastodonSuspension {
+            return Ok(LearnOutcome::AutoModerated);
         }
         let Some((job, signals)) = parse_job(job.as_deref())?
             .and_then(|job| job.signals.clone().map(|signals| (job, signals)))
@@ -257,7 +266,9 @@ impl StateStore {
                     LearnOutcome::NoSignals => {
                         info!(account_id, ?source, "no stored signals to learn from");
                     }
-                    LearnOutcome::AlreadyKnown | LearnOutcome::ClearedByModerator => {}
+                    LearnOutcome::AlreadyKnown
+                    | LearnOutcome::ClearedByModerator
+                    | LearnOutcome::AutoModerated => {}
                 }
                 Some(outcome)
             }
@@ -291,7 +302,8 @@ impl StateStore {
         Ok(true)
     }
 
-    /// The accounts among `ids` that [`Self::learn_spam`] would learn, read in one round trip.
+    /// The accounts among `ids`, suspended in Mastodon, that [`Self::learn_spam`] would learn from
+    /// [`LearnSource::MastodonSuspension`], read in one round trip.
     pub async fn learnable(&self, ids: &[String]) -> Result<Vec<String>> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -301,16 +313,18 @@ impl StateStore {
             state
                 .get(feedback_key(id))
                 .get(job_key(id))
-                .exists(known_spam_record_key(id));
+                .exists(known_spam_record_key(id))
+                .exists(auto_moderation_key(id));
         }
-        let states: Vec<(Option<String>, Option<String>, bool)> =
+        let states: Vec<(Option<String>, Option<String>, bool, bool)> =
             self.read(&state, "failed to read account state").await?;
         Ok(ids
             .iter()
             .zip(states)
-            .filter(|(_, (feedback, job, known))| {
+            .filter(|(_, (feedback, job, known, auto_moderated))| {
                 // Unparseable state is left to learn_spam, which reports it.
                 !known
+                    && !auto_moderated
                     && !is_false_positive(feedback.as_deref()).unwrap_or(false)
                     && parse_job(job.as_deref())
                         .map_or(true, |job| job.is_some_and(|job| job.signals.is_some()))
@@ -318,6 +332,73 @@ impl StateStore {
             .map(|(id, _)| id.clone())
             .collect())
     }
+}
+
+impl StateStore {
+    /// Records how far auto-moderation got. `Pending` must be saved *before* Mastodon is asked to
+    /// suspend: the marker is what keeps the suspension from being learned as a moderator's. A
+    /// suspension or deletion is also recorded as the account's moderation action, without
+    /// learning from it, unlike [`Self::record_action`].
+    pub async fn save_auto_moderation(
+        &self,
+        account_id: &str,
+        record: &AutoModerationRecord,
+    ) -> Result<()> {
+        let action = match record.state {
+            AutoModerationState::Pending => None,
+            AutoModerationState::Suspended => Some(JobStatus::Suspended),
+            AutoModerationState::Deleted => Some(JobStatus::Deleted),
+        };
+        let value =
+            serde_json::to_string(record).context("failed to serialize auto-moderation state")?;
+        let mut pipeline = redis::pipe();
+        pipeline.atomic();
+        pipeline
+            .set_ex(
+                auto_moderation_key(account_id),
+                value,
+                ACCOUNT_STATE_RETENTION_SECS,
+            )
+            .ignore();
+        if let Some(action) = action {
+            pipeline
+                .set_ex(
+                    action_key(account_id),
+                    action.as_str(),
+                    ACCOUNT_STATE_RETENTION_SECS,
+                )
+                .ignore();
+        }
+        self.write(&pipeline, "failed to save auto-moderation state")
+            .await
+    }
+
+    /// Removes the marker after a suspension that did not happen, so a moderator suspending the
+    /// account by hand later is learned as usual.
+    pub async fn abort_auto_moderation(&self, account_id: &str) -> Result<()> {
+        let mut pipeline = redis::pipe();
+        pipeline.del(auto_moderation_key(account_id)).ignore();
+        self.write(&pipeline, "failed to clear auto-moderation state")
+            .await
+    }
+
+    pub async fn auto_moderation(&self, account_id: &str) -> Result<Option<AutoModerationRecord>> {
+        let value: Option<String> = self
+            .read_key(
+                auto_moderation_key(account_id),
+                "failed to read auto-moderation state",
+            )
+            .await?;
+        value
+            .map(|value| {
+                serde_json::from_str(&value).context("invalid auto-moderation state in Redis")
+            })
+            .transpose()
+    }
+}
+
+fn auto_moderation_key(account_id: &str) -> String {
+    format!("{KEY_PREFIX}:auto_moderation:{account_id}")
 }
 
 fn is_false_positive(feedback: Option<&str>) -> Result<bool> {

@@ -1,5 +1,13 @@
 already_suspended: ":information_source: `%{acct}` is already suspended"
 
+auto_delete_failed: ":warning: *Auto-suspended, but deleting the data failed* (matched %{matched}): %{error}"
+auto_deleted: ":wastebasket: *Auto-deleted*: matched %{matched}. Mark it as a false positive if this was a mistake."
+auto_failed: ":x: *Auto-suspension failed* (matched %{matched}): %{error}. Please review manually."
+auto_interrupted: "auto-moderation was interrupted; check the account's current state"
+auto_match_bio: "identical profile text to %{count} confirmed spam account(s)"
+auto_match_domain: "destination domain %{domain}, shared with %{count} confirmed spam accounts"
+auto_suspended: ":robot_face: *Auto-suspended*: matched %{matched}. If this is a false positive, mark it below and lift the suspension from the moderation page."
+
 btn_cancel: Cancel
 btn_confirm_spam: Confirm spam
 btn_delete: Delete account
@@ -30,6 +38,7 @@ llm_reason_lang: English
 
 not_suspended: ":x: Deletion aborted: `%{acct}` is not suspended (the suspension may have been lifted)"
 
+note_auto_suspended: "[Mastodon Spam Checker] Auto-suspended as known spam (matched: %{matched})"
 note_spam: |-
   [Mastodon Spam Checker] Suspected spam
   Confidence: %{confidence}%

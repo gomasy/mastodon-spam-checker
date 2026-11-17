@@ -102,8 +102,14 @@ async fn check(store: StateStore, dry_run: bool) -> Result<()> {
         review_model = config.detection.openai_review_model.as_deref(),
         max_accounts = config.max_accounts_per_run,
         concurrency = config.check_concurrency,
+        auto_moderation = ?config.auto_moderation.as_ref().map(|auto| auto.mode),
         "configuration loaded"
     );
+    if config.auto_moderation.is_some() && config.slack_webhook_url.is_none() {
+        warn!(
+            "AUTO_MODERATION is set but Slack is not configured; no account will be auto-moderated"
+        );
+    }
 
     if !dry_run {
         let retention_applied = store.cleanup_expired_records().await?;

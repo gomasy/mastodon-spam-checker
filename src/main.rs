@@ -1,4 +1,5 @@
 mod activitypub;
+mod auto_moderation;
 mod check;
 mod cli;
 mod config;

@@ -11,13 +11,16 @@ use rust_i18n::t;
 use tracing::{error, info, warn};
 
 use crate::activitypub::RemoteFetcher;
+use crate::auto_moderation::{self, AutoModerationConfig, AutoModerationOutcome};
 use crate::chain;
 use crate::config::{Config, DetectionConfig};
 use crate::http;
 use crate::llm::{self, LlmClient, SpamVerdict};
 use crate::mastodon::{AdminAccount, MastodonClient, Status};
 use crate::postgres::{self, ModerationNoteWriter};
-use crate::redis::{CampaignContext, CheckSignals, JobRecord, JobStatus, StateStore};
+use crate::redis::{
+    CampaignContext, CheckSignals, JobRecord, JobStatus, KnownSpamContext, StateStore,
+};
 use crate::signals;
 use crate::slack::SlackNotifier;
 
@@ -40,6 +43,7 @@ pub struct CheckServices {
     /// whether anything is written back.
     store: StateStore,
     note_writer: Option<ModerationNoteWriter>,
+    auto_moderation: Option<AutoModerationConfig>,
     persist: bool,
     retry_pending: bool,
 }
@@ -72,9 +76,16 @@ impl CheckServices {
             slack,
             store,
             note_writer,
+            auto_moderation: config.auto_moderation.clone(),
             persist: options.persist,
             retry_pending: options.retry_pending,
         })
+    }
+
+    /// Auto-moderation acts only in runs that record what they did and tell moderators about it:
+    /// an account suspended in a dry run, or with nobody notified, would be suspended unseen.
+    fn auto_moderates(&self) -> bool {
+        self.persist && self.slack.is_some()
     }
 
     /// For callers that select the accounts to check before handing them to [`process_accounts`].
@@ -136,6 +147,7 @@ enum AccountCheckOutcome {
     Spam {
         verdict: SpamVerdict,
         notified: bool,
+        auto_moderated: bool,
     },
     Undetermined,
 }
@@ -165,6 +177,7 @@ pub struct ProcessSummary {
     last_contiguous_id: Option<String>,
     spam_detected: u32,
     spam_notified: u32,
+    auto_moderated: u32,
     undetermined: u32,
     skipped_existing: u32,
     first_failure: Option<anyhow::Error>,
@@ -191,6 +204,7 @@ impl ProcessSummary {
         info!(
             spam_detected = self.spam_detected,
             spam_notified = self.spam_notified,
+            auto_moderated = self.auto_moderated,
             undetermined = self.undetermined,
             skipped_existing = self.skipped_existing,
             dry_run,
@@ -241,9 +255,14 @@ pub async fn process_accounts(
                 .remove(&account.id)
                 .unwrap_or_else(|| Err(anyhow::anyhow!("account check task produced no result")));
             match result {
-                Ok(AccountCheckOutcome::Spam { notified, .. }) => {
+                Ok(AccountCheckOutcome::Spam {
+                    notified,
+                    auto_moderated,
+                    ..
+                }) => {
                     summary.spam_detected += 1;
                     summary.spam_notified += u32::from(notified);
+                    summary.auto_moderated += u32::from(auto_moderated);
                 }
                 Ok(AccountCheckOutcome::Undetermined) => summary.undetermined += 1,
                 Ok(AccountCheckOutcome::Existing) => summary.skipped_existing += 1,
@@ -284,7 +303,13 @@ async fn check_one(
             return Ok(AccountCheckOutcome::Existing);
         }
         if let Some(job) = store.get_job(&account.id).await? {
-            if job.status == JobStatus::NotificationPending {
+            // A failed notification marks the job failed, which would otherwise re-judge it from
+            // scratch: an auto-moderated account must instead get the notification for what was
+            // already done, whatever a fresh verdict would say.
+            let auto_moderated_failure = job.status == JobStatus::Failed
+                && job.verdict.is_some()
+                && store.auto_moderation(&account.id).await?.is_some();
+            if job.status == JobStatus::NotificationPending || auto_moderated_failure {
                 if services.retry_pending {
                     return retry_pending_notification(account, &services, job).await;
                 }
@@ -334,6 +359,7 @@ async fn check_one(
             if let AccountCheckOutcome::Spam {
                 verdict,
                 notified: true,
+                ..
             } = &checked.outcome
             {
                 add_spam_note(&services, &account.id, verdict).await;
@@ -422,7 +448,7 @@ async fn check_one_inner(
         campaign_matches = campaign.match_count(),
         "spam detected"
     );
-    report_spam(account, services, verdict, campaign, stored).await
+    report_spam(account, services, verdict, campaign, stored, &known).await
 }
 
 /// Notifies moderators about a spam verdict, and records it.
@@ -436,6 +462,7 @@ async fn report_spam(
     verdict: SpamVerdict,
     campaign: CampaignContext,
     signals: CheckSignals,
+    known: &KnownSpamContext,
 ) -> Result<CheckedAccount> {
     if services.slack.is_some() {
         services
@@ -450,17 +477,53 @@ async fn report_spam(
             .await?;
     }
 
-    let notified = notify_with_claim(services, account, &verdict).await?;
+    // After the classification is recorded, so an interruption from here on leaves a pending
+    // notification for retry-failed to send, rather than an account suspended without one.
+    let auto = auto_moderate(account, services, &verdict, known).await?;
+    let notified = notify_with_claim(services, account, &verdict, auto.as_ref()).await?;
     if !notified {
         info!(account_id = %account.id, "notification disabled");
     }
 
     Ok(CheckedAccount {
-        outcome: AccountCheckOutcome::Spam { verdict, notified },
+        outcome: AccountCheckOutcome::Spam {
+            verdict,
+            notified,
+            auto_moderated: auto.as_ref().is_some_and(AutoModerationOutcome::acted),
+        },
         status: JobStatus::Spam,
         campaign,
         signals,
     })
+}
+
+async fn auto_moderate(
+    account: &AdminAccount,
+    services: &CheckServices,
+    verdict: &SpamVerdict,
+    known: &KnownSpamContext,
+) -> Result<Option<AutoModerationOutcome>> {
+    let Some(config) = &services.auto_moderation else {
+        return Ok(None);
+    };
+    let Some(matched) = config.qualifying_match(verdict.spam_probability(), known) else {
+        return Ok(None);
+    };
+    if !services.auto_moderates() {
+        // Dry runs only log what they would have done.
+        info!(account_id = %account.id, ?matched, "matches known spam; auto-moderation skipped in a run without notifications");
+        return Ok(None);
+    }
+    auto_moderation::apply(
+        config.mode,
+        services.mastodon(),
+        &services.store,
+        services.note_writer.as_ref(),
+        account,
+        matched,
+    )
+    .await
+    .map(Some)
 }
 
 async fn retry_pending_notification(
@@ -476,7 +539,13 @@ async fn retry_pending_notification(
     let campaign = CampaignContext {
         matching_accounts: job.campaign_accounts.clone(),
     };
-    match notify_with_claim(services, &account, &verdict).await {
+    let auto = services
+        .store
+        .auto_moderation(&account.id)
+        .await?
+        .map(|record| record.outcome());
+    let auto_moderated = auto.as_ref().is_some_and(AutoModerationOutcome::acted);
+    match notify_with_claim(services, &account, &verdict, auto.as_ref()).await {
         Ok(notified) => {
             services
                 .store
@@ -491,7 +560,11 @@ async fn retry_pending_notification(
             if notified {
                 add_spam_note(services, &account.id, &verdict).await;
             }
-            Ok(AccountCheckOutcome::Spam { verdict, notified })
+            Ok(AccountCheckOutcome::Spam {
+                verdict,
+                notified,
+                auto_moderated,
+            })
         }
         Err(error) => {
             if let Err(store_error) = services.store.fail_job(job, &error).await {
@@ -506,6 +579,7 @@ async fn notify_with_claim(
     services: &CheckServices,
     account: &AdminAccount,
     verdict: &SpamVerdict,
+    auto: Option<&AutoModerationOutcome>,
 ) -> Result<bool> {
     let Some(slack) = &services.slack else {
         return Ok(false);
@@ -522,7 +596,7 @@ async fn notify_with_claim(
         );
     };
     let result = slack
-        .notify_spam(account, verdict)
+        .notify_spam(account, verdict, auto)
         .await
         .context("failed to send Slack notification");
     if let Err(error) = store.release_notification_claim(&account.id, &token).await {

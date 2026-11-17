@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use rust_i18n::t;
 
+use crate::auto_moderation::{AutoModerationOutcome, AutoModerationResult};
 use crate::http;
 use crate::llm::SpamVerdict;
 use crate::mastodon::AdminAccount;
@@ -68,7 +69,12 @@ impl SlackNotifier {
         })
     }
 
-    pub async fn notify_spam(&self, account: &AdminAccount, verdict: &SpamVerdict) -> Result<()> {
+    pub async fn notify_spam(
+        &self,
+        account: &AdminAccount,
+        verdict: &SpamVerdict,
+        auto: Option<&AutoModerationOutcome>,
+    ) -> Result<()> {
         let acct = account.acct();
         let safe_acct = sanitize_mrkdwn(&acct);
         let admin_url = format!("{}/admin/accounts/{}", self.mastodon_base_url, account.id);
@@ -82,6 +88,10 @@ impl SlackNotifier {
             admin_url = &admin_url,
         )
         .to_string();
+        let text = match auto {
+            Some(auto) => format!("{}\n{text}", auto_moderation_line(auto)),
+            None => text,
+        };
         let text = truncate_mrkdwn(&text, TEXT_MAX_CHARS);
 
         let value = serde_json::to_string(&ButtonValue {
@@ -94,7 +104,7 @@ impl SlackNotifier {
                 "type": "section",
                 "text": { "type": "mrkdwn", "text": text.clone() }
             },
-            spam_actions_block(&value, &safe_acct),
+            actions_block(auto, &value, &safe_acct),
         ]);
 
         let message = SlackMessage {
@@ -122,7 +132,14 @@ impl SlackNotifier {
 /// behind it rejects anything else. `value_json` is the suspend button's [`ButtonValue`], and
 /// `safe_acct` must already be through [`sanitize_mrkdwn`]; this does not escape it again.
 pub fn delete_actions_block(value_json: &str, safe_acct: &str) -> Value {
-    confirm_actions_block(
+    json!({
+        "type": "actions",
+        "elements": [delete_button(value_json, safe_acct)]
+    })
+}
+
+fn delete_button(value_json: &str, safe_acct: &str) -> Value {
+    confirm_button(
         DELETE_ACTION_ID,
         &t!("btn_delete"),
         value_json,
@@ -132,53 +149,61 @@ pub fn delete_actions_block(value_json: &str, safe_acct: &str) -> Value {
     )
 }
 
-fn spam_actions_block(value_json: &str, safe_acct: &str) -> Value {
-    json!({
-        "type": "actions",
-        "elements": [
-            confirm_button(
-                SUSPEND_ACTION_ID,
-                &t!("btn_suspend"),
-                value_json,
-                &t!("btn_suspend_title"),
-                &t!("btn_suspend_confirm", acct = safe_acct),
-                &t!("btn_suspend_do"),
-            ),
-            {
-                "type": "button",
-                "action_id": CONFIRM_SPAM_ACTION_ID,
-                "text": { "type": "plain_text", "text": t!("btn_confirm_spam").to_string() },
-                "value": value_json,
-            },
-            {
-                "type": "button",
-                "action_id": FALSE_POSITIVE_ACTION_ID,
-                "text": { "type": "plain_text", "text": t!("btn_false_positive").to_string() },
-                "value": value_json,
-            }
-        ]
-    })
+/// The headline for an auto-moderated account, placed above the usual details.
+fn auto_moderation_line(auto: &AutoModerationOutcome) -> String {
+    let matched = sanitize_mrkdwn(&auto.matched.describe());
+    match &auto.result {
+        AutoModerationResult::Suspended => t!("auto_suspended", matched = matched),
+        AutoModerationResult::Deleted => t!("auto_deleted", matched = matched),
+        AutoModerationResult::DeleteFailed(error) => t!(
+            "auto_delete_failed",
+            matched = matched,
+            error = sanitize_mrkdwn(error)
+        ),
+        AutoModerationResult::Failed(error) => t!(
+            "auto_failed",
+            matched = matched,
+            error = sanitize_mrkdwn(error)
+        ),
+    }
+    .to_string()
 }
 
-fn confirm_actions_block(
-    action_id: &str,
-    label: &str,
-    value: &str,
-    confirm_title: &str,
-    confirm_text: &str,
-    confirm_label: &str,
-) -> Value {
-    json!({
-        "type": "actions",
-        "elements": [confirm_button(
-            action_id,
-            label,
-            value,
-            confirm_title,
-            confirm_text,
-            confirm_label,
-        )]
-    })
+/// The buttons that still make sense after what auto-moderation did: none that would repeat it,
+/// and the feedback buttons always, so a false positive can still be recorded.
+fn actions_block(auto: Option<&AutoModerationOutcome>, value_json: &str, safe_acct: &str) -> Value {
+    let primary = match auto.map(|auto| &auto.result) {
+        None | Some(AutoModerationResult::Failed(_)) => Some(suspend_button(value_json, safe_acct)),
+        Some(AutoModerationResult::Suspended | AutoModerationResult::DeleteFailed(_)) => {
+            Some(delete_button(value_json, safe_acct))
+        }
+        Some(AutoModerationResult::Deleted) => None,
+    };
+    let feedback = [
+        (CONFIRM_SPAM_ACTION_ID, t!("btn_confirm_spam")),
+        (FALSE_POSITIVE_ACTION_ID, t!("btn_false_positive")),
+    ]
+    .map(|(action_id, label)| {
+        json!({
+            "type": "button",
+            "action_id": action_id,
+            "text": { "type": "plain_text", "text": label.to_string() },
+            "value": value_json,
+        })
+    });
+    let elements: Vec<Value> = primary.into_iter().chain(feedback).collect();
+    json!({ "type": "actions", "elements": elements })
+}
+
+fn suspend_button(value_json: &str, safe_acct: &str) -> Value {
+    confirm_button(
+        SUSPEND_ACTION_ID,
+        &t!("btn_suspend"),
+        value_json,
+        &t!("btn_suspend_title"),
+        &t!("btn_suspend_confirm", acct = safe_acct),
+        &t!("btn_suspend_do"),
+    )
 }
 
 fn confirm_button(
@@ -269,9 +294,55 @@ mod tests {
         assert_eq!(sanitize_mrkdwn("  padded\tname  "), "padded name");
     }
 
+    fn action_ids(block: &Value) -> Vec<String> {
+        block["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|element| element["action_id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn auto_moderated_messages_offer_only_what_is_left_to_do() {
+        use crate::auto_moderation::KnownSpamMatch;
+        let value = r#"{"id":"42","acct":"alice@example.com"}"#;
+        let outcome = |result| AutoModerationOutcome {
+            matched: KnownSpamMatch::Bio { accounts: 1 },
+            result,
+        };
+        let ids = |result| action_ids(&actions_block(Some(&outcome(result)), value, "alice"));
+        for result in [
+            AutoModerationResult::Suspended,
+            AutoModerationResult::DeleteFailed("x".into()),
+        ] {
+            assert_eq!(
+                ids(result),
+                [
+                    DELETE_ACTION_ID,
+                    CONFIRM_SPAM_ACTION_ID,
+                    FALSE_POSITIVE_ACTION_ID
+                ]
+            );
+        }
+        assert_eq!(
+            ids(AutoModerationResult::Deleted),
+            [CONFIRM_SPAM_ACTION_ID, FALSE_POSITIVE_ACTION_ID]
+        );
+        assert_eq!(
+            ids(AutoModerationResult::Failed("x".into())),
+            [
+                SUSPEND_ACTION_ID,
+                CONFIRM_SPAM_ACTION_ID,
+                FALSE_POSITIVE_ACTION_ID
+            ]
+        );
+    }
+
     #[test]
     fn spam_actions_include_feedback_and_suspension() {
-        let block = spam_actions_block(
+        let block = actions_block(
+            None,
             r#"{"id":"42","acct":"alice@example.com"}"#,
             "alice@example.com",
         );

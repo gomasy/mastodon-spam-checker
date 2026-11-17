@@ -112,6 +112,41 @@ mastodon-spam-checker learn-suspended            # up to 1000 accounts
 mastodon-spam-checker learn-suspended --max 5000
 ```
 
+### Auto-moderation
+
+With `AUTO_MODERATION=suspend` (or `delete`), an account that matches
+moderator-confirmed spam is suspended (or suspended and its data deleted)
+immediately, without waiting for a moderator. An account qualifies only when
+all of these hold:
+
+- the LLM judged it spam with a spam probability of at least
+  `AUTO_MODERATION_MIN_CONFIDENCE` (default `0.9`), and
+- its profile text is identical to a confirmed spam account's, **or** it links
+  to a destination domain shared by at least 2 confirmed spam accounts.
+  Domains of general-purpose platforms (social networks, video hosting,
+  link-in-bio services, URL shorteners, …) and their subdomains never count;
+  add your own with `AUTO_MODERATION_IGNORE_DOMAINS` (comma-separated).
+
+A spam-heavy server alone never qualifies. Everything else is reported to Slack
+as before.
+
+The Slack notification still goes out, headed with what was done and which
+signal matched. After a suspension the **Delete account** button replaces
+**Suspend**; after a deletion only the feedback buttons remain. **False
+positive** still works, but does not lift the suspension: do that from the
+moderation page. A Mastodon failure leaves the usual **Suspend** button and
+does not stop the run.
+
+Accounts suspended this way are not learned as confirmed spam, so the checker
+cannot confirm its own verdicts and spread one match to every other signal on
+the account. They are learned once a moderator clicks **Confirm spam** or
+**Delete account**.
+
+Auto-moderation only runs where results are persisted and Slack is notified: the
+periodic run, `retry-failed`, and `backfill --notify`. `dry-run` logs the
+accounts it would have acted on. The Mastodon token needs the
+`admin:write:accounts` scope.
+
 ### Confidence threshold
 
 With a decision model, `SPAM_CONFIDENCE_THRESHOLD` (0.0–1.0, default `0.7`) is
@@ -138,7 +173,7 @@ Judgment results are still logged.
 ## Requirements
 
 - A Mastodon access token with the `admin:read:accounts` scope
-  (plus `admin:write:accounts` if you use the suspend button)
+  (plus `admin:write:accounts` if you use the suspend button or auto-moderation)
 - Redis (cursor storage)
 - An OpenAI-compatible chat completions API, or a decision model such as
   [Jev](https://openrouter.ai/docs/guides/community/jev) or Kev via OpenRouter
@@ -370,10 +405,11 @@ sudo systemctl enable --now mastodon-spam-checker.timer
 
 ## Notes
 
-- No account is suspended or deleted automatically. These actions only happen
-  when someone with access to the Slack notification clicks the corresponding
-  button and confirms the dialog; the checker itself only reports. Restrict
-  access to the notification channel to trusted moderators.
+- Unless [auto-moderation](#auto-moderation) is enabled, no account is
+  suspended or deleted automatically. These actions only happen when someone
+  with access to the Slack notification clicks the corresponding button and
+  confirms the dialog; the checker itself only reports. Restrict access to the
+  notification channel to trusted moderators.
 - The release profile is tuned for binary size (rustls with the pure-Rust
   `ring` backend, LTO, stripped symbols), producing a ~3 MB binary.
 

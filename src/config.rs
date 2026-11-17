@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 
+use crate::auto_moderation::AutoModerationConfig;
 use crate::encryption;
 use crate::llm::is_decision_model;
 
@@ -132,6 +133,8 @@ pub struct Config {
     pub slack_webhook_url: Option<String>,
     pub slack_channel: Option<String>,
     pub postgres: Option<PostgresConfig>,
+    /// Suspends or deletes known spam without waiting for a moderator.
+    pub auto_moderation: Option<AutoModerationConfig>,
 }
 
 impl Config {
@@ -147,8 +150,23 @@ impl Config {
             },
             slack_channel: optional_env("SLACK_CHANNEL")?,
             postgres: PostgresConfig::from_env()?,
+            auto_moderation: auto_moderation_from_env()?,
         })
     }
+}
+
+fn auto_moderation_from_env() -> Result<Option<AutoModerationConfig>> {
+    let mode = optional_env("AUTO_MODERATION")?;
+    let Some(mode) = AutoModerationConfig::parse_mode(mode.as_deref().unwrap_or("off"))? else {
+        return Ok(None);
+    };
+    Ok(Some(AutoModerationConfig {
+        mode,
+        min_confidence: confidence_env("AUTO_MODERATION_MIN_CONFIDENCE", 0.9)?,
+        ignored_domains: optional_env("AUTO_MODERATION_IGNORE_DOMAINS")?
+            .map(|value| AutoModerationConfig::parse_domains(&value))
+            .unwrap_or_default(),
+    }))
 }
 
 pub struct ServeConfig {
