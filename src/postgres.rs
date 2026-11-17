@@ -6,8 +6,19 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 use tracing::{error, info, warn};
 
+use crate::chain;
 use crate::config::PostgresConfig;
 use crate::encryption;
+
+/// Adds a note when notes are configured; a failure is logged, never raised.
+pub async fn add_note_logged(writer: Option<&ModerationNoteWriter>, account_id: &str, note: &str) {
+    let Some(writer) = writer else {
+        return;
+    };
+    if let Err(error) = writer.add_note(account_id, note).await {
+        error!(account_id, error = %chain(&error), "failed to add moderation note");
+    }
+}
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 

@@ -536,17 +536,12 @@ async fn notify_with_claim(
 /// Called only after the job is completed, and failures are logged rather than raised: the
 /// notification this documents is already out, and a missing note must not undo it.
 async fn add_spam_note(services: &CheckServices, account_id: &str, verdict: &SpamVerdict) {
-    let Some(writer) = &services.note_writer else {
-        return;
-    };
     let note = t!(
         "note_spam",
         confidence = format!("{:.0}", verdict.confidence * 100.0),
         reason = &verdict.reason,
     );
-    if let Err(error) = writer.add_note(account_id, &note).await {
-        error!(account_id = %account_id, error = %chain(&error), "failed to add moderation note");
-    }
+    postgres::add_note_logged(services.note_writer.as_ref(), account_id, &note).await;
 }
 
 const SYSTEM_USERNAMES: &[&str] = &["mastodon.internal", "internal.fetch", "system.actor"];
