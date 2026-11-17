@@ -116,10 +116,7 @@ impl DetectionConfig {
             openai_api_key: required_env("OPENAI_API_KEY")?,
             openai_model,
             openai_json_mode: bool_env("OPENAI_JSON_MODE", true)?,
-            spam_confidence_threshold: match optional_env("SPAM_CONFIDENCE_THRESHOLD")? {
-                Some(value) => parse_confidence_threshold(&value)?,
-                None => 0.7,
-            },
+            spam_confidence_threshold: confidence_env("SPAM_CONFIDENCE_THRESHOLD", 0.7)?,
             openai_review_model,
             remote_fetch,
         })
@@ -264,14 +261,18 @@ fn validate_review_model(model: &str, review_model: Option<&str>) -> Result<()> 
     Ok(())
 }
 
-fn parse_confidence_threshold(value: &str) -> Result<f64> {
+fn confidence_env(key: &str, default: f64) -> Result<f64> {
+    optional_env(key)?.map_or(Ok(default), |value| parse_confidence(key, &value))
+}
+
+fn parse_confidence(key: &str, value: &str) -> Result<f64> {
     let threshold = value
         .trim()
         .parse::<f64>()
-        .context("SPAM_CONFIDENCE_THRESHOLD is not a valid number")?;
+        .with_context(|| format!("{key} is not a valid number"))?;
     // Also rejects NaN and infinities: comparisons against them are always false.
     if !(0.0..=1.0).contains(&threshold) {
-        bail!("SPAM_CONFIDENCE_THRESHOLD must be between 0.0 and 1.0");
+        bail!("{key} must be between 0.0 and 1.0");
     }
     Ok(threshold)
 }
@@ -292,13 +293,13 @@ mod tests {
 
     #[test]
     fn confidence_threshold_is_validated() {
-        assert_eq!(parse_confidence_threshold("0").unwrap(), 0.0);
-        assert_eq!(parse_confidence_threshold(" 0.75 ").unwrap(), 0.75);
-        assert_eq!(parse_confidence_threshold("1").unwrap(), 1.0);
-        assert!(parse_confidence_threshold("-0.1").is_err());
-        assert!(parse_confidence_threshold("1.1").is_err());
-        assert!(parse_confidence_threshold("NaN").is_err());
-        assert!(parse_confidence_threshold("invalid").is_err());
+        assert_eq!(parse_confidence("TEST", "0").unwrap(), 0.0);
+        assert_eq!(parse_confidence("TEST", " 0.75 ").unwrap(), 0.75);
+        assert_eq!(parse_confidence("TEST", "1").unwrap(), 1.0);
+        assert!(parse_confidence("TEST", "-0.1").is_err());
+        assert!(parse_confidence("TEST", "1.1").is_err());
+        assert!(parse_confidence("TEST", "NaN").is_err());
+        assert!(parse_confidence("TEST", "invalid").is_err());
     }
 
     #[test]
