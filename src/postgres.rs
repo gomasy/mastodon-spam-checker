@@ -3,7 +3,8 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, bail};
 use tokio::sync::Mutex;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::types::Type;
+use tokio_postgres::{Client, NoTls, Statement};
 use tracing::{error, info, warn};
 
 use crate::chain;
@@ -108,7 +109,37 @@ const INSERT_NOTE: &str = "INSERT INTO account_moderation_notes \
      (content, account_id, target_account_id, created_at, updated_at) \
      VALUES ($1, $2, $3, $4, $4)";
 
-/// Writes rows into Mastodon's `account_moderation_notes` table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModerationAction {
+    Suspend,
+    Delete,
+}
+
+impl ModerationAction {
+    pub const ALL: [Self; 2] = [Self::Suspend, Self::Delete];
+
+    pub fn env_key(self) -> &'static str {
+        match self {
+            Self::Suspend => "SUSPEND_SQL",
+            Self::Delete => "DELETE_SQL",
+        }
+    }
+}
+
+/// Runs the SQL configured for `action`, if any; a failure is logged, never raised.
+pub async fn run_action_sql_logged(
+    writer: Option<&ModerationNoteWriter>,
+    action: ModerationAction,
+    account_id: &str,
+) {
+    if let Some(writer) = writer
+        && let Err(error) = writer.run_action_sql(action, account_id).await
+    {
+        error!(account_id, ?action, error = %chain(&error), "failed to run action SQL");
+    }
+}
+
+/// Writes Mastodon moderation notes and runs the SQL configured to follow an action.
 ///
 /// The connection is disposable: each write checks it first and redials when it has gone. `serve`
 /// mode holds a writer for the life of the process, and a `tokio_postgres::Client` whose connection
@@ -122,13 +153,25 @@ pub struct ModerationNoteWriter {
 
 impl ModerationNoteWriter {
     pub async fn connect(config: &PostgresConfig) -> Result<Self> {
-        // Connect eagerly so a bad DATABASE_URL is reported at startup, not on the first detection.
+        // Connect and prepare eagerly so bad settings are reported at startup, not on first use.
         let client = connect(&config.database_url).await?;
-        info!("connected to PostgreSQL for moderation notes");
-        Ok(Self {
+        let writer = Self {
             config: config.clone(),
             client: Mutex::new(Some(client)),
-        })
+        };
+        for action in ModerationAction::ALL {
+            if let Some(sql) = config.action_sql(action) {
+                let key = action.env_key();
+                writer
+                    .with_client(key, async |client: &Client| {
+                        prepare_action_sql(client, sql).await
+                    })
+                    .await
+                    .with_context(|| format!("{key} is invalid"))?;
+            }
+        }
+        info!("connected to PostgreSQL for moderation notes");
+        Ok(writer)
     }
 
     pub async fn add_note(&self, target_account_id: &str, content: &str) -> Result<()> {
@@ -149,6 +192,21 @@ impl ModerationNoteWriter {
         })
         .await?;
         info!(target_account_id = %target_account_id, "moderation note added");
+        Ok(())
+    }
+
+    pub async fn run_action_sql(&self, action: ModerationAction, account_id: &str) -> Result<()> {
+        let Some(sql) = self.config.action_sql(action) else {
+            return Ok(());
+        };
+        let account_id = parse_account_id(account_id)?;
+        let rows = self
+            .with_client("action SQL", async |client: &Client| {
+                let statement = prepare_action_sql(client, sql).await?;
+                client.execute(&statement, &[&account_id]).await
+            })
+            .await?;
+        info!(account_id, ?action, rows, "action SQL executed");
         Ok(())
     }
 
@@ -187,6 +245,14 @@ impl ModerationNoteWriter {
         }
         result.with_context(|| format!("failed to run {what}"))
     }
+}
+
+/// Declaring `$1` lets the ID be bound even when the SQL never references it.
+async fn prepare_action_sql(
+    client: &Client,
+    sql: &str,
+) -> Result<Statement, tokio_postgres::Error> {
+    client.prepare_typed(sql, &[Type::INT8]).await
 }
 
 fn parse_account_id(account_id: &str) -> Result<i64> {

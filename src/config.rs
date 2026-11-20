@@ -3,27 +3,43 @@ use anyhow::{Context, Result, bail};
 use crate::auto_moderation::AutoModerationConfig;
 use crate::encryption;
 use crate::llm::is_decision_model;
+use crate::postgres::ModerationAction;
 
 #[derive(Clone)]
 pub struct PostgresConfig {
     pub database_url: String,
     pub moderator_account_id: i64,
+    action_sql: [Option<String>; ModerationAction::ALL.len()],
 }
 
 impl PostgresConfig {
     pub fn from_env() -> Result<Option<Self>> {
-        match optional_env("DATABASE_URL")? {
-            Some(url) => {
-                let id: i64 = required_env("MODERATOR_ACCOUNT_ID")?
-                    .parse()
-                    .context("MODERATOR_ACCOUNT_ID is not a valid integer")?;
-                Ok(Some(Self {
-                    database_url: url,
-                    moderator_account_id: id,
-                }))
-            }
-            None => Ok(None),
+        let mut action_sql = [None, None];
+        for action in ModerationAction::ALL {
+            action_sql[action as usize] = optional_env(action.env_key())?;
         }
+        let Some(database_url) = optional_env("DATABASE_URL")? else {
+            if let Some(action) = ModerationAction::ALL
+                .into_iter()
+                .find(|&action| action_sql[action as usize].is_some())
+            {
+                bail!("{} requires DATABASE_URL", action.env_key());
+            }
+            return Ok(None);
+        };
+        let moderator_account_id = required_env("MODERATOR_ACCOUNT_ID")?
+            .parse()
+            .context("MODERATOR_ACCOUNT_ID is not a valid integer")?;
+        Ok(Some(Self {
+            database_url,
+            moderator_account_id,
+            action_sql,
+        }))
+    }
+
+    /// SQL to run after `action`, with the account ID bound as `$1`.
+    pub fn action_sql(&self, action: ModerationAction) -> Option<&str> {
+        self.action_sql[action as usize].as_deref()
     }
 }
 

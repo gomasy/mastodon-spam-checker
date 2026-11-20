@@ -20,7 +20,7 @@ use crate::chain;
 use crate::config::ServeConfig;
 use crate::ids::is_numeric_id;
 use crate::mastodon::MastodonClient;
-use crate::postgres::{self, ModerationNoteWriter};
+use crate::postgres::{self, ModerationAction, ModerationNoteWriter};
 use crate::redis::{JobStatus, StateStore};
 use crate::slack::{
     ButtonValue, CONFIRM_SPAM_ACTION_ID, DELETE_ACTION_ID, FALSE_POSITIVE_ACTION_ID,
@@ -401,8 +401,10 @@ async fn handle_suspend(ctx: &mut ActionContext<'_>) -> String {
             info!(account_id = %ctx.value.id, acct = %ctx.value.acct, "account suspended");
             ctx.record_action(JobStatus::Suspended).await;
             replace_buttons_with_delete(ctx.blocks, ctx.raw_value, ctx.safe_acct);
+            let writer = ctx.state.note_writer.as_ref();
             let note = t!("note_suspended", user_id = ctx.user_id);
-            postgres::add_note_logged(ctx.state.note_writer.as_ref(), &ctx.value.id, &note).await;
+            postgres::add_note_logged(writer, &ctx.value.id, &note).await;
+            postgres::run_action_sql_logged(writer, ModerationAction::Suspend, &ctx.value.id).await;
             t!("suspended", user_id = ctx.user_id, acct = ctx.safe_acct).to_string()
         }
         Err(e) => {
@@ -442,6 +444,12 @@ async fn handle_delete(ctx: &mut ActionContext<'_>) -> String {
             info!(account_id = %ctx.value.id, acct = %ctx.value.acct, "account data deleted");
             ctx.record_action(JobStatus::Deleted).await;
             ctx.remove_actions();
+            postgres::run_action_sql_logged(
+                ctx.state.note_writer.as_ref(),
+                ModerationAction::Delete,
+                &ctx.value.id,
+            )
+            .await;
             t!("deleted", user_id = ctx.user_id, acct = ctx.safe_acct).to_string()
         }
         Err(e) => {

@@ -211,6 +211,8 @@ directory is also loaded.
 | `LISTEN_ADDR` | | `127.0.0.1:8990` | Listen address for `serve` mode |
 | `DATABASE_URL` | | – | Mastodon's PostgreSQL database. When set, moderation notes are written on spam detection and on suspension. Connects without TLS, so point it at a local socket or `localhost` |
 | `MODERATOR_ACCOUNT_ID` | with `DATABASE_URL` | – | `account.id` shown as the note author in the Mastodon admin UI |
+| `SUSPEND_SQL` | | – | SQL run against `DATABASE_URL` after an account is suspended. Requires `DATABASE_URL`. See [Action SQL](#action-sql) |
+| `DELETE_SQL` | | – | SQL run against `DATABASE_URL` after an account's data is deleted. Requires `DATABASE_URL`. See [Action SQL](#action-sql) |
 | `REMOTE_FETCH` | | `false` | Fetch posts from the account's own server when this instance holds none. Requires `DATABASE_URL`. See [Remote post fetching](#remote-post-fetching) |
 | `REMOTE_FETCH_USER_AGENT` | | `Mastodon/<version> (+https://<key ID host>/)` | User-Agent for remote requests. The default follows Mastodon's, with the version read from `/api/v2/instance` |
 | `INSTANCE_ACTOR_KEY_ID` | | `<MASTODON_BASE_URL>/actor#main-key` | `keyId` used to sign remote requests. Set it when `MASTODON_BASE_URL` is not the instance's public https URL |
@@ -233,6 +235,29 @@ when one is suspended from Slack, so the reasoning is visible in the admin UI. A
 note that fails to write is logged and does not abort the action it accompanies.
 Because `serve` mode is long-running, a connection lost to a database restart or
 idle timeout is re-established on the next write.
+
+### Action SQL
+
+`SUSPEND_SQL` and `DELETE_SQL` hold one SQL statement each, run against
+`DATABASE_URL` after an account is suspended or its data deleted — from the
+Slack buttons or by auto-moderation — for site-specific cleanup or bookkeeping.
+The account ID is bound as `$1` (`bigint`). Use a CTE to do more than one thing
+in a single statement.
+
+```sh
+SUSPEND_SQL="UPDATE accounts SET note = '' WHERE id = \$1"
+DELETE_SQL="INSERT INTO deleted_spam_accounts (account_id) VALUES (\$1)"
+```
+
+In `.env`, a `$` in an unquoted or double-quoted value starts a variable
+reference, so a bare `$1` becomes an empty string; write `\$1`, or wrap the
+whole value in single quotes when it contains none itself.
+
+The statement runs only after Mastodon has accepted the action, and not for an
+account the Slack button found already suspended. Both are prepared at startup,
+so an invalid statement stops the process; a failure at run time is logged and
+does not undo the action. It runs with the privileges of the `DATABASE_URL`
+user, so keep the value as trusted as the database credentials themselves.
 
 ### Remote post fetching
 

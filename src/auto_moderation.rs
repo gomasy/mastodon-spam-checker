@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::chain;
 use crate::mastodon::{AdminAccount, MastodonClient};
-use crate::postgres::{self, ModerationNoteWriter};
+use crate::postgres::{self, ModerationAction, ModerationNoteWriter};
 use crate::redis::{KnownSpamContext, StateStore};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -299,6 +299,7 @@ pub async fn apply(
         warn!(account_id = id, acct = %account.acct(), ?matched, "auto-moderation suspended account");
         let note = t!("note_auto_suspended", matched = matched.describe());
         postgres::add_note_logged(note_writer, id, &note).await;
+        postgres::run_action_sql_logged(note_writer, ModerationAction::Suspend, id).await;
     }
 
     if mode == AutoModerationMode::Suspend {
@@ -309,6 +310,7 @@ pub async fn apply(
         return Ok(outcome(AutoModerationResult::DeleteFailed(chain(&error))));
     }
     save(AutoModerationState::Deleted).await?;
+    postgres::run_action_sql_logged(note_writer, ModerationAction::Delete, id).await;
     info!(account_id = id, acct = %account.acct(), "auto-moderation deleted account data");
     Ok(outcome(AutoModerationResult::Deleted))
 }
