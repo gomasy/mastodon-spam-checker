@@ -1,9 +1,7 @@
 //! Acting on known spam without waiting for a moderator.
 //!
-//! An account qualifies only when the LLM judges it spam with high confidence *and* it shares a
-//! concrete signal — identical profile text, or a destination domain — with accounts a moderator
-//! already confirmed as spam. A spam-heavy server alone never qualifies: it says where an account
-//! is from, not that it is one of the accounts a moderator has seen.
+//! Requires a high-confidence spam verdict *and* identical profile text or a shared destination
+//! domain with moderator-confirmed spam. A spam-heavy server alone never qualifies.
 
 use std::collections::BTreeSet;
 
@@ -27,14 +25,12 @@ pub enum AutoModerationMode {
 #[derive(Clone)]
 pub struct AutoModerationConfig {
     pub mode: AutoModerationMode,
-    /// The spam probability a verdict must reach, on top of the known spam match.
     pub min_confidence: f64,
     /// Domains whose matches never qualify, on top of [`PLATFORM_DOMAINS`].
     pub ignored_domains: BTreeSet<String>,
 }
 
 impl AutoModerationConfig {
-    /// `off` disables auto-moderation; `false` and `0` are accepted like booleans elsewhere.
     pub fn parse_mode(value: &str) -> Result<Option<AutoModerationMode>> {
         match value.trim().to_ascii_lowercase().as_str() {
             "off" | "false" | "0" => Ok(None),
@@ -52,7 +48,6 @@ impl AutoModerationConfig {
             .collect()
     }
 
-    /// The known spam signal that lets `known` be acted on without a moderator, if any.
     pub fn qualifying_match(
         &self,
         spam_probability: f64,
@@ -77,9 +72,8 @@ impl AutoModerationConfig {
     }
 
     fn is_ignored_domain(&self, domain: &str) -> bool {
-        // A fully qualified `youtube.com.` is still YouTube.
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-        // The domain itself and each parent: `m.youtube.com` is YouTube too.
+        // The domain and each parent: `m.youtube.com` matches `youtube.com`.
         std::iter::successors(Some(domain.as_str()), |d| {
             d.split_once('.').map(|(_, rest)| rest)
         })
@@ -89,13 +83,10 @@ impl AutoModerationConfig {
     }
 }
 
-/// A shared destination domain only counts once this many confirmed accounts link to it: one
-/// confirmed account that happened to link somewhere common must not condemn everyone else who does.
+/// Confirmed accounts that must share a domain before it counts.
 const MIN_DOMAIN_MATCHES: u64 = 2;
 
-/// General-purpose platforms whose domain says nothing about who links to them. The LLM is told to
-/// ignore these in prose; auto-moderation needs the list spelled out, because it acts on the match
-/// itself.
+/// General-purpose platforms whose domain says nothing about who links to them.
 const PLATFORM_DOMAINS: &[&str] = &[
     // Social networks and messaging
     "x.com",
@@ -200,7 +191,6 @@ impl KnownSpamMatch {
     }
 }
 
-/// What auto-moderation did, carried into the Slack notification.
 #[derive(Clone, Debug)]
 pub struct AutoModerationOutcome {
     pub matched: KnownSpamMatch,
@@ -218,9 +208,9 @@ impl AutoModerationOutcome {
 pub enum AutoModerationResult {
     Suspended,
     Deleted,
-    /// Suspended, but deleting the data failed; the delete button stays for a moderator.
+    /// Suspended, but deleting the data failed.
     DeleteFailed(String),
-    /// Nothing was done; the notification keeps the manual suspend button.
+    /// Nothing was done.
     Failed(String),
 }
 
@@ -241,8 +231,7 @@ pub enum AutoModerationState {
 }
 
 impl AutoModerationRecord {
-    /// The outcome to report for a record found on a re-sent notification, where the error that
-    /// left it unfinished is no longer known.
+    /// The outcome to report when re-sending a notification.
     pub fn outcome(&self) -> AutoModerationOutcome {
         let result = match self.state {
             AutoModerationState::Pending => {
@@ -258,11 +247,8 @@ impl AutoModerationRecord {
     }
 }
 
-/// Suspends, and in delete mode deletes, an account that qualified. A Mastodon failure is reported
-/// in the outcome rather than raised — a moderator can still act from the notification, so it must
-/// not stop the run — while a Redis failure is raised like any other state failure.
-///
-/// Re-running for an account that already got this far picks up where it stopped.
+/// Suspends, and in delete mode deletes, a qualifying account, resuming where an earlier attempt
+/// stopped. Mastodon failures go into the outcome; Redis failures are raised.
 pub async fn apply(
     mode: AutoModerationMode,
     mastodon: &MastodonClient,
@@ -298,8 +284,7 @@ pub async fn apply(
         save(AutoModerationState::Suspended).await?;
         warn!(account_id = id, acct = %account.acct(), ?matched, "auto-moderation suspended account");
         let note = t!("note_auto_suspended", matched = matched.describe());
-        postgres::add_note_logged(note_writer, id, &note).await;
-        postgres::run_action_sql_logged(note_writer, ModerationAction::Suspend, id).await;
+        postgres::after_action(note_writer, ModerationAction::Suspend, id, Some(&note)).await;
     }
 
     if mode == AutoModerationMode::Suspend {
@@ -310,7 +295,7 @@ pub async fn apply(
         return Ok(outcome(AutoModerationResult::DeleteFailed(chain(&error))));
     }
     save(AutoModerationState::Deleted).await?;
-    postgres::run_action_sql_logged(note_writer, ModerationAction::Delete, id).await;
+    postgres::after_action(note_writer, ModerationAction::Delete, id, None).await;
     info!(account_id = id, acct = %account.acct(), "auto-moderation deleted account data");
     Ok(outcome(AutoModerationResult::Deleted))
 }
@@ -392,7 +377,6 @@ mod tests {
                 "{domain}"
             );
         }
-        // A suffix that is not a parent domain is not covered.
         assert!(
             config
                 .qualifying_match(0.95, &known(0, &[("notyoutube.com", 2)]))

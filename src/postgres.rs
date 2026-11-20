@@ -4,26 +4,15 @@ use anyhow::{Context, Result, bail};
 use tokio::sync::Mutex;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
-use tokio_postgres::{Client, NoTls, Statement};
+use tokio_postgres::{Client, NoTls};
 use tracing::{error, info, warn};
 
 use crate::chain;
 use crate::config::PostgresConfig;
 use crate::encryption;
 
-/// Adds a note when notes are configured; a failure is logged, never raised.
-pub async fn add_note_logged(writer: Option<&ModerationNoteWriter>, account_id: &str, note: &str) {
-    if let Some(writer) = writer
-        && let Err(error) = writer.add_note(account_id, note).await
-    {
-        error!(account_id, error = %chain(&error), "failed to add moderation note");
-    }
-}
-
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Connects a note writer when moderation notes are configured, and nothing otherwise. The checker
-/// and `serve` mode decide the same way, so the `Option` is unwrapped here rather than at both.
 pub async fn writer_for(config: Option<&PostgresConfig>) -> Result<Option<ModerationNoteWriter>> {
     match config {
         Some(pg) => ModerationNoteWriter::connect(pg).await.map(Some),
@@ -31,8 +20,7 @@ pub async fn writer_for(config: Option<&PostgresConfig>) -> Result<Option<Modera
     }
 }
 
-/// Opens a connection to Mastodon's database, driving it on a background task until the client is
-/// dropped.
+/// Connects, driving the connection on a background task until the client is dropped.
 pub async fn connect(database_url: &str) -> Result<Client> {
     let (client, connection) = tokio::time::timeout(
         DATABASE_TIMEOUT,
@@ -101,10 +89,8 @@ fn non_empty_key(key: Option<String>) -> Option<String> {
     key.filter(|key| !key.trim().is_empty())
 }
 
-/// `created_at`/`updated_at` are bound as parameters rather than written with `NOW()`: Mastodon's
-/// columns are `timestamp without time zone` holding UTC, and Postgres would convert `now()` into
-/// the session time zone, dating every note by the server's local wall clock. A `SystemTime` is
-/// encoded as UTC for both `timestamp` and `timestamptz`, so it is correct either way.
+/// Timestamps are bound rather than `now()`: the columns are `timestamp without time zone` in UTC,
+/// and `now()` would be converted to the session time zone.
 const INSERT_NOTE: &str = "INSERT INTO account_moderation_notes \
      (content, account_id, target_account_id, created_at, updated_at) \
      VALUES ($1, $2, $3, $4, $4)";
@@ -126,8 +112,17 @@ impl ModerationAction {
     }
 }
 
+/// Adds a note when configured; a failure is logged, never raised.
+pub async fn add_note_logged(writer: Option<&ModerationNoteWriter>, account_id: &str, note: &str) {
+    if let Some(writer) = writer
+        && let Err(error) = writer.add_note(account_id, note).await
+    {
+        error!(account_id, error = %chain(&error), "failed to add moderation note");
+    }
+}
+
 /// Runs the SQL configured for `action`, if any; a failure is logged, never raised.
-pub async fn run_action_sql_logged(
+async fn run_action_sql_logged(
     writer: Option<&ModerationNoteWriter>,
     action: ModerationAction,
     account_id: &str,
@@ -139,45 +134,49 @@ pub async fn run_action_sql_logged(
     }
 }
 
-/// Writes Mastodon moderation notes and runs the SQL configured to follow an action.
-///
-/// The connection is disposable: each write checks it first and redials when it has gone. `serve`
-/// mode holds a writer for the life of the process, and a `tokio_postgres::Client` whose connection
-/// ended fails every later request, so a database restart or idle timeout would otherwise silence
-/// moderation notes permanently. [`crate::redis::StateStore`] gets the equivalent from Redis'
-/// connection manager.
+/// The database side of a moderation action: an optional note, then the action's SQL.
+pub async fn after_action(
+    writer: Option<&ModerationNoteWriter>,
+    action: ModerationAction,
+    account_id: &str,
+    note: Option<&str>,
+) {
+    if let Some(note) = note {
+        add_note_logged(writer, account_id, note).await;
+    }
+    run_action_sql_logged(writer, action, account_id).await;
+}
+
+/// Writes moderation notes and runs action SQL, redialling when the connection has gone.
 pub struct ModerationNoteWriter {
     config: PostgresConfig,
     client: Mutex<Option<Client>>,
 }
 
 impl ModerationNoteWriter {
+    /// Connects and validates the action SQL, so bad settings fail at startup.
     pub async fn connect(config: &PostgresConfig) -> Result<Self> {
-        // Connect and prepare eagerly so bad settings are reported at startup, not on first use.
         let client = connect(&config.database_url).await?;
-        let writer = Self {
-            config: config.clone(),
-            client: Mutex::new(Some(client)),
-        };
         for action in ModerationAction::ALL {
             if let Some(sql) = config.action_sql(action) {
                 let key = action.env_key();
-                writer
-                    .with_client(key, async |client: &Client| {
-                        prepare_action_sql(client, sql).await
-                    })
+                tokio::time::timeout(DATABASE_TIMEOUT, client.prepare_typed(sql, &[Type::INT8]))
                     .await
+                    .with_context(|| format!("timed out validating {key}"))?
                     .with_context(|| format!("{key} is invalid"))?;
             }
         }
         info!("connected to PostgreSQL for moderation notes");
-        Ok(writer)
+        Ok(Self {
+            config: config.clone(),
+            client: Mutex::new(Some(client)),
+        })
     }
 
     pub async fn add_note(&self, target_account_id: &str, content: &str) -> Result<()> {
         let target_id = parse_account_id(target_account_id)?;
         let now = SystemTime::now();
-        self.with_client("moderation note", async |client: &Client| {
+        self.with_client("moderation note insert", async |client: &Client| {
             client
                 .execute(
                     INSERT_NOTE,
@@ -191,7 +190,7 @@ impl ModerationNoteWriter {
                 .await
         })
         .await?;
-        info!(target_account_id = %target_account_id, "moderation note added");
+        info!(target_account_id, "moderation note added");
         Ok(())
     }
 
@@ -200,10 +199,12 @@ impl ModerationNoteWriter {
             return Ok(());
         };
         let account_id = parse_account_id(account_id)?;
+        // Typed so `$1` binds even when the SQL never references it.
         let rows = self
-            .with_client("action SQL", async |client: &Client| {
-                let statement = prepare_action_sql(client, sql).await?;
-                client.execute(&statement, &[&account_id]).await
+            .with_client(action.env_key(), async |client: &Client| {
+                client
+                    .execute_typed(sql, &[(&account_id, Type::INT8)])
+                    .await
             })
             .await?;
         info!(account_id, ?action, rows, "action SQL executed");
@@ -228,8 +229,7 @@ impl ModerationNoteWriter {
         };
 
         let Ok(result) = tokio::time::timeout(DATABASE_TIMEOUT, query(&client)).await else {
-            // Dropping the query future does not stop PostgreSQL from executing it, so it is
-            // cancelled explicitly before this client is discarded, or lock waits leak sessions.
+            // Dropping the future does not stop the server-side query, so cancel it explicitly.
             match tokio::time::timeout(DATABASE_TIMEOUT, client.cancel_token().cancel_query(NoTls))
                 .await
             {
@@ -237,22 +237,13 @@ impl ModerationNoteWriter {
                 Ok(Err(error)) => warn!(%error, "failed to cancel timed-out {what}"),
                 Err(_) => warn!("timed out cancelling {what}"),
             }
-            bail!("timed out running {what}");
+            bail!("{what} timed out");
         };
-        // A connection the query killed is dropped; the next call reconnects.
         if !client.is_closed() {
             *guard = Some(client);
         }
-        result.with_context(|| format!("failed to run {what}"))
+        result.with_context(|| format!("{what} failed"))
     }
-}
-
-/// Declaring `$1` lets the ID be bound even when the SQL never references it.
-async fn prepare_action_sql(
-    client: &Client,
-    sql: &str,
-) -> Result<Statement, tokio_postgres::Error> {
-    client.prepare_typed(sql, &[Type::INT8]).await
 }
 
 fn parse_account_id(account_id: &str) -> Result<i64> {

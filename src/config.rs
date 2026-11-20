@@ -9,21 +9,22 @@ use crate::postgres::ModerationAction;
 pub struct PostgresConfig {
     pub database_url: String,
     pub moderator_account_id: i64,
-    action_sql: [Option<String>; ModerationAction::ALL.len()],
+    suspend_sql: Option<String>,
+    delete_sql: Option<String>,
 }
 
 impl PostgresConfig {
     pub fn from_env() -> Result<Option<Self>> {
-        let mut action_sql = [None, None];
-        for action in ModerationAction::ALL {
-            action_sql[action as usize] = optional_env(action.env_key())?;
-        }
+        let suspend_sql = optional_env(ModerationAction::Suspend.env_key())?;
+        let delete_sql = optional_env(ModerationAction::Delete.env_key())?;
         let Some(database_url) = optional_env("DATABASE_URL")? else {
-            if let Some(action) = ModerationAction::ALL
-                .into_iter()
-                .find(|&action| action_sql[action as usize].is_some())
-            {
-                bail!("{} requires DATABASE_URL", action.env_key());
+            for (action, sql) in [
+                (ModerationAction::Suspend, &suspend_sql),
+                (ModerationAction::Delete, &delete_sql),
+            ] {
+                if sql.is_some() {
+                    bail!("{} requires DATABASE_URL", action.env_key());
+                }
             }
             return Ok(None);
         };
@@ -33,25 +34,26 @@ impl PostgresConfig {
         Ok(Some(Self {
             database_url,
             moderator_account_id,
-            action_sql,
+            suspend_sql,
+            delete_sql,
         }))
     }
 
     /// SQL to run after `action`, with the account ID bound as `$1`.
     pub fn action_sql(&self, action: ModerationAction) -> Option<&str> {
-        self.action_sql[action as usize].as_deref()
+        match action {
+            ModerationAction::Suspend => self.suspend_sql.as_deref(),
+            ModerationAction::Delete => self.delete_sql.as_deref(),
+        }
     }
 }
 
-/// Reading posts from a remote account's own outbox when this instance holds none of them.
+/// Fetching posts from a remote account's outbox when this instance holds none.
 pub struct RemoteFetchConfig {
-    /// Mastodon's database, for the instance actor's private key.
     pub database_url: String,
-    /// The `keyId` remote servers resolve to verify signatures.
     pub key_id: reqwest::Url,
-    /// Replaces the User-Agent otherwise built to match Mastodon's own.
     pub user_agent: Option<String>,
-    /// Decrypts the key on Mastodon 4.7+.
+    /// Needed on Mastodon 4.7+, where the key is encrypted.
     pub encryption: Option<encryption::Secrets>,
 }
 
@@ -101,7 +103,6 @@ fn encryption_secrets_from_env() -> Result<Option<encryption::Secrets>> {
     }
 }
 
-/// Where Mastodon publishes the instance actor's key: `/actor#main-key` on the web domain.
 fn default_key_id(mastodon_base_url: &str) -> String {
     format!("{}/actor#main-key", mastodon_base_url.trim_end_matches('/'))
 }
@@ -141,8 +142,7 @@ impl DetectionConfig {
     }
 }
 
-/// Everything a checking run needs beyond its Redis connection, which each entry point opens for
-/// itself through [`redis_url_env`] before the run starts.
+/// Settings for a checking run; Redis is opened separately via [`redis_url_env`].
 pub struct Config {
     pub detection: DetectionConfig,
     pub max_accounts_per_run: usize,
@@ -150,7 +150,6 @@ pub struct Config {
     pub slack_webhook_url: Option<String>,
     pub slack_channel: Option<String>,
     pub postgres: Option<PostgresConfig>,
-    /// Suspends or deletes known spam without waiting for a moderator.
     pub auto_moderation: Option<AutoModerationConfig>,
 }
 
@@ -209,12 +208,8 @@ impl ServeConfig {
     }
 }
 
-const DEFAULT_REDIS_URL: &str = "redis://localhost:6379";
-
-/// `REDIS_URL`, or the local default. Every entry point reaches Redis, including subcommands that
-/// build no full [`Config`], so the default lives here rather than at each call site.
 pub fn redis_url_env() -> Result<String> {
-    env_or("REDIS_URL", DEFAULT_REDIS_URL)
+    env_or("REDIS_URL", "redis://localhost:6379")
 }
 
 fn mastodon_env() -> Result<(String, String)> {
@@ -224,8 +219,7 @@ fn mastodon_env() -> Result<(String, String)> {
     ))
 }
 
-/// Reads an environment variable, treating a blank value as unset: `KEY=` in a .env file is the
-/// usual way to disable a setting, so it falls back to the default instead of failing to parse.
+/// Reads an environment variable, treating a blank value (`KEY=`) as unset.
 fn optional_env(key: &str) -> Result<Option<String>> {
     match std::env::var(key) {
         Ok(value) => Ok(Some(value).filter(|v| !v.trim().is_empty())),
@@ -261,8 +255,7 @@ fn positive_usize_env(key: &str, default: usize) -> Result<usize> {
     }
 }
 
-/// Parses a count that must be at least one, naming `source` — an environment variable or a CLI
-/// flag — in the error.
+/// Parses a count of at least one; `source` names the variable or flag in errors.
 pub fn parse_positive_usize(value: &str, source: &str) -> Result<usize> {
     let parsed = value
         .trim()
@@ -305,7 +298,7 @@ fn parse_confidence(key: &str, value: &str) -> Result<f64> {
         .trim()
         .parse::<f64>()
         .with_context(|| format!("{key} is not a valid number"))?;
-    // Also rejects NaN and infinities: comparisons against them are always false.
+    // Also rejects NaN and infinities.
     if !(0.0..=1.0).contains(&threshold) {
         bail!("{key} must be between 0.0 and 1.0");
     }
@@ -361,7 +354,6 @@ mod tests {
         assert!(parse_positive_usize("-1", "TEST").is_err());
         assert!(parse_positive_usize("", "TEST").is_err());
         assert!(parse_positive_usize("abc", "TEST").is_err());
-        // The message names the setting to fix.
         let error = parse_positive_usize("0", "--max").unwrap_err().to_string();
         assert!(error.contains("--max"), "{error}");
     }
