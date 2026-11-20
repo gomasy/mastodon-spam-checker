@@ -401,12 +401,8 @@ async fn handle_suspend(ctx: &mut ActionContext<'_>) -> String {
             info!(account_id = %ctx.value.id, acct = %ctx.value.acct, "account suspended");
             ctx.record_action(JobStatus::Suspended).await;
             replace_buttons_with_delete(ctx.blocks, ctx.raw_value, ctx.safe_acct);
-            if let Some(writer) = &ctx.state.note_writer {
-                let note = t!("note_suspended", user_id = ctx.user_id);
-                if let Err(e) = writer.add_note(&ctx.value.id, &note).await {
-                    error!(error = %chain(&e), "failed to add moderation note");
-                }
-            }
+            let note = t!("note_suspended", user_id = ctx.user_id);
+            postgres::add_note_logged(ctx.state.note_writer.as_ref(), &ctx.value.id, &note).await;
             t!("suspended", user_id = ctx.user_id, acct = ctx.safe_acct).to_string()
         }
         Err(e) => {
