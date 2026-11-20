@@ -6,14 +6,12 @@ use tracing::warn;
 
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 
-/// An HTTP client with the shared User-Agent and the given timeout.
 pub fn client(timeout: Duration) -> Result<Client> {
     client_builder(timeout)
         .build()
         .context("failed to build HTTP client")
 }
 
-/// The builder behind [`client`], for callers that need to tighten it further.
 pub fn client_builder(timeout: Duration) -> ClientBuilder {
     Client::builder()
         .user_agent(concat!(
@@ -62,13 +60,11 @@ fn is_retryable_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
-/// Timeouts and connection failures are worth retrying; request-builder errors are not, since they
-/// point at a configuration problem.
 fn is_retryable_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect()
 }
 
-/// The `Retry-After` header as a wait duration. Integer seconds only.
+/// `Retry-After` in integer seconds, capped at [`MAX_RETRY_AFTER`].
 fn retry_after(resp: &Response) -> Option<Duration> {
     resp.headers()
         .get(reqwest::header::RETRY_AFTER)
@@ -78,8 +74,7 @@ fn retry_after(resp: &Response) -> Option<Duration> {
         .map(|duration| duration.min(MAX_RETRY_AFTER))
 }
 
-/// [`send_with_retry_raw`] plus [`ensure_success`]: anything but a success status, whether
-/// non-retryable or left after the retries ran out, becomes a body-bearing error.
+/// [`send_with_retry_raw`] plus [`ensure_success`].
 pub async fn send_with_retry<F>(build: F, what: &str, retry: RetryConfig) -> Result<Response>
 where
     F: Fn() -> RequestBuilder,
@@ -88,53 +83,35 @@ where
     ensure_success(resp, what).await
 }
 
-/// Retries network errors and 429 / 5xx up to `retry.max_retries` times, then returns the final
-/// response whatever its status. `build` must return a fresh `RequestBuilder` for each attempt.
-///
-/// Judging the status is left to the caller, for the paths that handle 404 or 410 themselves.
+/// Retries network errors and 429/5xx, then returns the final response whatever its status.
 pub async fn send_with_retry_raw<F>(build: F, what: &str, retry: RetryConfig) -> Result<Response>
 where
     F: Fn() -> RequestBuilder,
 {
     let mut attempt = 0;
     loop {
-        match build().send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if is_retryable_status(status) && attempt < retry.max_retries {
-                    let delay = retry_after(&resp).unwrap_or_else(|| retry.backoff(attempt));
-                    warn!(
-                        %what,
-                        %status,
-                        attempt = attempt + 1,
-                        max = retry.max_retries,
-                        delay_ms = delay.as_millis(),
-                        "retryable HTTP status, backing off",
-                    );
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                    continue;
-                }
-                return Ok(resp);
-            }
-            Err(e) => {
-                if is_retryable_error(&e) && attempt < retry.max_retries {
-                    let delay = retry.backoff(attempt);
-                    warn!(
-                        %what,
-                        error = %e,
-                        attempt = attempt + 1,
-                        max = retry.max_retries,
-                        delay_ms = delay.as_millis(),
-                        "retryable request error, backing off",
-                    );
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                    continue;
-                }
-                return Err(anyhow::Error::new(e).context(format!("{what} request failed")));
-            }
-        }
+        let result = build().send().await;
+        let retryable = match &result {
+            Ok(resp) if is_retryable_status(resp.status()) => Some((
+                retry_after(resp).unwrap_or_else(|| retry.backoff(attempt)),
+                resp.status().to_string(),
+            )),
+            Err(e) if is_retryable_error(e) => Some((retry.backoff(attempt), e.to_string())),
+            _ => None,
+        };
+        let Some((delay, reason)) = retryable.filter(|_| attempt < retry.max_retries) else {
+            return result.with_context(|| format!("{what} request failed"));
+        };
+        warn!(
+            %what,
+            %reason,
+            attempt = attempt + 1,
+            max = retry.max_retries,
+            delay_ms = delay.as_millis(),
+            "retryable HTTP failure, backing off",
+        );
+        tokio::time::sleep(delay).await;
+        attempt += 1;
     }
 }
 

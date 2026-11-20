@@ -87,8 +87,6 @@ pub struct MediaAttachment {
     pub description: Option<String>,
 }
 
-/// Puts accounts in ascending ID order and drops repeats. `dedup_by` only collapses neighbours, so
-/// the sort has to come first, and it uses [`numeric_id_cmp`] because the IDs are unpadded decimals.
 fn sort_unique_by_id(accounts: &mut Vec<AdminAccount>) {
     accounts.sort_by(|a, b| numeric_id_cmp(&a.id, &b.id));
     accounts.dedup_by(|a, b| a.id == b.id);
@@ -129,13 +127,11 @@ impl MastodonClient {
         Ok(version)
     }
 
-    /// A clone of the inner HTTP client; clones share the connection pool.
     pub fn http_client(&self) -> Client {
         self.client.clone()
     }
 
-    /// Sends an authenticated request without retrying, for write operations with side effects
-    /// (suspend, delete). A non-success status becomes an error carrying the response body.
+    /// Authenticated and not retried, for writes with side effects.
     async fn send(&self, req: RequestBuilder, what: &str) -> Result<Response> {
         let resp = req
             .bearer_auth(&self.access_token)
@@ -145,13 +141,21 @@ impl MastodonClient {
         http::ensure_success(resp, what).await
     }
 
-    /// Sends an authenticated request with backoff retry, for idempotent reads. `build` must return
-    /// a fresh `RequestBuilder` on each call.
+    /// Authenticated and retried, for idempotent reads; the status is left to the caller.
+    async fn send_retry_raw<F>(&self, build: F, what: &str) -> Result<Response>
+    where
+        F: Fn() -> RequestBuilder,
+    {
+        http::send_with_retry_raw(|| build().bearer_auth(&self.access_token), what, self.retry)
+            .await
+    }
+
     async fn send_retry<F>(&self, build: F, what: &str) -> Result<Response>
     where
         F: Fn() -> RequestBuilder,
     {
-        http::send_with_retry(|| build().bearer_auth(&self.access_token), what, self.retry).await
+        let resp = self.send_retry_raw(build, what).await?;
+        http::ensure_success(resp, what).await
     }
 
     pub async fn fetch_remote_accounts(
@@ -173,9 +177,7 @@ impl MastodonClient {
             query.extend(page_min_id.as_deref().map(|id| ("min_id", id)));
             query.extend(page_max_id.as_deref().map(|id| ("max_id", id)));
             let mut page: Vec<AdminAccount> = self.admin_accounts_page(&query).await?;
-            // Whether the page was full decides if another one exists, so measure it before
-            // de-duplication: a repeated ID within a page would otherwise end pagination early,
-            // silently leaving the remaining accounts unchecked.
+            // Measured before de-duplication, which could otherwise end pagination early.
             let page_was_full = page.len() >= limit;
             sort_unique_by_id(&mut page);
             let next_min_id = page.last().map(|account| account.id.clone());
@@ -200,8 +202,6 @@ impl MastodonClient {
         }
 
         info!(count = accounts.len(), "fetched accounts across pages");
-
-        // Pages can overlap at their bounds, so per-page ordering does not carry across the seam.
         sort_unique_by_id(&mut accounts);
         Ok(accounts)
     }
@@ -242,8 +242,6 @@ impl MastodonClient {
         Ok(ids)
     }
 
-    /// One page of `GET /api/v2/admin/accounts`. The query is encoded rather than concatenated, so
-    /// values cannot smuggle in extra parameters.
     async fn admin_accounts_page<T: DeserializeOwned>(
         &self,
         query: &[(&str, &str)],
@@ -258,8 +256,7 @@ impl MastodonClient {
             .context("failed to parse admin accounts response")
     }
 
-    /// Resolves an acct to its admin account. `lookup` matches exactly and normalizes case, and is
-    /// called anonymously like [`Self::fetch_statuses`], since the token carries only admin scopes.
+    /// `lookup` is called anonymously, since the token carries only admin scopes.
     pub async fn fetch_admin_account_by_acct(&self, acct: &str) -> Result<Option<AdminAccount>> {
         #[derive(Deserialize)]
         struct Lookup {
@@ -290,9 +287,7 @@ impl MastodonClient {
             .with_context(|| format!("admin account {account_id} was not found"))
     }
 
-    /// The admin endpoint for a single account, shared by the read, suspend, and delete paths.
-    /// `account_id` becomes a path segment, so callers must have validated it with
-    /// [`crate::ids::validate_account_id`] first.
+    /// `account_id` must already be validated as numeric.
     fn admin_account_url(&self, account_id: &str) -> String {
         format!("{}/api/v1/admin/accounts/{account_id}", self.base_url)
     }
@@ -302,12 +297,9 @@ impl MastodonClient {
         account_id: &str,
     ) -> Result<Option<AdminAccount>> {
         let url = self.admin_account_url(account_id);
-        let resp = http::send_with_retry_raw(
-            || self.client.get(&url).bearer_auth(&self.access_token),
-            "Admin account API",
-            self.retry,
-        )
-        .await?;
+        let resp = self
+            .send_retry_raw(|| self.client.get(&url), "Admin account API")
+            .await?;
         if matches!(resp.status(), StatusCode::NOT_FOUND | StatusCode::GONE) {
             return Ok(None);
         }
@@ -319,9 +311,7 @@ impl MastodonClient {
         Ok(Some(account))
     }
 
-    /// Returns whether the account is suspended (requires admin:read:accounts scope).
     pub async fn is_account_suspended(&self, account_id: &str) -> Result<bool> {
-        /// A missing or null field reads as unsuspended, tolerating Mastodon version differences.
         #[derive(Deserialize)]
         struct SuspensionState {
             #[serde(default)]
@@ -329,74 +319,54 @@ impl MastodonClient {
         }
 
         let url = self.admin_account_url(account_id);
-        let resp = self
+        let account: SuspensionState = self
             .send_retry(|| self.client.get(&url), "Admin account API")
-            .await?;
-        let account: SuspensionState = resp
+            .await?
             .json()
             .await
             .context("failed to parse admin account response")?;
         Ok(account.suspended.unwrap_or(false))
     }
 
-    /// Suspends the account (requires admin:write:accounts scope).
     pub async fn suspend_account(&self, account_id: &str) -> Result<()> {
-        info!(account_id = %account_id, "suspending account");
-
+        info!(account_id, "suspending account");
         let req = self
             .client
             .post(format!("{}/action", self.admin_account_url(account_id)))
             .json(&serde_json::json!({ "type": "suspend" }));
         self.send(req, "Admin action API").await?;
-
         Ok(())
     }
 
-    /// Permanently deletes data for a suspended account (requires admin:write:accounts scope).
-    /// Mastodon rejects this request if the account is not already suspended.
+    /// Mastodon rejects this unless the account is already suspended.
     pub async fn delete_account(&self, account_id: &str) -> Result<()> {
-        info!(account_id = %account_id, "deleting account data");
-
-        self.send(
-            self.client.delete(self.admin_account_url(account_id)),
-            "Admin account delete API",
-        )
-        .await?;
-
+        info!(account_id, "deleting account data");
+        let req = self.client.delete(self.admin_account_url(account_id));
+        self.send(req, "Admin account delete API").await?;
         Ok(())
     }
 
     pub async fn fetch_statuses(&self, account_id: &str) -> Result<Vec<Status>> {
         let url = format!(
-            "{}/api/v1/accounts/{}/statuses?limit={STATUSES_LIMIT}&exclude_reblogs=true",
-            self.base_url, account_id
+            "{}/api/v1/accounts/{account_id}/statuses?limit={STATUSES_LIMIT}&exclude_reblogs=true",
+            self.base_url
         );
+        info!(account_id, "fetching statuses");
 
-        info!(account_id = %account_id, "fetching statuses");
+        // Anonymous: a user token would include private posts; an admin token fails the scope check.
+        let resp =
+            http::send_with_retry_raw(|| self.client.get(&url), "Statuses API", self.retry).await?;
 
-        let resp = http::send_with_retry_raw(
-            // Keep this request anonymous. Supplying a user token expands the response to private
-            // statuses that user can see, while an admin-only token fails the endpoint's scope check.
-            || self.client.get(&url),
-            "Statuses API",
-            self.retry,
-        )
-        .await?;
-
-        // A permanent error (a deleted account, typically) reads as "no posts" rather than
-        // aborting the caller, leaving a profile-only classification.
         let status = resp.status();
         if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
-            warn!(account_id = %account_id, %status, "statuses unavailable, treating as no posts");
+            warn!(account_id, %status, "statuses unavailable, treating as no posts");
             return Ok(Vec::new());
         }
 
-        let resp = http::ensure_success(resp, "Statuses API").await?;
-        let statuses: Vec<Status> = resp
+        http::ensure_success(resp, "Statuses API")
+            .await?
             .json()
             .await
-            .context("failed to parse statuses response")?;
-
-        Ok(statuses)
+            .context("failed to parse statuses response")
     }
 }
