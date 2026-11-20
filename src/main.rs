@@ -14,6 +14,7 @@ mod redis;
 mod server;
 mod signals;
 mod slack;
+mod sql;
 mod text;
 
 use anyhow::{Result, bail};

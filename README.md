@@ -238,25 +238,27 @@ idle timeout is re-established on the next write.
 
 ### Action SQL
 
-`SUSPEND_SQL` and `DELETE_SQL` hold one SQL statement each, run against
-`DATABASE_URL` after an account is suspended or its data deleted — from the
-Slack buttons or by auto-moderation — for site-specific cleanup or bookkeeping.
-The account ID is bound as `$1` (`bigint`). Use a CTE to do more than one thing
-in a single statement.
+`SUSPEND_SQL` and `DELETE_SQL` hold SQL run against `DATABASE_URL` after an
+account is suspended or its data deleted — from the Slack buttons or by
+auto-moderation — for site-specific cleanup or bookkeeping. The account ID is
+bound as `$1` (`bigint`) in every statement. Separate several statements with
+`;`: they run in order, each in its own transaction, so `VACUUM` works too.
 
 ```sh
 SUSPEND_SQL="UPDATE accounts SET note = '' WHERE id = \$1"
-DELETE_SQL="INSERT INTO deleted_spam_accounts (account_id) VALUES (\$1)"
+DELETE_SQL="INSERT INTO deleted_spam_accounts (account_id) VALUES (\$1); DELETE FROM account_warnings WHERE target_account_id = \$1"
 ```
 
 In `.env`, a `$` in an unquoted or double-quoted value starts a variable
 reference, so a bare `$1` becomes an empty string; write `\$1`, or wrap the
 whole value in single quotes when it contains none itself.
 
-The statement runs only after Mastodon has accepted the action, and not for an
-account the Slack button found already suspended. Both are prepared at startup,
-so an invalid statement stops the process; a failure at run time is logged and
-does not undo the action. It runs with the privileges of the `DATABASE_URL`
+The SQL runs only after Mastodon has accepted the action, and not for an
+account the Slack button found already suspended. Every statement is prepared
+at startup, so an invalid one stops the process. At run time, a failure or the
+10-second timeout, which covers all of an action's statements together, is
+logged and skips the remaining statements; it undoes neither the action nor the
+statements already run. It runs with the privileges of the `DATABASE_URL`
 user, so keep the value as trusted as the database credentials themselves.
 
 ### Remote post fetching

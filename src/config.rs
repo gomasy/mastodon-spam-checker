@@ -4,25 +4,26 @@ use crate::auto_moderation::AutoModerationConfig;
 use crate::encryption;
 use crate::llm::is_decision_model;
 use crate::postgres::ModerationAction;
+use crate::sql::split_statements;
 
 #[derive(Clone)]
 pub struct PostgresConfig {
     pub database_url: String,
     pub moderator_account_id: i64,
-    suspend_sql: Option<String>,
-    delete_sql: Option<String>,
+    suspend_sql: Vec<String>,
+    delete_sql: Vec<String>,
 }
 
 impl PostgresConfig {
     pub fn from_env() -> Result<Option<Self>> {
-        let suspend_sql = optional_env(ModerationAction::Suspend.env_key())?;
-        let delete_sql = optional_env(ModerationAction::Delete.env_key())?;
+        let suspend_sql = action_sql_env(ModerationAction::Suspend)?;
+        let delete_sql = action_sql_env(ModerationAction::Delete)?;
         let Some(database_url) = optional_env("DATABASE_URL")? else {
             for (action, sql) in [
                 (ModerationAction::Suspend, &suspend_sql),
                 (ModerationAction::Delete, &delete_sql),
             ] {
-                if sql.is_some() {
+                if !sql.is_empty() {
                     bail!("{} requires DATABASE_URL", action.env_key());
                 }
             }
@@ -39,13 +40,25 @@ impl PostgresConfig {
         }))
     }
 
-    /// SQL to run after `action`, with the account ID bound as `$1`.
-    pub fn action_sql(&self, action: ModerationAction) -> Option<&str> {
+    /// Statements to run after `action`, with the account ID bound as `$1`.
+    pub fn action_sql(&self, action: ModerationAction) -> &[String] {
         match action {
-            ModerationAction::Suspend => self.suspend_sql.as_deref(),
-            ModerationAction::Delete => self.delete_sql.as_deref(),
+            ModerationAction::Suspend => &self.suspend_sql,
+            ModerationAction::Delete => &self.delete_sql,
         }
     }
+}
+
+fn action_sql_env(action: ModerationAction) -> Result<Vec<String>> {
+    let key = action.env_key();
+    let Some(sql) = optional_env(key)? else {
+        return Ok(Vec::new());
+    };
+    let statements = split_statements(&sql);
+    if statements.is_empty() {
+        bail!("{key} contains no SQL statement");
+    }
+    Ok(statements)
 }
 
 /// Fetching posts from a remote account's outbox when this instance holds none.

@@ -158,12 +158,16 @@ impl ModerationNoteWriter {
     pub async fn connect(config: &PostgresConfig) -> Result<Self> {
         let client = connect(&config.database_url).await?;
         for action in ModerationAction::ALL {
-            if let Some(sql) = config.action_sql(action) {
-                let key = action.env_key();
-                tokio::time::timeout(DATABASE_TIMEOUT, client.prepare_typed(sql, &[Type::INT8]))
-                    .await
-                    .with_context(|| format!("timed out validating {key}"))?
-                    .with_context(|| format!("{key} is invalid"))?;
+            let key = action.env_key();
+            for (i, statement) in config.action_sql(action).iter().enumerate() {
+                let n = i + 1;
+                tokio::time::timeout(
+                    DATABASE_TIMEOUT,
+                    client.prepare_typed(statement, &[Type::INT8]),
+                )
+                .await
+                .with_context(|| format!("timed out validating {key} statement {n}"))?
+                .with_context(|| format!("{key} statement {n} is invalid"))?;
             }
         }
         info!("connected to PostgreSQL for moderation notes");
@@ -195,16 +199,22 @@ impl ModerationNoteWriter {
     }
 
     pub async fn run_action_sql(&self, action: ModerationAction, account_id: &str) -> Result<()> {
-        let Some(sql) = self.config.action_sql(action) else {
+        let statements = self.config.action_sql(action);
+        if statements.is_empty() {
             return Ok(());
-        };
+        }
         let account_id = parse_account_id(account_id)?;
-        // Typed so `$1` binds even when the SQL never references it.
+        // One execute per statement: VACUUM and the like refuse to share one.
+        // Typed so `$1` binds even when a statement never references it.
         let rows = self
             .with_client(action.env_key(), async |client: &Client| {
-                client
-                    .execute_typed(sql, &[(&account_id, Type::INT8)])
-                    .await
+                let mut rows = 0;
+                for statement in statements {
+                    rows += client
+                        .execute_typed(statement, &[(&account_id, Type::INT8)])
+                        .await?;
+                }
+                Ok(rows)
             })
             .await?;
         info!(account_id, ?action, rows, "action SQL executed");
