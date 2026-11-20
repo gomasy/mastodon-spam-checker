@@ -1,8 +1,5 @@
-//! Reads a remote account's recent posts straight from its ActivityPub outbox, signing requests
-//! with the instance actor's key so authorized-fetch servers answer too.
-//!
-//! The URLs are remote-chosen, so only public https on the actor's origin is fetched, without
-//! redirects, and resolved addresses are checked too.
+//! Reads a remote account's recent posts from its ActivityPub outbox, signed with the instance
+//! actor's key. Only public https URLs on the actor's origin are fetched, without redirects.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, SystemTime};
@@ -38,7 +35,6 @@ pub struct RemoteFetcher {
 }
 
 impl RemoteFetcher {
-    /// Builds a fetcher when remote fetching is configured, and nothing otherwise.
     pub async fn from_config(
         config: Option<&RemoteFetchConfig>,
         mastodon: &MastodonClient,
@@ -81,7 +77,6 @@ impl RemoteFetcher {
             key,
             key_id: config.key_id.clone(),
             rng: SystemRandom::new(),
-            // A server that is down should not stall the run.
             retry: http::RetryConfig {
                 max_retries: 1,
                 ..http::RetryConfig::default()
@@ -146,7 +141,6 @@ impl RemoteFetcher {
 
         let status = resp.status();
         if !status.is_success() {
-            // The remote-controlled body is not quoted.
             bail!("{url} answered HTTP {status}");
         }
         let content_type = resp
@@ -201,13 +195,12 @@ fn parse_private_key(pem: &str) -> Result<RsaKeyPair> {
     .map_err(|error| anyhow!("key rejected: {error}"))
 }
 
-/// `Mastodon/<version> (+https://<host>/)`.
 fn mastodon_user_agent(mastodon_version: &str, key_id: &Url) -> String {
     let origin = key_id.origin().ascii_serialization();
     format!("Mastodon/{mastodon_version} (+{origin}/)")
 }
 
-/// The draft-cavage signing string for a GET over [`SIGNED_HEADERS`], as Mastodon signs.
+/// The draft-cavage signing string for a GET over [`SIGNED_HEADERS`].
 fn signing_string(request_target: &str, host: &str, date: &str) -> String {
     format!(
         "(request-target): get {request_target}\nhost: {host}\ndate: {date}\naccept: {ACTIVITY_JSON}"
@@ -230,7 +223,7 @@ fn host_header(url: &Url) -> Result<String> {
     })
 }
 
-/// A remote-chosen URL, accepted only as https to a possibly public host.
+/// Accepts only https URLs without credentials or non-public IP literals.
 fn remote_url(raw: &str) -> Result<Url> {
     let mut url = Url::parse(raw).with_context(|| format!("invalid URL {raw:?}"))?;
     if url.scheme() != "https" {
@@ -251,7 +244,6 @@ fn remote_url(raw: &str) -> Result<Url> {
     Ok(url)
 }
 
-/// [`remote_url`], additionally pinned to the actor's own origin.
 fn same_origin_url(raw: &str, actor_url: &Url) -> Result<Url> {
     let url = remote_url(raw)?;
     if url.origin() != actor_url.origin() {

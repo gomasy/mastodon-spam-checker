@@ -1,13 +1,8 @@
 /// Shortens `s` to at most `max_chars` characters, marking a cut with a trailing ellipsis.
-///
-/// Characters rather than bytes, so multi-byte text is never split mid-character, and because the
-/// limits this enforces (Slack Block Kit fields, LLM prompt budget) are expressed in characters.
 pub fn truncate_chars(s: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
     }
-    // Scanning stops at the cap rather than counting every character: this guards untrusted text
-    // that can be orders of magnitude longer than the limit.
     if s.char_indices().nth(max_chars).is_none() {
         return s.to_string();
     }
@@ -35,7 +30,6 @@ mod tests {
 
     #[test]
     fn truncate_chars_is_exact_at_the_boundary() {
-        // Exactly at the cap is not a cut; one past it is.
         assert_eq!(truncate_chars("あいう", 3), "あいう");
         assert_eq!(truncate_chars("あいうえ", 3), "あい…");
         assert_eq!(truncate_chars("a", 1), "a");

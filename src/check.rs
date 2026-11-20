@@ -1,7 +1,4 @@
 //! The spam-check pipeline, shared by the periodic run, `retry-failed`, and `backfill`.
-//!
-//! [`check_one`] takes one account through statuses, campaign signals, verdict, notification, and
-//! recording; [`process_accounts`] runs that over a list and reports how far it got.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,14 +21,13 @@ use crate::redis::{
 use crate::signals;
 use crate::slack::SlackNotifier;
 
-/// What a run may do beyond classifying accounts — the only thing the entry points differ in.
 #[derive(Clone, Copy)]
 pub struct ServiceOptions {
-    /// Send Slack notifications, and write the moderation notes that document them.
+    /// Send Slack notifications and moderation notes.
     pub notify: bool,
     /// Write job records, campaign index entries, and the retry queue.
     pub persist: bool,
-    /// Re-send a notification whose delivery was left uncertain, rather than skipping the account.
+    /// Re-send notifications whose delivery was left uncertain.
     pub retry_pending: bool,
 }
 
@@ -39,8 +35,7 @@ pub struct CheckServices {
     posts: PostSource,
     llm: LlmClient,
     slack: Option<SlackNotifier>,
-    /// Present for every run: dry runs read campaign context through it, and `persist` decides
-    /// whether anything is written back.
+    /// Read even in dry runs; written only with `persist`.
     store: StateStore,
     note_writer: Option<ModerationNoteWriter>,
     auto_moderation: Option<AutoModerationConfig>,
@@ -82,20 +77,16 @@ impl CheckServices {
         })
     }
 
-    /// Auto-moderation acts only in runs that record what they did and tell moderators about it:
-    /// an account suspended in a dry run, or with nobody notified, would be suspended unseen.
+    /// Only runs that persist and notify may act, so nothing is suspended unseen.
     fn auto_moderates(&self) -> bool {
         self.persist && self.slack.is_some()
     }
 
-    /// For callers that select the accounts to check before handing them to [`process_accounts`].
     pub fn mastodon(&self) -> &MastodonClient {
         &self.posts.mastodon
     }
 }
 
-/// The clients a spam check always needs. Shared with the one-off inspection commands, which
-/// build them without the rest of [`CheckServices`].
 pub async fn detection_clients(detection: &DetectionConfig) -> Result<(PostSource, LlmClient)> {
     let mastodon = MastodonClient::new(
         &detection.mastodon_base_url,
@@ -116,7 +107,6 @@ impl PostSource {
     /// A failed remote fetch is logged and yields no posts, as if remote fetching were off.
     pub async fn fetch(&self, account: &AdminAccount) -> Result<Vec<Status>> {
         let statuses = self.mastodon.fetch_statuses(&account.id).await?;
-        // Local accounts are skipped: their outbox is this instance.
         let Some(remote) = self.remote.as_ref().filter(|_| {
             statuses.is_empty() && account.account.statuses_count > 0 && account.domain.is_some()
         }) else {
@@ -184,22 +174,16 @@ pub struct ProcessSummary {
 }
 
 impl ProcessSummary {
-    /// The newest account every earlier account also finished for, or `None` when the very first
-    /// one failed. Saving anything past a failure would skip the account that failed.
+    /// The newest account with no failure at or before it; the cursor may advance this far.
     pub fn last_contiguous_id(&self) -> Option<&str> {
         self.last_contiguous_id.as_deref()
     }
 
-    /// Keeps the failure that stopped the run, which is the one that explains it. Later failures
-    /// are consequences of stopping, and their accounts stay queued for retry regardless.
     fn record_failure(&mut self, error: anyhow::Error) {
         self.first_failure.get_or_insert(error);
     }
 
-    /// Reports what the run did, then hands back the failure that stopped it, if any.
-    ///
-    /// The counts are logged even on failure, so a run that stopped part-way still says how far it
-    /// got — the notified count is what tells an operator whether `retry-failed` has work left.
+    /// Logs the counts, even on failure, then returns the failure that stopped the run.
     pub fn finish(self, dry_run: bool) -> Result<()> {
         info!(
             spam_detected = self.spam_detected,
@@ -223,8 +207,6 @@ pub async fn process_accounts(
     services: CheckServices,
     concurrency: usize,
 ) -> ProcessSummary {
-    // One shared handle: cloning the struct would duplicate every client's URLs, tokens, and model
-    // name for each of potentially thousands of accounts.
     let services = Arc::new(services);
     let mut summary = ProcessSummary::default();
 
@@ -248,8 +230,7 @@ pub async fn process_accounts(
             }
         }
 
-        // Original order, not completion order: the cursor may only advance across accounts whose
-        // predecessors all succeeded.
+        // In input order, so the cursor never passes a failed account.
         for account in chunk {
             let result = results
                 .remove(&account.id)
@@ -303,9 +284,8 @@ async fn check_one(
             return Ok(AccountCheckOutcome::Existing);
         }
         if let Some(job) = store.get_job(&account.id).await? {
-            // A failed notification marks the job failed, which would otherwise re-judge it from
-            // scratch: an auto-moderated account must instead get the notification for what was
-            // already done, whatever a fresh verdict would say.
+            // An auto-moderated account whose notification failed must be re-notified, not
+            // re-judged.
             let auto_moderated_failure = job.status == JobStatus::Failed
                 && job.verdict.is_some()
                 && store.auto_moderation(&account.id).await?.is_some();
@@ -355,7 +335,6 @@ async fn check_one(
                     )
                     .await?;
             }
-            // After the job is completed, never before: see `add_spam_note`.
             if let AccountCheckOutcome::Spam {
                 verdict,
                 notified: true,
@@ -429,8 +408,6 @@ async fn check_one_inner(
     let domain = account.domain.as_deref().unwrap_or("?");
     let spam_probability = verdict.spam_probability();
     if !verdict.spam {
-        // Nothing is owed to Slack, so nothing is written ahead of time: the caller completes the
-        // job with this verdict as the next step.
         info!(username = %account.username, %domain, spam_probability, "not spam");
         return Ok(CheckedAccount {
             outcome: AccountCheckOutcome::NotSpam(verdict),
@@ -451,11 +428,8 @@ async fn check_one_inner(
     report_spam(account, services, verdict, campaign, stored, &known).await
 }
 
-/// Notifies moderators about a spam verdict, and records it.
-///
-/// The classification is written as pending before the notification goes out, so a crash
-/// mid-delivery leaves the account queued for retry rather than looking finished. With no Slack
-/// configured nothing is owed, and the caller's `complete_job` records the verdict on its own.
+/// Records the verdict as notification-pending, auto-moderates, then notifies, so an interruption
+/// leaves the account queued for `retry-failed`.
 async fn report_spam(
     account: &AdminAccount,
     services: &CheckServices,
@@ -477,8 +451,6 @@ async fn report_spam(
             .await?;
     }
 
-    // After the classification is recorded, so an interruption from here on leaves a pending
-    // notification for retry-failed to send, rather than an account suspended without one.
     let auto = auto_moderate(account, services, &verdict, known).await?;
     let notified = notify_with_claim(services, account, &verdict, auto.as_ref()).await?;
     if !notified {
@@ -510,7 +482,6 @@ async fn auto_moderate(
         return Ok(None);
     };
     if !services.auto_moderates() {
-        // Dry runs only log what they would have done.
         info!(account_id = %account.id, ?matched, "matches known spam; auto-moderation skipped in a run without notifications");
         return Ok(None);
     }
@@ -605,10 +576,7 @@ async fn notify_with_claim(
     result.map(|()| true)
 }
 
-/// Records a delivered spam verdict as a Mastodon moderation note, when one is configured.
-///
-/// Called only after the job is completed, and failures are logged rather than raised: the
-/// notification this documents is already out, and a missing note must not undo it.
+/// Notes a delivered spam verdict in Mastodon. Called only after the job is completed.
 async fn add_spam_note(services: &CheckServices, account_id: &str, verdict: &SpamVerdict) {
     let note = t!(
         "note_spam",

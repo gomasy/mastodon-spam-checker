@@ -16,15 +16,12 @@ use crate::redis::{CampaignContext, KnownSpamContext, StoredVerdict};
 use crate::signals::{AccountSignals, html_to_plain};
 use crate::text::truncate_chars;
 
-// Caps on the untrusted account text copied into the prompt. Uncapped, one account with very long
-// posts can exceed the context window and fail its check on every run (see [`UnparseableVerdict`]),
-// and every account costs more than it needs to.
+// Caps on untrusted account text in the prompt, so it fits the context window.
 const FIELD_MAX_CHARS: usize = 200;
 const BIO_MAX_CHARS: usize = 1_000;
 const POST_MAX_CHARS: usize = 500;
 const POSTS_TOTAL_MAX_CHARS: usize = 4_000;
 
-/// How much of the offending reply [`UnparseableVerdict`] quotes back for diagnosis.
 const VERDICT_SNIPPET_MAX_CHARS: usize = 200;
 pub const PROMPT_VERSION: &str = "2026-11-known-spam-v1";
 
@@ -55,7 +52,6 @@ impl From<&SpamVerdict> for StoredVerdict {
     }
 }
 
-/// For re-notifying from a stored verdict rather than asking the model again.
 impl From<StoredVerdict> for SpamVerdict {
     fn from(stored: StoredVerdict) -> Self {
         Self {
@@ -66,19 +62,13 @@ impl From<StoredVerdict> for SpamVerdict {
     }
 }
 
-/// The model replied, but the reply carried no verdict this program can act on.
-///
-/// Retrying cannot help — the same prompt yields the same unusable reply — so failing the run would
-/// park the cursor in front of this account forever. Callers skip the account instead, the same
-/// reasoning as [`normalize_confidence`] one level further out.
-///
-/// Deliberately *not* used for a body that does not deserialize as a chat completion at all: that
-/// points at a misconfigured endpoint, which affects every account and should fail loudly.
+/// A reply with no usable verdict. Retrying would not help, so callers mark the account
+/// undetermined instead of stalling the cursor. Not used for malformed API responses, which point
+/// at misconfiguration and should fail the run.
 #[derive(Debug)]
 pub struct UnparseableVerdict(String);
 
 impl UnparseableVerdict {
-    /// `reply` is quoted back, truncated, so the prompt or model can be adjusted.
     fn new(reason: impl std::fmt::Display, reply: &str) -> Self {
         Self(format!(
             "no usable LLM verdict: {reason} (reply: {:?})",
@@ -95,7 +85,6 @@ impl std::fmt::Display for UnparseableVerdict {
 
 impl std::error::Error for UnparseableVerdict {}
 
-/// Whether `error` was caused by a reply carrying no usable verdict (see [`UnparseableVerdict`]).
 pub fn is_unparseable_verdict(error: &anyhow::Error) -> bool {
     error.chain().any(|e| e.is::<UnparseableVerdict>())
 }
@@ -193,8 +182,7 @@ Respond ONLY with a JSON object in this exact format (no markdown, no extra text
 
 const DECISION_MODEL_PREFIXES: &[&str] = &["typesafe/jev-", "jaredpalmer/kev-", "jev-", "kev-"];
 
-/// Whether `model` is a System One decision model such as Jev or Kev, which returns typed answers
-/// through `/systemone` instead of chat text.
+/// System One decision models (Jev, Kev) answer through `/systemone` instead of chat.
 pub fn is_decision_model(model: &str) -> bool {
     let model = model.trim_start_matches('~');
     DECISION_MODEL_PREFIXES
@@ -217,8 +205,7 @@ struct NoulAnswer {
     noul: Option<f64>,
 }
 
-/// Turns a spam probability into a verdict: spam unless not-spam is at least `min_not_spam` sure.
-/// Decision models give no reason.
+/// Spam unless not-spam is at least `min_not_spam` sure.
 fn decision_verdict(probability: f64, min_not_spam: f64) -> SpamVerdict {
     let probability = normalize_confidence(probability);
     let spam = 1.0 - probability < min_not_spam;
@@ -238,7 +225,7 @@ pub struct LlmClient {
     json_mode: bool,
     decision: bool,
     min_not_spam: f64,
-    /// Re-checks the decision model's spam verdicts.
+    /// A chat model that re-checks the decision model's spam verdicts.
     review: Option<Box<LlmClient>>,
     retry: http::RetryConfig,
 }
@@ -266,8 +253,6 @@ impl LlmClient {
         Ok(Self { review, ..client })
     }
 
-    /// `signals` is threaded in rather than recomputed here: the campaign lookup needs it first,
-    /// and analysing an account hashes its bio and parses every link it carries.
     pub async fn check_spam(
         &self,
         account: &AdminAccount,
@@ -357,7 +342,7 @@ impl LlmClient {
         resp.json().await.context("failed to parse LLM response")
     }
 
-    /// The model recorded with each verdict: `decision+review` when reviewed.
+    /// `model` or `model+review_model`.
     pub fn model_label(&self) -> String {
         match &self.review {
             Some(review) => format!("{}+{}", self.model, review.model),
@@ -366,10 +351,7 @@ impl LlmClient {
     }
 }
 
-/// Unwraps the markdown code fence models wrap JSON in despite being told not to.
-///
-/// The system prompt asks for bare JSON and `json_mode` enforces it where supported, but neither is
-/// guaranteed, and a fence is the one deviation common enough to absorb rather than fail over.
+/// Unwraps a markdown code fence around JSON.
 fn strip_code_fence(content: &str) -> &str {
     content
         .trim()
@@ -386,16 +368,11 @@ fn parse_verdict(content: &str) -> Result<SpamVerdict> {
     Ok(verdict)
 }
 
-/// Coerces a verdict confidence into 0.0–1.0.
-///
-/// Some models report on a 0–100 scale or drift slightly out of range. Failing instead would stop
-/// the caller without advancing the cursor, so the same account would be retried on every run.
+/// Coerces a confidence into 0.0–1.0, reading values in (1, 100] as percentages.
 fn normalize_confidence(confidence: f64) -> f64 {
     let normalized = if confidence.is_nan() {
-        // clamp() would pass NaN straight through.
         0.0
     } else if confidence > 1.0 && confidence <= 100.0 {
-        // In the percentage range, read as a 0-100 scale; anything beyond is clamped.
         confidence / 100.0
     } else {
         confidence.clamp(0.0, 1.0)
@@ -417,7 +394,6 @@ fn build_user_prompt(
     known: &KnownSpamContext,
 ) -> String {
     let note_plain = html_to_plain(&account.account.note);
-    // Mastodon serves /avatars/original/missing.png when no avatar is set
     let avatar_state =
         if account.account.avatar.is_empty() || account.account.avatar.contains("missing.png") {
             "not set (default avatar)"
@@ -487,7 +463,7 @@ fn build_user_prompt(
     prompt
 }
 
-/// Always emitted, zeros included, so "no match" is stated rather than implied.
+/// Always emitted, so "no match" is stated rather than implied.
 fn append_known_spam(prompt: &mut String, known: &KnownSpamContext) {
     prompt.push_str("\n## Moderator-confirmed Spam\n");
     let _ = writeln!(
@@ -526,19 +502,17 @@ fn append_known_spam(prompt: &mut String, known: &KnownSpamContext) {
     }
 }
 
-/// Appends the recent posts, spending one shared character budget across them so a few very long
-/// posts cannot crowd out the rest.
+/// Appends the recent posts within a shared character budget.
 fn append_recent_posts(prompt: &mut String, statuses: &[Status]) {
+    prompt.push_str("\n## Recent Posts\n");
     if statuses.is_empty() {
-        prompt.push_str("\n## Recent Posts\n(No posts found)\n");
+        prompt.push_str("(No posts found)\n");
         return;
     }
 
-    prompt.push_str("\n## Recent Posts\n");
     let mut budget = POSTS_TOTAL_MAX_CHARS;
     let mut remaining = statuses.iter();
     for status in remaining.by_ref() {
-        // A trailing ellipsis tells the model the text was cut.
         let post = truncate_chars(&post_text(status), POST_MAX_CHARS.min(budget));
         budget -= post.chars().count();
         let language = status.language.as_deref().unwrap_or("unknown");
@@ -557,15 +531,13 @@ fn append_recent_posts(prompt: &mut String, statuses: &[Status]) {
             break;
         }
     }
-    // Whatever the loop did not reach; zero when the budget outlasted the posts.
     let omitted = remaining.count();
     if omitted > 0 {
         let _ = writeln!(prompt, "({omitted} further post(s) omitted)");
     }
 }
 
-/// One post as plain text, with its content warning and media descriptions folded in. The three
-/// share the post's budget: a spam link is as likely to sit in an image description as in the body.
+/// A post as plain text, with its content warning and media descriptions.
 fn post_text(status: &Status) -> String {
     let mut text = html_to_plain(&status.content);
     if !status.spoiler_text.is_empty() {
@@ -627,14 +599,11 @@ mod tests {
     fn a_reply_without_a_verdict_is_flagged_as_skippable() {
         let error = parse_verdict("I'm sorry, I can't help with that.").unwrap_err();
         assert!(is_unparseable_verdict(&error));
-        // The reply is quoted back so the prompt or model can be adjusted.
         assert!(error.to_string().contains("I'm sorry"), "{error}");
 
-        // A wrapping context must not hide it from the caller that decides to skip the account.
         let wrapped = error.context("LLM check failed");
         assert!(is_unparseable_verdict(&wrapped));
 
-        // A transport-level failure is a different thing and must stay fatal.
         assert!(!is_unparseable_verdict(&anyhow::anyhow!(
             "connection reset"
         )));
@@ -657,7 +626,6 @@ mod tests {
         assert!(error.to_string().contains("blocked by content filter"));
     }
 
-    /// Builds a prompt the way [`LlmClient::check_spam`] does, deriving the signals from the input.
     fn prompt_for(account: &AdminAccount, statuses: &[Status]) -> String {
         let signals = crate::signals::analyze(account, statuses);
         build_user_prompt(
@@ -731,7 +699,6 @@ mod tests {
             .collect();
         let prompt = prompt_for(&account(""), &statuses);
 
-        // Each post is capped, and the shared budget stops the list well before all ten fit.
         let posts: Vec<&str> = prompt
             .lines()
             .filter(|line| line.contains("lang=unknown; source=unknown] x"))
@@ -759,7 +726,6 @@ mod tests {
         let json = r#"{"spam":false,"reason":"ok","confidence":0.1}"#;
         assert_eq!(strip_code_fence(&format!("```json\n{json}\n```")), json);
         assert_eq!(strip_code_fence(&format!("```\n{json}\n```")), json);
-        // Bare JSON, which is what the prompt asks for, is passed through untouched.
         assert_eq!(strip_code_fence(json), json);
         assert!(parse_verdict(strip_code_fence(&format!("```json\n{json}\n```"))).is_ok());
     }
@@ -769,7 +735,6 @@ mod tests {
         let verdict = parse_verdict(r#"{"spam":true,"reason":"test","confidence":0.8}"#).unwrap();
         assert_eq!(verdict.confidence, 0.8);
 
-        // A malformed confidence must not fail the run, so it is coerced instead.
         let verdict = parse_verdict(r#"{"spam":true,"reason":"test","confidence":-0.1}"#).unwrap();
         assert_eq!(verdict.confidence, 0.0);
         let verdict = parse_verdict(r#"{"spam":true,"reason":"test","confidence":85}"#).unwrap();
@@ -795,7 +760,6 @@ mod tests {
         assert!(verdict.spam);
         assert_eq!(verdict.confidence, 0.9);
 
-        // An undecided answer falls on the not-spam side.
         assert!(!decision_verdict(0.5, 0.5).spam);
 
         let verdict = decision_verdict(0.2, 0.5);
@@ -803,7 +767,6 @@ mod tests {
         assert_eq!(verdict.confidence, 0.8);
         assert!((verdict.spam_probability() - 0.2).abs() < 1e-9);
 
-        // Not-spam below the required confidence counts as spam.
         assert!(decision_verdict(0.4, 0.7).spam);
         assert!(!decision_verdict(0.25, 0.7).spam);
     }
@@ -813,10 +776,8 @@ mod tests {
         assert_eq!(normalize_confidence(0.0), 0.0);
         assert_eq!(normalize_confidence(1.0), 1.0);
         assert_eq!(normalize_confidence(0.42), 0.42);
-        // 0-100 scale.
         assert_eq!(normalize_confidence(85.0), 0.85);
         assert_eq!(normalize_confidence(100.0), 1.0);
-        // Out of every range.
         assert_eq!(normalize_confidence(-3.0), 0.0);
         assert_eq!(normalize_confidence(150.0), 1.0);
         assert_eq!(normalize_confidence(f64::INFINITY), 1.0);

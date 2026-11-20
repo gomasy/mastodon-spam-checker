@@ -109,8 +109,7 @@ fn collect_url(candidate: &str, links: &mut BTreeSet<String>) {
         && matches!(url.scheme(), "http" | "https")
     {
         let path = url.path();
-        // Mentions and hashtags render as links, but they are federation navigation, not a
-        // promotional destination a campaign could share.
+        // Mentions and hashtags are federation navigation, not destinations.
         if path.starts_with("/@") || path.starts_with("/users/") || path.starts_with("/tags/") {
             return;
         }
@@ -119,7 +118,7 @@ fn collect_url(candidate: &str, links: &mut BTreeSet<String>) {
     }
 }
 
-/// Hex SHA-256 of `value`, used to key campaign signals by content without storing the content.
+/// Hex SHA-256 of `value`.
 pub fn digest(value: &str) -> String {
     use std::fmt::Write;
 
@@ -172,8 +171,6 @@ mod tests {
 
     #[test]
     fn federation_links_are_not_campaign_destinations() {
-        // Counted, they would make each instance a shared "destination domain" and match
-        // unrelated accounts as one campaign.
         assert_eq!(
             links_in(
                 r#"<a href="https://mstdn.example/@bob">@bob</a>
@@ -187,7 +184,6 @@ mod tests {
 
     #[test]
     fn a_fragment_does_not_split_one_destination_into_many() {
-        // Same page, different anchors: kept apart these would dilute a campaign's match count.
         assert_eq!(
             links_in(
                 r#"<a href="https://spam.example/x#a">1</a><a href="https://spam.example/x#b">2</a>"#
@@ -198,7 +194,6 @@ mod tests {
 
     #[test]
     fn bare_and_non_http_urls_are_handled() {
-        // Surrounding punctuation is trimmed; schemes that cannot be a destination are left out.
         assert_eq!(
             links_in("see (https://plain.example/a), javascript:alert(1) mailto:x@example.com"),
             ["https://plain.example/a"]
@@ -226,7 +221,7 @@ mod tests {
             html_to_plain("&lt;b&gt; &quot;x&quot; &#39;y&#39;"),
             "<b> \"x\" 'y'"
         );
-        // Double-escaped entities are unescaped only one level deep (because &amp; is replaced last).
+        // Unescaped one level only.
         assert_eq!(html_to_plain("&amp;lt;script&amp;gt;"), "&lt;script&gt;");
         assert_eq!(html_to_plain("A &amp; B"), "A & B");
     }

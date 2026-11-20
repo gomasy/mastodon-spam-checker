@@ -78,7 +78,6 @@ fn open(
     );
     let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).ok()?);
     let nonce = Nonce::try_assume_unique_for_key(iv).ok()?;
-    // A wrong-length tag just fails authentication.
     let mut in_out = [ciphertext, tag].concat();
     let plaintext = key.open_in_place(nonce, Aad::empty(), &mut in_out).ok()?;
     Some(plaintext.to_vec())

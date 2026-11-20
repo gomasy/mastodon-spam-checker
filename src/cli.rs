@@ -1,8 +1,3 @@
-//! Command-line entry points.
-//!
-//! Each subcommand assembles what it needs from the environment and hands the work to
-//! [`crate::check`]. The ones that write shared state run under a Redis lease.
-
 use std::future::Future;
 
 use anyhow::{Context, Result, bail};
@@ -49,11 +44,7 @@ async fn connect_store() -> Result<StateStore> {
     StateStore::new(&config::redis_url_env()?).await
 }
 
-/// Runs `operation` as the only checker touching shared state, handing it the store the lease is
-/// held on so the run opens one Redis connection rather than two.
-///
-/// A renewal task keeps the lease past its own expiry. Losing it aborts the operation: a second run
-/// may already have started on the strength of the expired lease.
+/// Runs `operation` under the Redis run lease, aborting it if the lease cannot be renewed.
 async fn exclusive_run<F, Fut>(operation: F) -> Result<()>
 where
     F: FnOnce(StateStore) -> Fut,
@@ -133,7 +124,7 @@ async fn check(store: StateStore, dry_run: bool) -> Result<()> {
         },
     )
     .await?;
-    // First, so new suspensions count against this run; a failure must not block the checks.
+    // Before checking, so new suspensions count in this run.
     if !dry_run
         && let Err(error) =
             learn::learn_suspended(&store, services.mastodon(), ADMIN_PAGE_LIMIT).await
@@ -188,7 +179,7 @@ async fn check_acct_command(args: &[String]) -> Result<()> {
     inspect_account(&posts, &llm, &account).await
 }
 
-/// Classifies one account and prints the verdict, shared by `check-account` and `check-acct`.
+/// Classifies one account without touching state and prints the verdict.
 async fn inspect_account(
     posts: &PostSource,
     llm: &LlmClient,
@@ -196,7 +187,6 @@ async fn inspect_account(
 ) -> Result<()> {
     let statuses = posts.fetch(account).await?;
     let signals = signals::analyze(account, &statuses);
-    // A one-off inspection touches no state, so it carries no campaign or known spam history.
     let verdict = llm
         .check_spam(
             account,
@@ -234,8 +224,7 @@ async fn cursor_command(args: &[String]) -> Result<()> {
 
 async fn retry_failed_command(store: StateStore, max: usize) -> Result<()> {
     let config = Config::from_env(true)?;
-    // Walked well past `max`: entries a moderator has since resolved are dropped as they are
-    // found, rather than counting against the batch.
+    // Headroom for queued accounts that turn out to be unavailable or unfetchable.
     let ids = store.failed_ids(max.saturating_mul(10)).await?;
     if ids.is_empty() {
         info!("retry queue is empty");
@@ -295,7 +284,6 @@ async fn backfill_command(store: StateStore, options: BackfillOptions) -> Result
         store,
         ServiceOptions {
             notify: options.notify,
-            // Results are persisted even when notifications are intentionally disabled.
             persist: true,
             retry_pending: false,
         },
@@ -310,7 +298,6 @@ async fn backfill_command(store: StateStore, options: BackfillOptions) -> Result
         .finish(false)
 }
 
-/// Learns from more suspended accounts than the one page a periodic run looks at.
 async fn learn_suspended_command(store: StateStore, max: usize) -> Result<()> {
     let detection = DetectionConfig::from_env()?;
     let mastodon = MastodonClient::new(
@@ -346,22 +333,12 @@ impl BackfillOptions {
         let mut to = None;
         let mut max = 1_000;
         let mut notify = false;
-        // Each flag takes its value in the arm that matched it, so no already-decided flag is
-        // matched a second time.
         let mut args = args.iter();
         while let Some(flag) = args.next() {
             let mut value = || args.next().with_context(|| format!("{flag} needs a value"));
             match flag.as_str() {
-                "--from" => {
-                    let id = value()?;
-                    validate_account_id(id)?;
-                    from = Some(id.clone());
-                }
-                "--to" => {
-                    let id = value()?;
-                    validate_account_id(id)?;
-                    to = Some(id.clone());
-                }
+                "--from" => from = Some(account_id_arg(value()?)?),
+                "--to" => to = Some(account_id_arg(value()?)?),
                 "--max" => max = parse_positive_usize(value()?, "--max")?,
                 "--notify" => notify = true,
                 unknown => bail!("unknown backfill option: {unknown}"),
@@ -380,6 +357,11 @@ impl BackfillOptions {
             notify,
         })
     }
+}
+
+fn account_id_arg(id: &str) -> Result<String> {
+    validate_account_id(id)?;
+    Ok(id.to_string())
 }
 
 fn parse_optional_max(args: &[String], default: usize) -> Result<usize> {
@@ -426,7 +408,6 @@ mod tests {
         assert!(parse(&["--from", "abc"]).is_err(), "non-numeric ID");
         assert!(parse(&["--from", "1", "--max", "0"]).is_err(), "--max 0");
         assert!(parse(&["--wat"]).is_err(), "unknown flag");
-        // --notify takes no value, so it must not swallow the flag that follows it.
         let options = parse(&["--notify", "--from", "10"]).unwrap();
         assert!(options.notify);
         assert_eq!(options.from, "10");

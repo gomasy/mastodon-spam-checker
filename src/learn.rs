@@ -1,13 +1,10 @@
-//! Learning spam from accounts suspended in Mastodon, which includes the checker's misses.
-
 use anyhow::Result;
 use tracing::info;
 
 use crate::mastodon::MastodonClient;
 use crate::redis::{LearnOutcome, LearnSource, StateStore};
 
-/// Looks through the newest `max` suspended remote accounts. A failure on one account is logged and
-/// the rest continue.
+/// Learns spam from the newest `max` suspended remote accounts, including the checker's misses.
 pub async fn learn_suspended(
     store: &StateStore,
     mastodon: &MastodonClient,

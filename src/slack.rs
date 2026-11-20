@@ -15,19 +15,16 @@ use crate::text::truncate_chars;
 
 const APP_NAME: &str = "Mastodon Spam Checker";
 
-// Action IDs, shared with the serve-mode handler that receives the clicks.
 pub const SUSPEND_ACTION_ID: &str = "suspend_account";
-/// Appears only in post-suspension messages.
 pub const DELETE_ACTION_ID: &str = "delete_account";
 pub const CONFIRM_SPAM_ACTION_ID: &str = "confirm_spam";
 pub const FALSE_POSITIVE_ACTION_ID: &str = "false_positive";
 
-/// Character limit for Block Kit mrkdwn text objects (shared by section and context blocks).
+/// Block Kit limit for mrkdwn text objects.
 pub(crate) const TEXT_MAX_CHARS: usize = 3000;
-/// Character limit for the Block Kit confirm dialog text.
+/// Block Kit limit for confirm dialog text.
 const CONFIRM_TEXT_MAX_CHARS: usize = 300;
 
-/// What a button carries back to the serve-mode handler when it is clicked.
 #[derive(Serialize, Deserialize)]
 pub struct ButtonValue {
     pub id: String,
@@ -36,7 +33,6 @@ pub struct ButtonValue {
 
 #[derive(Serialize)]
 struct SlackMessage {
-    /// With blocks present, this is the notification and preview fallback.
     text: String,
     blocks: Value,
     username: &'static str,
@@ -115,8 +111,6 @@ impl SlackNotifier {
             channel: self.channel.clone(),
         };
 
-        // Retried, because the caller aborts the whole run on a notification error: a momentary
-        // blip would otherwise stall the checker on this account.
         http::send_with_retry(
             || self.client.post(&self.webhook_url).json(&message),
             "Slack webhook",
@@ -128,9 +122,7 @@ impl SlackNotifier {
     }
 }
 
-/// The "Delete Account" button, for a message whose account has just been suspended — the endpoint
-/// behind it rejects anything else. `value_json` is the suspend button's [`ButtonValue`], and
-/// `safe_acct` must already be through [`sanitize_mrkdwn`]; this does not escape it again.
+/// The delete button for a suspended account. `safe_acct` must already be sanitized.
 pub fn delete_actions_block(value_json: &str, safe_acct: &str) -> Value {
     json!({
         "type": "actions",
@@ -149,7 +141,6 @@ fn delete_button(value_json: &str, safe_acct: &str) -> Value {
     )
 }
 
-/// The headline for an auto-moderated account, placed above the usual details.
 fn auto_moderation_line(auto: &AutoModerationOutcome) -> String {
     let matched = sanitize_mrkdwn(&auto.matched.describe());
     match &auto.result {
@@ -169,8 +160,7 @@ fn auto_moderation_line(auto: &AutoModerationOutcome) -> String {
     .to_string()
 }
 
-/// The buttons that still make sense after what auto-moderation did: none that would repeat it,
-/// and the feedback buttons always, so a false positive can still be recorded.
+/// The next moderation step, if any, plus the feedback buttons.
 fn actions_block(auto: Option<&AutoModerationOutcome>, value_json: &str, safe_acct: &str) -> Value {
     let primary = match auto.map(|auto| &auto.result) {
         None | Some(AutoModerationResult::Failed(_)) => Some(suspend_button(value_json, safe_acct)),
@@ -233,11 +223,9 @@ fn confirm_button(
     })
 }
 
-/// Truncates text that has been through [`sanitize_mrkdwn`], without cutting a trailing
-/// `&...;` entity in half (a bare `&am` would render as literal text).
+/// Truncates sanitized mrkdwn without splitting a trailing `&...;` entity.
 pub(crate) fn truncate_mrkdwn(s: &str, max_chars: usize) -> String {
     let truncated = truncate_chars(s, max_chars);
-    // Only a shortened string can end mid-entity, and the ellipsis marks that case.
     if !truncated.ends_with('…') {
         return truncated;
     }
@@ -247,14 +235,8 @@ pub(crate) fn truncate_mrkdwn(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Prepares untrusted text for embedding in an mrkdwn template.
-///
-/// Escapes the three characters Slack treats as control sequences, so the content cannot inject
-/// links, mentions, or broadcasts such as `<!channel>`, and folds line breaks, which mrkdwn offers
-/// no way to escape, so it cannot forge extra lines. Every account-, LLM-, or error-derived value
-/// interpolated into a locale template goes through this.
-///
-/// Not idempotent: applying it twice renders the escapes literally.
+/// Escapes untrusted text for mrkdwn: `&<>` so it cannot inject links or mentions, and folded
+/// whitespace so it cannot forge lines. Not idempotent.
 pub(crate) fn sanitize_mrkdwn(s: &str) -> String {
     s.split_whitespace()
         .collect::<Vec<_>>()
@@ -270,10 +252,8 @@ mod tests {
 
     #[test]
     fn truncate_mrkdwn_does_not_split_an_escaped_entity() {
-        // "A&amp;B" cut at 6 chars would end in "&am" without the entity guard.
         assert_eq!(truncate_mrkdwn(&sanitize_mrkdwn("A&B"), 6), "A…");
         assert_eq!(truncate_mrkdwn("a&amp;bcd", 8), "a&amp;b…");
-        // Untruncated text is returned untouched.
         assert_eq!(truncate_mrkdwn("a&amp;b", 8), "a&amp;b");
     }
 
@@ -346,14 +326,8 @@ mod tests {
             r#"{"id":"42","acct":"alice@example.com"}"#,
             "alice@example.com",
         );
-        let action_ids: Vec<&str> = block["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|element| element["action_id"].as_str())
-            .collect();
         assert_eq!(
-            action_ids,
+            action_ids(&block),
             [
                 SUSPEND_ACTION_ID,
                 CONFIRM_SPAM_ACTION_ID,
