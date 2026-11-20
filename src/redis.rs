@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, FromRedisValue, Pipeline, RedisError, RedisResult};
+use redis::{AsyncCommands, FromRedisValue, Pipeline, RedisResult};
 use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
@@ -22,17 +22,14 @@ const CURSOR_KEY: &str = "mastodon_spam_checker:last_account_id";
 const FAILED_KEY: &str = "mastodon_spam_checker:failed_accounts";
 const PENDING_NOTIFICATION_KEY: &str = "mastodon_spam_checker:pending_notifications";
 const RETENTION_MIGRATION_KEY: &str = "mastodon_spam_checker:migration:account_state_retention_v2";
-/// Covers a complete Slack delivery attempt: a 30-second request timeout plus at most three
-/// Retry-After delays, each capped at 30 seconds.
+/// Outlasts a full Slack delivery with retries.
 const NOTIFICATION_CLAIM_SECS: u64 = 10 * 60;
 const RUN_LEASE_KEY: &str = "mastodon_spam_checker:run_lease";
 const RUN_LEASE_SECS: u64 = 180;
 const CAMPAIGN_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
 const CAMPAIGN_MEMBERS_PER_SIGNAL: i64 = 1_000;
-/// How many matching accounts a campaign lookup keeps, per signal and in total.
 const CAMPAIGN_MATCHES_REPORTED: usize = 20;
-/// Keeps completed account history available for recent Slack actions without accumulating
-/// forever. Unresolved retries and moderator feedback are deliberately exempt.
+/// Retention for completed account state; retries and moderator feedback never expire.
 const ACCOUNT_STATE_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,9 +63,7 @@ impl JobStatus {
         )
     }
 
-    /// The stored spelling, matching how `serde` renames the variants for [`JobRecord`]. Statuses
-    /// are written both inside job records and as the bare moderation action value; one spelling
-    /// keeps the two greppable as the same thing.
+    /// The same spelling `serde` uses.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Processing => "processing",
@@ -137,15 +132,9 @@ impl StateStore {
         Ok(Self { conn })
     }
 
-    /// Runs a read, reissuing it once if the connection had gone away underneath it.
-    ///
-    /// [`ConnectionManager`] replaces a dropped connection in the background but still fails the
-    /// command that discovered the dead socket — so an idle `serve` process fails the first
-    /// moderator click after the socket goes, with nothing the moderator can act on. By the time
-    /// the error surfaces the replacement is in place, and the reissue runs against it.
-    ///
-    /// Reads only: a failed write may still have reached Redis, and nothing in the error says
-    /// whether it did, so re-sending one could apply it twice.
+    /// Runs a read, reissuing it once on a replaced connection. [`ConnectionManager`] reconnects
+    /// but still fails the command that found the dead socket. Writes are never reissued, since
+    /// they may already have applied.
     async fn read<T: FromRedisValue>(
         &self,
         query: &impl RedisRead,
@@ -153,15 +142,14 @@ impl StateStore {
     ) -> Result<T> {
         let mut conn = self.conn.clone();
         match query.run(&mut conn).await {
-            Err(e) if e.is_unrecoverable_error() => {
-                note_reconnect(&e, what);
+            Err(error) if error.is_unrecoverable_error() => {
+                warn!(%error, read = what, "Redis connection was replaced, retrying the read once");
                 query.run(&mut conn).await.context(what)
             }
             result => result.context(what),
         }
     }
 
-    /// [`Self::read`] for the single-key GET most callers want.
     async fn read_key<T: FromRedisValue>(
         &self,
         key: impl redis::ToRedisArgs,
@@ -173,6 +161,23 @@ impl StateStore {
     async fn write(&self, pipeline: &Pipeline, what: &'static str) -> Result<()> {
         let mut conn = self.conn.clone();
         pipeline.query_async::<()>(&mut conn).await.context(what)
+    }
+
+    /// Deletes `key` if it still holds `token`, returning whether it did.
+    async fn delete_if_owned(&self, key: &str, token: &str, what: &'static str) -> Result<bool> {
+        let mut conn = self.conn.clone();
+        let deleted: i32 = redis::Script::new(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then \
+               return redis.call('DEL', KEYS[1]) \
+             end \
+             return 0",
+        )
+        .key(key)
+        .arg(token)
+        .invoke_async(&mut conn)
+        .await
+        .context(what)?;
+        Ok(deleted != 0)
     }
 
     pub async fn get_cursor(&self) -> Result<Option<String>> {
@@ -226,19 +231,10 @@ impl StateStore {
     }
 
     pub async fn release_run_lease(&self, token: &str) -> Result<()> {
-        let mut conn = self.conn.clone();
-        let released = redis::Script::new(
-            "if redis.call('GET', KEYS[1]) == ARGV[1] then \
-               return redis.call('DEL', KEYS[1]) \
-             end \
-             return 0",
-        )
-        .key(RUN_LEASE_KEY)
-        .arg(token)
-        .invoke_async::<i32>(&mut conn)
-        .await
-        .context("failed to release run lease")?;
-        if released == 0 {
+        if !self
+            .delete_if_owned(RUN_LEASE_KEY, token, "failed to release run lease")
+            .await?
+        {
             bail!("run lease ownership was lost before release");
         }
         Ok(())
@@ -345,11 +341,8 @@ impl StateStore {
         if job.status == JobStatus::NotificationPending {
             pipeline.sadd(PENDING_NOTIFICATION_KEY, account_id).ignore();
         }
-        let mut conn = self.conn.clone();
-        pipeline
-            .query_async::<()>(&mut conn)
+        self.write(&pipeline, "failed to persist account classification")
             .await
-            .context("failed to persist account classification")
     }
 
     pub async fn fail_job(&self, mut job: JobRecord, error: &anyhow::Error) -> Result<()> {
@@ -366,13 +359,8 @@ impl StateStore {
             .await
     }
 
-    /// Records a moderator's verdict on an account, returning the verdict it replaced, if any.
-    ///
-    /// A later verdict overwrites an earlier one — correcting a mis-click is what these buttons are
-    /// for, and either order is reachable, since an older notification for the same account still
-    /// carries the buttons the newer one hid. The replaced verdict is handed back so the caller can
-    /// log the reversal. The one refusal is a notification still being delivered, which would race
-    /// the claim.
+    /// Records a moderator's verdict, overwriting any earlier one, and returns the one replaced.
+    /// Refused while a notification for the account is being delivered.
     pub async fn record_feedback(
         &self,
         account_id: &str,
@@ -386,8 +374,6 @@ impl StateStore {
         })
         .context("failed to serialize moderator feedback")?;
         let mut conn = self.conn.clone();
-        // The status code distinguishes a missing job and an in-flight notification without
-        // racing a separate job read against the completed job's expiry.
         let (outcome, previous): (i32, String) = redis::Script::new(
             "if redis.call('EXISTS', KEYS[2]) == 0 and redis.call('EXISTS', KEYS[1]) == 0 then return {0, ''} end \
              if redis.call('EXISTS', KEYS[3]) == 1 then return {1, ''} end \
@@ -425,8 +411,7 @@ impl StateStore {
             }
             _ => {}
         }
-        // Empty means nothing to replace; an unparseable value reads the same way rather than
-        // failing, since the new verdict is already written and this only feeds a log line.
+        // Only feeds a log line, so an unparseable value reads as none.
         Ok(parse_feedback(Some(previous.as_str()))
             .ok()
             .flatten()
@@ -451,18 +436,12 @@ impl StateStore {
     }
 
     pub async fn release_notification_claim(&self, account_id: &str, token: &str) -> Result<()> {
-        let mut conn = self.conn.clone();
-        redis::Script::new(
-            "if redis.call('GET', KEYS[1]) == ARGV[1] then \
-               return redis.call('DEL', KEYS[1]) \
-             end \
-             return 0",
+        self.delete_if_owned(
+            &notification_claim_key(account_id),
+            token,
+            "failed to release notification claim",
         )
-        .key(notification_claim_key(account_id))
-        .arg(token)
-        .invoke_async::<i32>(&mut conn)
-        .await
-        .context("failed to release notification claim")?;
+        .await?;
         Ok(())
     }
 
@@ -482,10 +461,7 @@ impl StateStore {
         Ok(())
     }
 
-    /// Adds the current retention policy to records created before TTLs were introduced.
-    ///
-    /// The marker keeps later runs from scanning every account key, and is written only after both
-    /// scans complete, so an interrupted migration is safely retried.
+    /// One-time migration adding TTLs to records written before retention existed.
     pub async fn cleanup_expired_records(&self) -> Result<usize> {
         let migrated: bool = self
             .read(
@@ -506,8 +482,6 @@ impl StateStore {
         Ok(applied)
     }
 
-    /// Expires completed and abandoned processing jobs according to their stored update time.
-    /// Failed and notification-pending jobs remain durable until an operator resolves them.
     async fn apply_job_retention(&self) -> Result<usize> {
         let now = now_timestamp();
         let mut cursor = 0u64;
@@ -548,11 +522,8 @@ impl StateStore {
                     }
                 }
                 if !updates.is_empty() {
-                    let mut conn = self.conn.clone();
-                    updates
-                        .query_async::<()>(&mut conn)
-                        .await
-                        .context("failed to apply legacy Redis job retention")?;
+                    self.write(&updates, "failed to apply legacy Redis job retention")
+                        .await?;
                 }
             }
 
@@ -563,7 +534,7 @@ impl StateStore {
         }
     }
 
-    /// Moderation action values predate timestamps, so give legacy keys one full retention window.
+    /// Action values carry no timestamp, so each gets a full retention window.
     async fn expire_legacy_actions(&self) -> Result<usize> {
         let mut cursor = 0u64;
         let mut applied = 0usize;
@@ -584,11 +555,8 @@ impl StateStore {
                         .expire(key, ACCOUNT_STATE_RETENTION_SECS as i64)
                         .ignore();
                 }
-                let mut conn = self.conn.clone();
-                expiration
-                    .query_async::<()>(&mut conn)
-                    .await
-                    .context("failed to apply legacy Redis record retention")?;
+                self.write(&expiration, "failed to apply legacy Redis record retention")
+                    .await?;
                 applied += keys.len();
             }
             cursor = next_cursor;
@@ -635,15 +603,12 @@ impl StateStore {
 
         let mut failed = Vec::new();
         for id in ids {
-            // Both keys in one round trip: the queue can hold thousands of IDs, and this walks it
-            // until `limit` live ones are found.
             let mut state = redis::pipe();
             state.get(feedback_key(&id)).get(job_key(&id));
             let (feedback, job): (Option<String>, Option<String>) = self
                 .read(&state, "failed to read queued account state")
                 .await?;
-            // A missing job stays retryable: an interrupted retry can leave its ID queued after the
-            // temporary Processing record expires, and begin_job reconstructs it.
+            // A missing job stays retryable; begin_job recreates it.
             if is_terminal_feedback(feedback.as_deref())? || is_completed_job(job.as_deref())? {
                 self.remove_failed(&id).await?;
                 continue;
@@ -668,26 +633,18 @@ impl StateStore {
     }
 
     async fn remove_failed(&self, account_id: &str) -> Result<()> {
-        let mut conn = self.conn.clone();
-        redis::pipe()
+        let mut pipeline = redis::pipe();
+        pipeline
             .atomic()
             .srem(FAILED_KEY, account_id)
             .ignore()
             .srem(PENDING_NOTIFICATION_KEY, account_id)
-            .ignore()
-            .query_async::<()>(&mut conn)
+            .ignore();
+        self.write(&pipeline, "failed to remove account from retry queue")
             .await
-            .context("failed to remove account from retry queue")
     }
 
-    /// Records this account against its campaign signals and reports which other recently seen
-    /// accounts share one. With `record` unset nothing is written, so a dry run reports the same
-    /// matches without leaving a trace.
-    ///
-    /// An account can carry a bio fingerprint plus a domain per extracted link, so this runs over
-    /// tens of keys, all in one pipeline: issued serially they cost four to five round trips per
-    /// key, which dominated the time spent checking an account. Not `atomic()` — these are
-    /// independent per-key housekeeping commands, and MULTI/EXEC would only add contention.
+    /// Reports other recent accounts sharing a campaign signal, and with `record` adds this one.
     pub async fn campaign_context(
         &self,
         account_id: &str,
@@ -730,19 +687,11 @@ impl StateStore {
     async fn save_job(&self, job: &JobRecord) -> Result<()> {
         let mut pipeline = redis::pipe();
         set_job(&mut pipeline, job, serialize_job(job)?);
-        let mut conn = self.conn.clone();
-        pipeline
-            .query_async::<()>(&mut conn)
+        self.write(&pipeline, "failed to save account job to Redis")
             .await
-            .context("failed to save account job to Redis")
     }
 
-    /// Persists a job that reached an outcome and moves the account in or out of the retry queue to
-    /// match, in one transaction: split, a crash in between would leave a completed account queued
-    /// for retry, or a failed one with nothing to pick it up.
-    ///
-    /// The pending-notification set is cleared either way — once the job says what happened, the
-    /// delivery it tracked is no longer in doubt.
+    /// Saves a finished job and updates the retry queue atomically.
     async fn write_job(&self, job: &JobRecord, retry: Retry, what: &'static str) -> Result<()> {
         let value = serialize_job(job)?;
         let account_id = &job.account_id;
@@ -754,17 +703,13 @@ impl StateStore {
             Retry::Clear => pipeline.srem(FAILED_KEY, account_id).ignore(),
         };
         pipeline.srem(PENDING_NOTIFICATION_KEY, account_id).ignore();
-        let mut conn = self.conn.clone();
-        pipeline.query_async::<()>(&mut conn).await.context(what)
+        self.write(&pipeline, what).await
     }
 }
 
-/// What [`StateStore::write_job`] does with the account's place in the retry queue.
 #[derive(Clone, Copy)]
 enum Retry {
-    /// The check failed; `retry-failed` should pick the account up again.
     Queue,
-    /// The account reached a terminal status and has nothing left to retry.
     Clear,
 }
 
@@ -772,30 +717,28 @@ fn serialize_job(job: &JobRecord) -> Result<String> {
     serde_json::to_string(job).context("failed to serialize account job")
 }
 
-/// Writes account jobs with retention only when no retry or notification obligation remains.
+/// Jobs with a pending retry or notification never expire.
+fn expires(job: &JobRecord) -> bool {
+    job.status.is_completed() || job.status == JobStatus::Processing
+}
+
 fn set_job(pipeline: &mut Pipeline, job: &JobRecord, value: String) {
-    if job.status.is_completed() || job.status == JobStatus::Processing {
+    let key = job_key(&job.account_id);
+    if expires(job) {
         pipeline
-            .set_ex(
-                job_key(&job.account_id),
-                value,
-                ACCOUNT_STATE_RETENTION_SECS,
-            )
+            .set_ex(key, value, ACCOUNT_STATE_RETENTION_SECS)
             .ignore();
     } else {
-        pipeline.set(job_key(&job.account_id), value).ignore();
+        pipeline.set(key, value).ignore();
     }
 }
 
-/// Remaining retention for a legacy job, or `None` when it still requires operator action.
 fn remaining_job_ttl(job: &JobRecord, now: u64) -> Option<u64> {
-    (job.status.is_completed() || job.status == JobStatus::Processing)
+    expires(job)
         .then(|| ACCOUNT_STATE_RETENTION_SECS.saturating_sub(now.saturating_sub(job.updated_at)))
 }
 
-/// Builds the per-key campaign commands for [`StateStore::campaign_context`]. Exactly one reply is
-/// kept per key — the newest members still inside the window — so the caller reads back the same
-/// shape regardless of `record`.
+/// One reply per key, the newest members inside the window, whatever `record` is.
 fn campaign_pipeline(keys: &[String], account_id: &str, now: u64, record: bool) -> redis::Pipeline {
     let cutoff = now.saturating_sub(CAMPAIGN_WINDOW_SECS);
     let mut pipeline = redis::pipe();
@@ -811,9 +754,7 @@ fn campaign_pipeline(keys: &[String], account_id: &str, now: u64, record: bool) 
                 CAMPAIGN_MEMBERS_PER_SIGNAL,
             );
         }
-        // By score rather than by rank, so a dry run can skip the trim above and stay read-only
-        // without reporting accounts that have since aged out. The bound is exclusive, matching
-        // what the trim removes.
+        // By score, so dry runs need no trim; exclusive, matching what the trim removes.
         pipeline
             .cmd("ZREVRANGEBYSCORE")
             .arg(key)
@@ -826,9 +767,6 @@ fn campaign_pipeline(keys: &[String], account_id: &str, now: u64, record: bool) 
     pipeline
 }
 
-/// A read [`StateStore::read`] can reissue against a replacement connection. `Cmd` and `Pipeline`
-/// carry the same `query_async` but share no trait that names it, so without this the one retry
-/// would be written out once per shape of read.
 /// Adds `member` to a time-scored set, dropping entries older than `window` and the oldest beyond
 /// `cap`; the set expires once nothing is added for `window`.
 fn add_windowed(
@@ -857,6 +795,7 @@ fn add_windowed(
         .ignore();
 }
 
+/// `Cmd` and `Pipeline` share `query_async` but no trait naming it.
 trait RedisRead {
     async fn run<T: FromRedisValue>(&self, conn: &mut ConnectionManager) -> RedisResult<T>;
 }
@@ -873,13 +812,6 @@ impl RedisRead for Pipeline {
     }
 }
 
-/// Reports the connection loss [`StateStore::read`] is about to retry through. Its
-/// `is_unrecoverable_error` guard is the same condition [`ConnectionManager`] uses to replace the
-/// connection, so it is exactly the set of failures a second attempt reaches a live socket for.
-fn note_reconnect(error: &RedisError, what: &'static str) {
-    warn!(error = %error, read = what, "Redis connection was replaced, retrying the read once");
-}
-
 fn parse_feedback(value: Option<&str>) -> Result<Option<FeedbackRecord>> {
     value
         .map(|value| serde_json::from_str(value).context("invalid moderator feedback in Redis"))
@@ -892,7 +824,6 @@ fn parse_job(value: Option<&str>) -> Result<Option<JobRecord>> {
         .transpose()
 }
 
-/// Whether a raw feedback value marks the account as decided by a moderator.
 fn is_terminal_feedback(value: Option<&str>) -> Result<bool> {
     Ok(matches!(
         parse_feedback(value)?.map(|feedback| feedback.status),
@@ -900,16 +831,11 @@ fn is_terminal_feedback(value: Option<&str>) -> Result<bool> {
     ))
 }
 
-/// Whether a raw job value shows the account has already reached a terminal status.
 fn is_completed_job(value: Option<&str>) -> Result<bool> {
     Ok(parse_job(value)?.is_some_and(|job| job.status.is_completed()))
 }
 
-/// Caps the merged per-signal matches at the newest [`CAMPAIGN_MATCHES_REPORTED`] accounts.
-///
-/// Each signal is read newest-first, but merging them for de-duplication loses that order, and the
-/// set's own order is textual — `"1000"` ahead of `"999"`. Re-sorting numerically, descending,
-/// keeps the accounts the campaign report is about.
+/// The newest [`CAMPAIGN_MATCHES_REPORTED`] IDs, in numeric rather than textual order.
 fn most_recent_matches(matches: BTreeSet<String>) -> Vec<String> {
     let mut matches: Vec<String> = matches.into_iter().collect();
     matches.sort_by(|a, b| numeric_id_cmp(b, a));
@@ -981,7 +907,6 @@ mod tests {
 
     #[test]
     fn campaign_matches_keep_the_most_recent_accounts() {
-        // IDs increase over time, so "most recent" is the numerically largest.
         let ids = (1..=CAMPAIGN_MATCHES_REPORTED as u64 + 5)
             .map(|id| (id * 100).to_string())
             .collect::<BTreeSet<_>>();
@@ -992,14 +917,12 @@ mod tests {
         assert_eq!(kept[kept.len() - 1], "600");
     }
 
-    /// A timestamp far enough past the epoch that the campaign window does not clamp to zero.
     const CAMPAIGN_NOW: u64 = 1_800_000_000;
 
-    /// The arguments a pipeline would send, one entry per RESP token.
+    /// The RESP payload tokens a pipeline would send.
     fn pipeline_tokens(pipeline: redis::Pipeline) -> Vec<String> {
         String::from_utf8_lossy(&pipeline.get_packed_pipeline())
             .split("\r\n")
-            // Drop the array and bulk-string length prefixes, keeping the payload tokens.
             .filter(|part| !part.is_empty() && !part.starts_with('*') && !part.starts_with('$'))
             .map(str::to_string)
             .collect()
@@ -1059,7 +982,6 @@ mod tests {
 
     #[test]
     fn a_dry_run_reads_the_campaign_index_without_writing_to_it() {
-        // `dry-run` leaves no trace, so the read must not depend on trimming the key first.
         let commands = |record| {
             campaign_tokens(record)
                 .into_iter()
@@ -1082,20 +1004,15 @@ mod tests {
 
     #[test]
     fn the_campaign_window_bound_excludes_what_the_trim_removes() {
-        // ZREMRANGEBYSCORE's max is inclusive, so the read's min must be exclusive or a dry run
-        // would report an account the recording path had already dropped.
         let cutoff = CAMPAIGN_NOW - CAMPAIGN_WINDOW_SECS;
         let tokens = campaign_tokens(true);
         assert!(tokens.contains(&cutoff.to_string()), "{tokens:?}");
         assert!(tokens.contains(&format!("({cutoff}")), "{tokens:?}");
-        // The account is scored with the current time, so it lands inside its own window.
         assert!(tokens.contains(&CAMPAIGN_NOW.to_string()), "{tokens:?}");
     }
 
     #[test]
     fn the_verdict_a_moderator_replaced_is_reported_back() {
-        // `record_feedback` maps the script's reply through this: an empty string means nothing was
-        // replaced, and an unparseable one must not fail the verdict already written.
         let replaced = |raw: &str| {
             parse_feedback(Some(raw))
                 .ok()
@@ -1116,7 +1033,6 @@ mod tests {
 
     #[test]
     fn job_status_round_trips_through_its_stored_form() {
-        // record_action and the JobRecord both persist this; one snake_case spelling for both.
         assert_eq!(JobStatus::ConfirmedSpam.as_str(), "confirmed_spam");
         assert_eq!(JobStatus::NotSpam.as_str(), "not_spam");
         assert_eq!(

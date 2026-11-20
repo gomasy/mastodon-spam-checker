@@ -15,10 +15,9 @@ use crate::signals::digest;
 /// How long a confirmed account counts toward bio and domain matches.
 const KNOWN_SPAM_WINDOW_SECS: u64 = 365 * 24 * 60 * 60;
 const MEMBERS_PER_SIGNAL: i64 = 1_000;
-/// High enough that a large server's observed count is not understated.
 const OBSERVED_PER_SERVER: i64 = 20_000;
 
-/// The signals a check stores on the job, so the account can be learned after Mastodon blanks it.
+/// Stored on the job so the account can be learned after Mastodon blanks it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CheckSignals {
     pub instance: Option<String>,
@@ -52,8 +51,7 @@ pub enum LearnOutcome {
     /// No job with signals: never checked, or checked too long ago.
     NoSignals,
     ClearedByModerator,
-    /// Suspended by auto-moderation, not by a moderator: learning it would let the checker confirm
-    /// its own verdicts, spreading each match to every other signal on the account.
+    /// Not learned, so the checker cannot confirm its own verdicts.
     AutoModerated,
 }
 
@@ -81,8 +79,8 @@ impl ServerSpam {
 }
 
 impl StateStore {
-    /// Matches `signals` against confirmed spam, excluding `account_id` itself. With `record`, also
-    /// counts the account as observed from its server.
+    /// Matches `signals` against confirmed spam other than `account_id`; with `record`, also counts
+    /// the account as observed on its server.
     pub async fn known_spam_context(
         &self,
         account_id: &str,
@@ -132,7 +130,7 @@ impl StateStore {
                 .zscore(key, account_id);
         }
         let mut conn = self.conn.clone();
-        // Read as floats: ZCOUNT's integer parses as one, and ZSCORE's score is one.
+        // ZCOUNT and ZSCORE replies both parse as floats.
         let replies: Vec<Option<f64>> = pipeline
             .query_async(&mut conn)
             .await
@@ -175,7 +173,6 @@ impl StateStore {
         })
     }
 
-    /// Adds an account's stored signals to the known spam index.
     pub async fn learn_spam(&self, account_id: &str, source: LearnSource) -> Result<LearnOutcome> {
         let mut state = redis::pipe();
         state
@@ -236,7 +233,7 @@ impl StateStore {
             .ignore();
         self.write(&pipeline, "failed to save known spam").await?;
 
-        // A false positive recorded since the read above found nothing to forget; undo it here.
+        // Undo if a false positive was recorded since the read above.
         let feedback: Option<String> = self
             .read_key(
                 feedback_key(account_id),
@@ -250,8 +247,7 @@ impl StateStore {
         Ok(LearnOutcome::Learned { missed })
     }
 
-    /// [`Self::learn_spam`] for side effects of a moderator action: the outcome is logged, and a
-    /// failure is too rather than failing the action.
+    /// [`Self::learn_spam`], logging the outcome or failure instead of returning an error.
     pub async fn learn_logged(
         &self,
         account_id: &str,
@@ -279,7 +275,6 @@ impl StateStore {
         }
     }
 
-    /// Removes an account from the known spam index, returning whether it was there.
     pub async fn forget_spam(&self, account_id: &str) -> Result<bool> {
         let value: Option<String> = self
             .read_key(
@@ -302,8 +297,7 @@ impl StateStore {
         Ok(true)
     }
 
-    /// The accounts among `ids`, suspended in Mastodon, that [`Self::learn_spam`] would learn from
-    /// [`LearnSource::MastodonSuspension`], read in one round trip.
+    /// The `ids` that [`Self::learn_spam`] would learn from a Mastodon suspension.
     pub async fn learnable(&self, ids: &[String]) -> Result<Vec<String>> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -335,10 +329,8 @@ impl StateStore {
 }
 
 impl StateStore {
-    /// Records how far auto-moderation got. `Pending` must be saved *before* Mastodon is asked to
-    /// suspend: the marker is what keeps the suspension from being learned as a moderator's. A
-    /// suspension or deletion is also recorded as the account's moderation action, without
-    /// learning from it, unlike [`Self::record_action`].
+    /// Save `Pending` before suspending: the marker keeps the suspension from being learned.
+    /// Unlike [`Self::record_action`], the action is recorded without learning.
     pub async fn save_auto_moderation(
         &self,
         account_id: &str,
@@ -373,8 +365,7 @@ impl StateStore {
             .await
     }
 
-    /// Removes the marker after a suspension that did not happen, so a moderator suspending the
-    /// account by hand later is learned as usual.
+    /// Clears the marker after a failed suspension, so a later manual one is learned.
     pub async fn abort_auto_moderation(&self, account_id: &str) -> Result<()> {
         let mut pipeline = redis::pipe();
         pipeline.del(auto_moderation_key(account_id)).ignore();
