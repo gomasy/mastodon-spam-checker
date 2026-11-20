@@ -12,10 +12,9 @@ use crate::encryption;
 
 /// Adds a note when notes are configured; a failure is logged, never raised.
 pub async fn add_note_logged(writer: Option<&ModerationNoteWriter>, account_id: &str, note: &str) {
-    let Some(writer) = writer else {
-        return;
-    };
-    if let Err(error) = writer.add_note(account_id, note).await {
+    if let Some(writer) = writer
+        && let Err(error) = writer.add_note(account_id, note).await
+    {
         error!(account_id, error = %chain(&error), "failed to add moderation note");
     }
 }
@@ -26,9 +25,7 @@ const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 /// and `serve` mode decide the same way, so the `Option` is unwrapped here rather than at both.
 pub async fn writer_for(config: Option<&PostgresConfig>) -> Result<Option<ModerationNoteWriter>> {
     match config {
-        Some(pg) => ModerationNoteWriter::connect(&pg.database_url, pg.moderator_account_id)
-            .await
-            .map(Some),
+        Some(pg) => ModerationNoteWriter::connect(pg).await.map(Some),
         None => Ok(None),
     }
 }
@@ -119,29 +116,48 @@ const INSERT_NOTE: &str = "INSERT INTO account_moderation_notes \
 /// moderation notes permanently. [`crate::redis::StateStore`] gets the equivalent from Redis'
 /// connection manager.
 pub struct ModerationNoteWriter {
-    database_url: String,
-    moderator_account_id: i64,
+    config: PostgresConfig,
     client: Mutex<Option<Client>>,
 }
 
 impl ModerationNoteWriter {
-    pub async fn connect(database_url: &str, moderator_account_id: i64) -> Result<Self> {
+    pub async fn connect(config: &PostgresConfig) -> Result<Self> {
         // Connect eagerly so a bad DATABASE_URL is reported at startup, not on the first detection.
-        let client = connect(database_url).await?;
+        let client = connect(&config.database_url).await?;
         info!("connected to PostgreSQL for moderation notes");
         Ok(Self {
-            database_url: database_url.to_string(),
-            moderator_account_id,
+            config: config.clone(),
             client: Mutex::new(Some(client)),
         })
     }
 
     pub async fn add_note(&self, target_account_id: &str, content: &str) -> Result<()> {
-        let target_id: i64 = target_account_id
-            .parse()
-            .context("target account ID is not a valid integer")?;
+        let target_id = parse_account_id(target_account_id)?;
         let now = SystemTime::now();
+        self.with_client("moderation note", async |client: &Client| {
+            client
+                .execute(
+                    INSERT_NOTE,
+                    &[
+                        &content,
+                        &self.config.moderator_account_id,
+                        &target_id,
+                        &now,
+                    ],
+                )
+                .await
+        })
+        .await?;
+        info!(target_account_id = %target_account_id, "moderation note added");
+        Ok(())
+    }
 
+    /// Runs `query` within [`DATABASE_TIMEOUT`], redialling first if the connection has gone.
+    async fn with_client<T>(
+        &self,
+        what: &str,
+        query: impl AsyncFnOnce(&Client) -> Result<T, tokio_postgres::Error>,
+    ) -> Result<T> {
         let mut guard = self.client.lock().await;
         let client = match guard.take() {
             Some(client) if !client.is_closed() => client,
@@ -149,38 +165,32 @@ impl ModerationNoteWriter {
                 if previous.is_some() {
                     warn!("PostgreSQL connection was lost, reconnecting");
                 }
-                connect(&self.database_url).await?
+                connect(&self.config.database_url).await?
             }
         };
 
-        let Ok(result) = tokio::time::timeout(
-            DATABASE_TIMEOUT,
-            client.execute(
-                INSERT_NOTE,
-                &[&content, &self.moderator_account_id, &target_id, &now],
-            ),
-        )
-        .await
-        else {
+        let Ok(result) = tokio::time::timeout(DATABASE_TIMEOUT, query(&client)).await else {
             // Dropping the query future does not stop PostgreSQL from executing it, so it is
             // cancelled explicitly before this client is discarded, or lock waits leak sessions.
             match tokio::time::timeout(DATABASE_TIMEOUT, client.cancel_token().cancel_query(NoTls))
                 .await
             {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => warn!(%error, "failed to cancel timed-out moderation note"),
-                Err(_) => warn!("timed out cancelling moderation note"),
+                Ok(Err(error)) => warn!(%error, "failed to cancel timed-out {what}"),
+                Err(_) => warn!("timed out cancelling {what}"),
             }
-            bail!("timed out inserting moderation note");
+            bail!("timed out running {what}");
         };
-        // Kept for the next note unless the query itself killed it, in which case this one note is
-        // lost and the next call reconnects.
+        // A connection the query killed is dropped; the next call reconnects.
         if !client.is_closed() {
             *guard = Some(client);
         }
-        result.context("failed to insert moderation note")?;
-
-        info!(target_account_id = %target_account_id, "moderation note added");
-        Ok(())
+        result.with_context(|| format!("failed to run {what}"))
     }
+}
+
+fn parse_account_id(account_id: &str) -> Result<i64> {
+    account_id
+        .parse()
+        .context("account ID is not a valid integer")
 }

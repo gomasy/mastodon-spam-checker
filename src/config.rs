@@ -4,6 +4,7 @@ use crate::auto_moderation::AutoModerationConfig;
 use crate::encryption;
 use crate::llm::is_decision_model;
 
+#[derive(Clone)]
 pub struct PostgresConfig {
     pub database_url: String,
     pub moderator_account_id: i64,
